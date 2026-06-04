@@ -89,9 +89,16 @@ jobs:
           [IO.File]::WriteAllBytes(
             "dist/site/AirScreenshot.cer",
             $certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-          certutil.exe -user -addstore -f Root "dist/site/AirScreenshot.cer"
-          if ($LASTEXITCODE -ne 0) {
-            throw "无法在 runner 上信任发布证书。"
+          $publicCertificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            "dist/site/AirScreenshot.cer")
+          $rootStore = [Security.Cryptography.X509Certificates.X509Store]::new(
+            "Root",
+            [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+          try {
+            $rootStore.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            $rootStore.Add($publicCertificate)
+          } finally {
+            $rootStore.Close()
           }
 
       - name: Validate release package
