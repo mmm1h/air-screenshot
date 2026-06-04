@@ -7,84 +7,85 @@ Air Screenshot 是一个面向 Windows 10 2004+ x64 的轻量原生截图工具�
 - 区域、活动窗口、显示器和全虚拟桌面截图
 - 剪贴板与 PNG 输出
 - 可关闭的轻量标注、贴图和 Windows 系统 OCR
-- 托盘、开机自启、全局快捷键与正式 CLI
-- MSIX 安装与 App Installer 自动更新
+- 托盘、开机自启、全局快捷键与单 EXE CLI
+- 便携 EXE 静默下载更新，退出或下次启动时应用
 
-常驻宿主只负责托盘、快捷键和命名管道；截图缓冲、Direct2D 资源和 OCR 引擎都在使用时创建。标注、OCR 与 Shell 使用内部延迟模块工厂，关闭后不注册对应能力。
+常驻宿主只负责托盘、快捷键和命名管道；截图缓冲、Direct2D 资源和 OCR 引擎都在使用时创建。
 
-## 构建
+## 下载与使用
+
+从 [公开下载页](https://mmm1h.github.io/air-screenshot/) 下载 `AirScreenshot.exe`，放到普通可写目录后双击运行。无需安装、管理员权限或证书脚本。
+
+首次启动默认注册当前用户开机启动项，可在设置中关闭。移动 EXE 后再次启动会自动修正启动项路径。
+
+Windows SmartScreen 可能提示未知发布者。这是因为当前使用自签名代码签名证书；请确认下载来源为本项目后再选择继续运行。
+
+## 构建与验证
 
 ```powershell
 .\scripts\build.ps1
 .\scripts\test.ps1
+.\scripts\smoke-portable.ps1
 .\scripts\measure-performance.ps1
 ```
 
-生成开发 MSIX：
+生成本地便携包：
 
 ```powershell
-.\scripts\create-dev-cert.ps1
-# 下一条命令需要管理员 PowerShell；仅开发机首次运行
-.\scripts\trust-dev-cert.ps1
-.\scripts\package.ps1 -Sign
-.\scripts\install-dev.ps1
+.\scripts\package.ps1 -Version 0.2.0
 ```
 
-`trust-dev-cert.ps1` 必须在管理员 PowerShell 中运行，因为 Windows 的 MSIX 部署服务只读取本地计算机的包签名信任。
+## 自动更新
 
-## 安装与静默更新
+程序启动后会读取 GitHub Pages 上的 `latest.json`。发现新版本时：
 
-发布版首次安装时，需要在管理员 PowerShell 中运行 Release 附带的 `Install-AirScreenshot.ps1`。脚本会信任发布证书，并通过 `.appinstaller` 建立更新关系。
+1. 静默下载新版 EXE 到 `%LOCALAPPDATA%\AirScreenshot\updates`。
+2. 校验文件大小、SHA256、Authenticode 完整性和内置发布证书指纹。
+3. 用户退出程序时完成替换；若程序仍在运行，则下次启动先更新再继续运行。
 
-首次安装完成后：
-
-- 每次启动都会无界面检查新版本。
-- Windows 每 8 小时进行一次后台检查。
-- 新版本在合适时机静默安装，不需要用户重新下载安装。
-- 必须保持相同的包身份和签名证书，版本号必须递增。
-
-直接安装 `.msix` 不会建立 App Installer 自动更新关系。
+当前 EXE 所在目录不可写时不会请求提权，也不会覆盖原文件；程序会提示将 EXE 移到普通可写目录。
 
 ## 发布
 
 推送格式为 `vX.Y.Z` 的 tag 会自动运行 [release.yml](.github/workflows/release.yml)：
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
-工作流会运行测试、生成并验证签名 MSIX、创建 GitHub Release，并将最新安装入口发布到 GitHub Pages。
+工作流会运行测试、生成并验证签名 EXE、执行便携烟测、创建 GitHub Release，并更新 GitHub Pages 下载页与 `latest.json`。
 
-Release 工作流依赖以下仓库配置：
+发布工作流使用以下仓库配置；为兼容旧配置，也会回退读取原 `MSIX_*` 名称：
 
 | 类型 | 名称 | 用途 |
 | --- | --- | --- |
-| Variable | `MSIX_PACKAGE_NAME` | 稳定 MSIX 包身份 |
-| Variable | `MSIX_PUBLISHER` | 必须与签名证书主题完全一致 |
-| Secret | `MSIX_SIGNING_PFX_BASE64` | Base64 编码的发布签名 PFX |
-| Secret | `MSIX_SIGNING_PFX_PASSWORD` | 发布签名 PFX 密码 |
+| Variable | `RELEASE_PUBLISHER` | 发布签名证书主题 |
+| Secret | `CODE_SIGNING_PFX_BASE64` | Base64 编码的代码签名 PFX |
+| Secret | `CODE_SIGNING_PFX_PASSWORD` | 代码签名 PFX 密码 |
 
-可使用 `scripts/create-release-cert.ps1` 创建自签名发布证书。发布后不能随意更换包身份或证书，否则已安装版本无法静默升级。
+`scripts/create-release-cert.ps1` 可创建自签名发布证书并打印 SHA256 指纹；证书变化时必须同步更新程序内置指纹。
 
 ## CLI
 
-CLI 示例：
+同一个 EXE 同时提供 GUI 与 CLI：
 
 ```powershell
-airshot capture region
-airshot capture screen --monitor all --output clipboard
-airshot ocr region --copy
-airshot module list
-airshot app settings
+.\AirScreenshot.exe capture region
+.\AirScreenshot.exe capture screen --monitor all --output clipboard
+.\AirScreenshot.exe ocr region --copy
+.\AirScreenshot.exe module list
+.\AirScreenshot.exe app settings
+.\AirScreenshot.exe --help
 ```
 
-运行 `airshot --help` 查看完整命令。宿主未运行时，CLI 会按命令需要启动常驻或临时宿主。
+无参数双击时启动托盘宿主。CLI 主要面向 PowerShell 与 Windows Terminal；程序保持 GUI 子系统，因此双击不会弹出黑色控制台窗口。
 
 ## 限制
 
 - GDI `BitBlt` 无法捕获受保护内容和部分硬件覆盖层。
-- 首版不包含长截图、录屏、历史记录或第三方 DLL 插件。
+- 不包含长截图、录屏、历史记录或第三方 DLL 插件。
 - OCR 只调用 Windows 系统 `Windows.Media.Ocr`，可用语言取决于系统语言包。
+- 旧 MSIX 版本不会自动迁移配置，需要用户自行卸载。
 
-项目采用 `LGPL-3.0-only`，第三方来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+项目采用 `LGPL-3.0-only`。完整许可证与第三方声明已嵌入 EXE，可从托盘菜单“关于 / 许可证”查看。

@@ -7,16 +7,32 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 & (Join-Path $PSScriptRoot "build.ps1") -Configuration Release
 $hostPath = Join-Path $root "build\AirScreenshot.exe"
-$cliPath = Join-Path $root "build\airshot.exe"
-
-& $cliPath app stop 2>$null | Out-Null
-Get-Process AirScreenshot -ErrorAction SilentlyContinue | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
-$startedHost = Start-Process -FilePath $hostPath -WindowStyle Hidden -PassThru
-Start-Sleep -Milliseconds 500
-if ($startedHost.HasExited) {
-    throw "Air Screenshot 宿主启动失败，退出码：$($startedHost.ExitCode)"
+$cliPath = $hostPath
+if (Get-Process AirScreenshot -ErrorAction SilentlyContinue) {
+    throw "性能测量前请先退出现有 Air Screenshot 进程。"
 }
+$temporary = Join-Path ([IO.Path]::GetTempPath()) "AirScreenshot-Performance-$PID"
+$runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$originalDataDirectory = $env:AIRSHOT_DATA_DIR
+$originalRunValue = $null
+$hadRunValue = $false
 try {
+    $originalRunValue = (Get-ItemProperty -LiteralPath $runKey -Name AirScreenshot -ErrorAction Stop).AirScreenshot
+    $hadRunValue = $true
+}
+catch {
+}
+$env:AIRSHOT_DATA_DIR = Join-Path $temporary "data"
+
+$startedHost = $null
+$outputPath = $null
+try {
+    New-Item -ItemType Directory -Path $temporary -Force | Out-Null
+    $startedHost = Start-Process -FilePath $hostPath -WindowStyle Hidden -PassThru
+    Start-Sleep -Milliseconds 500
+    if ($startedHost.HasExited) {
+        throw "Air Screenshot 宿主启动失败，退出码：$($startedHost.ExitCode)"
+    }
     $process = $startedHost
     $cpuStart = $process.TotalProcessorTime
     Start-Sleep -Seconds 3
@@ -50,8 +66,22 @@ try {
     } | Format-List
 }
 finally {
-    & $cliPath app stop 2>$null | Out-Null
+    if ($startedHost -and -not $startedHost.HasExited) {
+        & $cliPath app stop 2>$null | Out-Null
+        $startedHost.WaitForExit(5000) | Out-Null
+    }
     if ($outputPath -and (Test-Path -LiteralPath $outputPath)) {
         Remove-Item -LiteralPath $outputPath -Force
     }
+    if ($hadRunValue) {
+        Set-ItemProperty -LiteralPath $runKey -Name AirScreenshot -Value $originalRunValue
+    } else {
+        Remove-ItemProperty -LiteralPath $runKey -Name AirScreenshot -ErrorAction SilentlyContinue
+    }
+    if ($null -eq $originalDataDirectory) {
+        Remove-Item Env:\AIRSHOT_DATA_DIR -ErrorAction SilentlyContinue
+    } else {
+        $env:AIRSHOT_DATA_DIR = $originalDataDirectory
+    }
+    Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(AirScreenshot VERSION 0.1.5.0 LANGUAGES CXX)
+project(AirScreenshot VERSION 0.2.0 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "Air Screenshot only supports Windows.")
@@ -10,6 +10,13 @@ set(AIRSHOT_BUILD_VERSION "" CACHE STRING "Version reported by the Air Screensho
 if(AIRSHOT_BUILD_VERSION STREQUAL "")
     set(AIRSHOT_BUILD_VERSION "${PROJECT_VERSION}")
 endif()
+if(NOT AIRSHOT_BUILD_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "AIRSHOT_BUILD_VERSION must use X.Y.Z format.")
+endif()
+string(REPLACE "." ";" AIRSHOT_BUILD_VERSION_PARTS "${AIRSHOT_BUILD_VERSION}")
+list(GET AIRSHOT_BUILD_VERSION_PARTS 0 AIRSHOT_VERSION_MAJOR)
+list(GET AIRSHOT_BUILD_VERSION_PARTS 1 AIRSHOT_VERSION_MINOR)
+list(GET AIRSHOT_BUILD_VERSION_PARTS 2 AIRSHOT_VERSION_PATCH)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,6 +36,7 @@ add_library(airshot_core STATIC
     src/core/ocr.cpp
     src/core/output.cpp
     src/core/overlay.cpp
+    src/core/portable.cpp
 )
 
 target_include_directories(airshot_core PUBLIC include)
@@ -38,9 +46,14 @@ target_compile_definitions(airshot_core PUBLIC
     _UNICODE
     WIN32_LEAN_AND_MEAN
     AIRSHOT_VERSION="${AIRSHOT_BUILD_VERSION}"
+    AIRSHOT_VERSION_MAJOR=${AIRSHOT_VERSION_MAJOR}
+    AIRSHOT_VERSION_MINOR=${AIRSHOT_VERSION_MINOR}
+    AIRSHOT_VERSION_PATCH=${AIRSHOT_VERSION_PATCH}
 )
 target_compile_options(airshot_core PRIVATE /W4 /permissive- /utf-8)
 target_link_libraries(airshot_core PUBLIC
+    bcrypt
+    crypt32
     d2d1
     dwrite
     dwmapi
@@ -48,12 +61,17 @@ target_link_libraries(airshot_core PUBLIC
     shell32
     shlwapi
     user32
+    urlmon
+    version
     windowsapp
     windowscodecs
+    wintrust
 )
 
 add_executable(AirScreenshot WIN32
+    src/host/about_window.cpp
     src/host/host_app.cpp
+    src/host/cli_app.cpp
     src/host/main.cpp
     src/host/settings_window.cpp
     src/host/pin_window.cpp
@@ -65,10 +83,6 @@ target_compile_options(AirScreenshot PRIVATE /W4 /permissive- /utf-8 "$<$<CONFIG
 target_link_options(AirScreenshot PRIVATE "$<$<CONFIG:Release>:/DEBUG>" "$<$<CONFIG:Release>:/OPT:REF>" "$<$<CONFIG:Release>:/OPT:ICF>")
 target_link_libraries(AirScreenshot PRIVATE airshot_core comctl32)
 
-add_executable(airshot src/cli/main.cpp)
-target_compile_options(airshot PRIVATE /W4 /permissive- /utf-8)
-target_link_libraries(airshot PRIVATE airshot_core)
-
 if(BUILD_TESTING)
     add_executable(airshot_tests tests/test_main.cpp)
     target_compile_options(airshot_tests PRIVATE /W4 /permissive- /utf-8)
@@ -76,4 +90,4 @@ if(BUILD_TESTING)
     add_test(NAME airshot_tests COMMAND airshot_tests)
 endif()
 
-install(TARGETS AirScreenshot airshot RUNTIME DESTINATION .)
+install(TARGETS AirScreenshot RUNTIME DESTINATION .)

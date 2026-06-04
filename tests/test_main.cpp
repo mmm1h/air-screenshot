@@ -3,10 +3,12 @@
 #include "airshot/config.h"
 #include "airshot/feature.h"
 #include "airshot/ocr.h"
+#include "airshot/portable.h"
 
 #include <winrt/base.h>
 
 #include <iostream>
+#include <fstream>
 
 namespace {
 
@@ -91,6 +93,63 @@ void test_ocr_join() {
     expect(airshot::join_ocr_lines(lines) == L"第一行\r\nsecond", L"OCR line join");
 }
 
+void test_portable_runtime() {
+    expect(airshot::version_is_newer(L"0.1.6", L"0.2.0"), L"portable version detects newer release");
+    expect(!airshot::version_is_newer(L"0.2.0", L"0.1.6"), L"portable version rejects older release");
+    expect(!airshot::version_is_newer(L"0.2", L"0.2.0"), L"portable version rejects malformed version");
+
+    const auto manifest = airshot::parse_update_manifest(
+        LR"({"version":"0.2.0","url":"https://example.com/AirScreenshot.exe","sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","size":3})");
+    expect(manifest && manifest->version == L"0.2.0" && manifest->size == 3 &&
+               manifest->sha256 == L"BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD",
+           L"portable update manifest parses and normalizes");
+    expect(!airshot::parse_update_manifest(
+               LR"({"version":"0.2","url":"http://example.com/a.exe","sha256":"bad","size":0})"),
+           L"portable update manifest rejects unsafe values");
+
+    const auto path = std::filesystem::temp_directory_path() / L"airshot-sha256-test.txt";
+    {
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+        stream << "abc";
+    }
+    expect(airshot::sha256_file(path) == L"BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD",
+           L"portable SHA256");
+    airshot::UpdateManifest unsigned_manifest{
+        L"0.2.0",
+        L"https://example.com/AirScreenshot.exe",
+        L"BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD",
+        3};
+    expect(!airshot::verify_portable_executable(path, unsigned_manifest),
+           L"portable update rejects unsigned executable");
+    unsigned_manifest.sha256 = L"AA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
+    expect(!airshot::verify_portable_executable(path, unsigned_manifest),
+           L"portable update rejects wrong hash");
+    unsigned_manifest.sha256 = L"BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
+    unsigned_manifest.size = 4;
+    expect(!airshot::verify_portable_executable(path, unsigned_manifest),
+           L"portable update rejects wrong size");
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+
+    wchar_t windows_directory[MAX_PATH]{};
+    if (GetWindowsDirectoryW(windows_directory, MAX_PATH) > 0) {
+        const auto wrong_signer = std::filesystem::path(windows_directory) / L"System32" / L"notepad.exe";
+        if (std::filesystem::exists(wrong_signer)) {
+            airshot::UpdateManifest wrong_signer_manifest{
+                L"0.2.0",
+                L"https://example.com/AirScreenshot.exe",
+                airshot::sha256_file(wrong_signer),
+                std::filesystem::file_size(wrong_signer)};
+            expect(!airshot::verify_portable_executable(wrong_signer, wrong_signer_manifest),
+                   L"portable update rejects wrong signer");
+        }
+    }
+
+    expect(airshot::portable_startup_command(L"C:\\Apps\\Air Screenshot\\AirScreenshot.exe") ==
+               L"\"C:\\Apps\\Air Screenshot\\AirScreenshot.exe\"",
+           L"portable startup command quotes executable path");
+}
+
 void test_feature_registry() {
     airshot::AppConfig config;
     airshot::FeatureRegistry registry;
@@ -114,6 +173,7 @@ int wmain() {
     test_config();
     test_cli();
     test_ocr_join();
+    test_portable_runtime();
     test_feature_registry();
     if (failures == 0) {
         std::wcout << L"All tests passed.\n";

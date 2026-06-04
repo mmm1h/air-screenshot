@@ -33,18 +33,18 @@ ParsedCli request_result(JsonObject request, bool json_output) {
 }  // namespace
 
 std::wstring help_text() {
-    return LR"(Air Screenshot CLI
+    return LR"(Air Screenshot 单 EXE / CLI
 
 用法:
-  airshot capture region [--output clipboard|file] [--path <路径>] [--json]
-  airshot capture window [--output clipboard|file] [--path <路径>] [--json]
-  airshot capture screen [--monitor all|primary|cursor|编号] [--output clipboard|file] [--path <路径>] [--json]
-  airshot ocr region [--copy] [--json]
-  airshot module list
-  airshot module enable|disable <annotation|ocr|shell>
-  airshot app start|stop|status|settings
-  airshot --help
-  airshot --version
+  AirScreenshot.exe capture region [--output clipboard|file] [--path <路径>] [--json]
+  AirScreenshot.exe capture window [--output clipboard|file] [--path <路径>] [--json]
+  AirScreenshot.exe capture screen [--monitor all|primary|cursor|编号] [--output clipboard|file] [--path <路径>] [--json]
+  AirScreenshot.exe ocr region [--copy] [--json]
+  AirScreenshot.exe module list
+  AirScreenshot.exe module enable|disable <annotation|ocr|shell>
+  AirScreenshot.exe app start|stop|status|settings
+  AirScreenshot.exe --help
+  AirScreenshot.exe --version
 )";
 }
 
@@ -63,7 +63,7 @@ ParsedCli parse_cli(std::span<const std::wstring> arguments) {
     if (is_option(arguments[0], L"--version") || is_option(arguments[0], L"version")) {
         ParsedCli result;
         result.local_only = true;
-        result.local_text = L"airshot " + from_utf8(AIRSHOT_VERSION);
+        result.local_text = L"AirScreenshot " + from_utf8(AIRSHOT_VERSION);
         return result;
     }
 

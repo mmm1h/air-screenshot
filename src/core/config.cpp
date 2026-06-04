@@ -331,19 +331,6 @@ std::wstring_view json_boolean(bool value) {
     return value ? L"true" : L"false";
 }
 
-std::optional<std::wstring> current_package_family() {
-    UINT32 length = 0;
-    if (GetCurrentPackageFamilyName(&length, nullptr) != ERROR_INSUFFICIENT_BUFFER || length == 0) {
-        return std::nullopt;
-    }
-    std::wstring family(length, L'\0');
-    if (GetCurrentPackageFamilyName(&length, family.data()) != ERROR_SUCCESS) {
-        return std::nullopt;
-    }
-    family.resize(wcslen(family.c_str()));
-    return family;
-}
-
 }  // namespace
 
 std::optional<Hotkey> parse_hotkey(std::wstring_view value) {
@@ -435,13 +422,17 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text) {
 
 std::filesystem::path config_directory() {
     try {
+        std::wstring override_path(32768, L'\0');
+        const DWORD override_length =
+            GetEnvironmentVariableW(L"AIRSHOT_DATA_DIR", override_path.data(), static_cast<DWORD>(override_path.size()));
+        if (override_length > 0 && override_length < override_path.size()) {
+            override_path.resize(override_length);
+            return std::filesystem::path(override_path);
+        }
         PWSTR value = nullptr;
         if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &value)) && value) {
             std::filesystem::path result(value);
             CoTaskMemFree(value);
-            if (const auto family = current_package_family()) {
-                return result / L"Packages" / *family / L"LocalState";
-            }
             return result / L"AirScreenshot";
         }
         return std::filesystem::temp_directory_path() / L"AirScreenshot";

@@ -1,6 +1,5 @@
 #include "airshot/common.h"
 
-#include <appmodel.h>
 #include <roapi.h>
 
 #include <iomanip>
@@ -91,12 +90,6 @@ std::wstring timestamp_for_file() {
                        time.wMinute,
                        time.wSecond,
                        time.wMilliseconds);
-}
-
-bool is_process_packaged() {
-    UINT32 length = 0;
-    const LONG result = GetCurrentPackageFullName(&length, nullptr);
-    return result != APPMODEL_ERROR_NO_PACKAGE;
 }
 
 }  // namespace airshot

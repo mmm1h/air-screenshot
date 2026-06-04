@@ -6,16 +6,16 @@
   <title>Air Screenshot __SEMVER__</title>
   <style>
     body { max-width: 720px; margin: 48px auto; padding: 0 20px; font: 16px/1.6 system-ui, sans-serif; color: #202124; }
-    a { color: #1677ff; }
+    .download { display: inline-block; padding: 10px 18px; border-radius: 6px; background: #1677ff; color: white; text-decoration: none; }
     code { background: #f2f3f5; padding: 2px 5px; border-radius: 4px; }
   </style>
 </head>
 <body>
   <h1>Air Screenshot __SEMVER__</h1>
-  <p>首次安装需要信任发布证书，并通过 App Installer 建立更新关系。之后由 Windows 在后台静默更新，无需重复安装。</p>
-  <p><a href="Install-AirScreenshot.ps1">下载安装脚本</a> · <a href="AirScreenshot.appinstaller">App Installer 文件</a> · <a href="AirScreenshot.cer">发布证书</a></p>
-  <p>管理员 PowerShell 安装命令：</p>
-  <pre><code>.\Install-AirScreenshot.ps1</code></pre>
+  <p>下载一个 EXE，双击即可运行。无需安装、管理员权限或证书脚本。</p>
+  <p><a class="download" href="__DOWNLOAD_URL__">下载 AirScreenshot.exe</a></p>
+  <p>Windows SmartScreen 可能提示未知发布者；确认来源为本项目后可选择继续运行。</p>
+  <p>程序会在后台下载经过哈希和签名校验的新版本，并在退出或下次启动时完成更新。</p>
   <p><a href="https://github.com/mmm1h/air-screenshot">源代码与发布记录</a></p>
 </body>
 </html>

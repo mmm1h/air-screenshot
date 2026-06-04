@@ -42,4 +42,6 @@ Export-PfxCertificate -Cert $certificate -FilePath $pfx -Password $secure | Out-
 Export-Certificate -Cert $certificate -FilePath $cer | Out-Null
 
 Write-Host "发布证书已生成：$pfx"
+Write-Host "发布证书 SHA256：$($certificate.GetCertHashString([Security.Cryptography.HashAlgorithmName]::SHA256))"
+Write-Host "证书变化时，请同步更新程序内置发布证书指纹与 validate-package.ps1 默认指纹。"
 Write-Host "请将 PFX 与密码保存到 GitHub Actions Secrets，不要提交到仓库。"

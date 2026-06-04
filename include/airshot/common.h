@@ -19,9 +19,9 @@ inline constexpr wchar_t kAppName[] = L"Air Screenshot";
 inline constexpr wchar_t kAppWindowClass[] = L"AirScreenshot.HostWindow";
 inline constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\LOCAL\\AirScreenshot.v1";
 inline constexpr wchar_t kHostMutexName[] = L"Local\\AirScreenshot.Host.v1";
-inline constexpr wchar_t kStartupTaskId[] = L"AirScreenshotStartup";
-inline constexpr wchar_t kAppInstallerUrl[] =
-    L"https://mmm1h.github.io/air-screenshot/AirScreenshot.appinstaller";
+inline constexpr wchar_t kLatestJsonUrl[] = L"https://mmm1h.github.io/air-screenshot/latest.json";
+inline constexpr wchar_t kReleaseSignerSha256[] =
+    L"CB864DBFC63D94625D2173DD9B5C0426A88A415A29F054D2936165FA793D7E1E";
 
 enum class ExitCode : int {
     success = 0,
@@ -92,6 +92,5 @@ struct RectI {
 [[nodiscard]] std::wstring from_utf8(std::string_view value);
 [[nodiscard]] std::wstring windows_error_message(DWORD error);
 [[nodiscard]] std::wstring timestamp_for_file();
-[[nodiscard]] bool is_process_packaged();
 
 }  // namespace airshot

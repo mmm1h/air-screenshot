@@ -1,23 +1,22 @@
 #include "host_app.h"
 
+#include "about_window.h"
+#include "resource.h"
 #include "settings_window.h"
 
 #include "airshot/capture.h"
 #include "airshot/ocr.h"
 #include "airshot/output.h"
 #include "airshot/overlay.h"
+#include "airshot/portable.h"
 #include "airshot/strings.h"
 
 #include <shellapi.h>
 
 #include <malloc.h>
 
-#include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.h>
-#include <winrt/Windows.Web.Http.h>
-#include <winrt/Windows.Data.Xml.Dom.h>
-#include <winrt/Windows.Management.Deployment.h>
 #include <thread>
 
 namespace airshot {
@@ -37,6 +36,7 @@ constexpr UINT kMenuSettings = 2002;
 constexpr UINT kMenuUpdate = 2003;
 constexpr UINT kMenuExit = 2004;
 constexpr UINT kMenuCloseAllPins = 2005;
+constexpr UINT kMenuAbout = 2006;
 
 RegionResult run_trimmed_region_capture(const RegionRequest& request) {
     RegionResult result = run_region_capture(request);
@@ -78,8 +78,8 @@ bool HostApp::initialize() {
     window_class.lpfnWndProc = window_proc;
     window_class.hInstance = instance_;
     window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    window_class.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(101));
-    window_class.hIconSm = LoadIconW(instance_, MAKEINTRESOURCEW(101));
+    window_class.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APP_ICON));
+    window_class.hIconSm = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APP_ICON));
     window_class.lpszClassName = kAppWindowClass;
     RegisterClassExW(&window_class);
     window_ = CreateWindowExW(WS_EX_TOOLWINDOW,
@@ -109,6 +109,7 @@ bool HostApp::initialize() {
     });
     if (!transient_) {
         apply_shell();
+        sync_startup_task();
         check_for_updates(false);
     }
     return true;
@@ -145,26 +146,7 @@ void HostApp::apply_shell() {
 }
 
 void HostApp::sync_startup_task() {
-    if (!is_process_packaged()) {
-        return;
-    }
-    const ScopedWinrtApartment apartment(true);
-    if (!apartment.available()) {
-        return;
-    }
-    try {
-        using winrt::Windows::ApplicationModel::StartupTask;
-        using winrt::Windows::ApplicationModel::StartupTaskState;
-        const auto task = StartupTask::GetAsync(kStartupTaskId).get();
-        if (config_.shell_enabled && config_.start_at_login) {
-            if (task.State() == StartupTaskState::Disabled) {
-                task.RequestEnableAsync().get();
-            }
-        } else if (task.State() == StartupTaskState::Enabled) {
-            task.Disable();
-        }
-    } catch (...) {
-    }
+    sync_portable_startup(config_.shell_enabled && config_.start_at_login);
 }
 
 void HostApp::add_tray() {
@@ -174,7 +156,7 @@ void HostApp::add_tray() {
     tray_.uID = 1;
     tray_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     tray_.uCallbackMessage = kTrayMessage;
-    tray_.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(101));
+    tray_.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APP_ICON));
     wcscpy_s(tray_.szTip, kAppName);
     tray_added_ = Shell_NotifyIconW(NIM_ADD, &tray_) == TRUE;
     if (tray_added_) {
@@ -217,6 +199,7 @@ void HostApp::show_tray_menu() {
     AppendMenuW(menu, MF_STRING, kMenuCapture, strings::tray_capture.data());
     AppendMenuW(menu, MF_STRING, kMenuSettings, strings::tray_settings.data());
     AppendMenuW(menu, MF_STRING, kMenuUpdate, strings::tray_update.data());
+    AppendMenuW(menu, MF_STRING, kMenuAbout, L"关于 / 许可证");
     if (!pin_windows_.empty()) {
         AppendMenuW(menu, MF_STRING, kMenuCloseAllPins, L"销毁所有贴图 (Close All Pins)");
     }
@@ -496,6 +479,8 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
             show_settings();
         } else if (LOWORD(w_param) == kMenuUpdate) {
             check_for_updates(true);
+        } else if (LOWORD(w_param) == kMenuAbout) {
+            show_about_window(window_);
         } else if (LOWORD(w_param) == kMenuCloseAllPins) {
             pin_windows_.clear();
         } else if (LOWORD(w_param) == kMenuExit) {
@@ -525,123 +510,20 @@ LRESULT CALLBACK HostApp::window_proc(HWND window, UINT message, WPARAM w_param,
     return app ? app->handle_message(message, w_param, l_param) : DefWindowProcW(window, message, w_param, l_param);
 }
 
-namespace {
-
-std::vector<int> parse_version(const std::wstring& s) {
-    std::vector<int> parts;
-    std::wstring part;
-    for (wchar_t c : s) {
-        if (c == L'.') {
-            try {
-                parts.push_back(std::stoi(part));
-            } catch (...) {
-                parts.push_back(0);
-            }
-            part.clear();
-        } else if (c >= L'0' && c <= L'9') {
-            part.push_back(c);
-        }
-    }
-    if (!part.empty()) {
-        try {
-            parts.push_back(std::stoi(part));
-        } catch (...) {
-            parts.push_back(0);
-        }
-    }
-    return parts;
-}
-
-bool is_newer_version(const std::wstring& current_str, const std::wstring& latest_str) {
-    auto current = parse_version(current_str);
-    auto latest = parse_version(latest_str);
-    for (size_t i = 0; i < std::max(current.size(), latest.size()); ++i) {
-        int c = i < current.size() ? current[i] : 0;
-        int l = i < latest.size() ? latest[i] : 0;
-        if (l > c) return true;
-        if (l < c) return false;
-    }
-    return false;
-}
-
-} // namespace
-
 void HostApp::check_for_updates(bool user_triggered) {
     const HWND owner_window = window_;
     std::thread([owner_window, user_triggered]() {
-        const ScopedWinrtApartment apartment(true);
+        const ScopedWinrtApartment apartment;
+        std::wstring message;
+        const UpdateStageResult result = apartment.available() ? stage_latest_update(&message) : UpdateStageResult::failed;
         if (!apartment.available()) {
-            if (user_triggered) {
-                MessageBoxW(owner_window, L"无法初始化 Windows Runtime，检查更新失败。", kAppName, MB_OK | MB_ICONERROR);
-            }
-            return;
+            message = L"无法初始化更新检查所需的 Windows 运行时。";
         }
-
-        try {
-            winrt::Windows::Web::Http::HttpClient client;
-            winrt::Windows::Foundation::Uri uri(kAppInstallerUrl);
-            winrt::hstring content = client.GetStringAsync(uri).get();
-
-            winrt::Windows::Data::Xml::Dom::XmlDocument doc;
-            doc.LoadXml(content);
-            auto elements = doc.GetElementsByTagName(L"AppInstaller");
-            if (elements.Length() == 0) {
-                if (user_triggered) {
-                    MessageBoxW(owner_window, L"更新配置文件格式无效。", kAppName, MB_OK | MB_ICONERROR);
-                }
-                return;
-            }
-
-            auto version_attr = elements.Item(0).Attributes().GetNamedItem(L"Version");
-            if (!version_attr) {
-                if (user_triggered) {
-                    MessageBoxW(owner_window, L"无法获取最新版本号。", kAppName, MB_OK | MB_ICONERROR);
-                }
-                return;
-            }
-
-            std::wstring latest_version = version_attr.NodeValue().as<winrt::hstring>().c_str();
-            std::wstring current_version = from_utf8(AIRSHOT_VERSION);
-
-            if (is_newer_version(current_version, latest_version)) {
-                std::wstring prompt = std::format(L"发现新版本 (v{})，当前版本为 (v{})。\n\n是否立即开始自动更新？", latest_version, current_version);
-                if (MessageBoxW(owner_window, prompt.c_str(), kAppName, MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                    if (is_process_packaged()) {
-                        MessageBoxW(owner_window, L"正在启动自动更新，程序将会关闭并应用更新。", kAppName, MB_OK | MB_ICONINFORMATION);
-
-                        winrt::Windows::Management::Deployment::PackageManager pm;
-                        pm.AddPackageByAppInstallerFileAsync(
-                            uri,
-                            winrt::Windows::Management::Deployment::AddPackageByAppInstallerOptions::ForceTargetAppShutdown,
-                            nullptr
-                        );
-                    } else {
-                        if (reinterpret_cast<INT_PTR>(
-                                ShellExecuteW(owner_window, L"open", kAppInstallerUrl, nullptr, nullptr, SW_SHOWNORMAL)) <= 32) {
-                            MessageBoxW(owner_window, L"无法打开安装入口。", kAppName, MB_OK | MB_ICONERROR);
-                        }
-                    }
-                }
-            } else {
-                if (user_triggered) {
-                    std::wstring msg = std::format(L"当前已是最新版本 (v{})。", current_version);
-                    MessageBoxW(owner_window, msg.c_str(), kAppName, MB_OK | MB_ICONINFORMATION);
-                }
-            }
-        } catch (const winrt::hresult_error& error) {
-            if (user_triggered) {
-                std::wstring msg = std::format(L"检查更新失败：{}", error.message().c_str());
-                MessageBoxW(owner_window, msg.c_str(), kAppName, MB_OK | MB_ICONERROR);
-            }
-        } catch (const std::exception& e) {
-            if (user_triggered) {
-                std::wstring msg = std::format(L"检查更新出错：{}", from_utf8(e.what()));
-                MessageBoxW(owner_window, msg.c_str(), kAppName, MB_OK | MB_ICONERROR);
-            }
-        } catch (...) {
-            if (user_triggered) {
-                MessageBoxW(owner_window, L"检查更新时发生未知错误。", kAppName, MB_OK | MB_ICONERROR);
-            }
+        const bool writable_error =
+            message.find(L"当前目录不可写") != std::wstring::npos || message.find(L"只读") != std::wstring::npos;
+        if (user_triggered || writable_error) {
+            const UINT icon = result == UpdateStageResult::failed ? MB_ICONERROR : MB_ICONINFORMATION;
+            MessageBoxW(owner_window, message.c_str(), kAppName, MB_OK | icon);
         }
     }).detach();
 }
