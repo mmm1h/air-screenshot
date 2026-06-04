@@ -6,6 +6,11 @@ if(NOT WIN32)
     message(FATAL_ERROR "Air Screenshot only supports Windows.")
 endif()
 
+set(AIRSHOT_BUILD_VERSION "" CACHE STRING "Version reported by the Air Screenshot binaries")
+if(AIRSHOT_BUILD_VERSION STREQUAL "")
+    set(AIRSHOT_BUILD_VERSION "${PROJECT_VERSION}")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -32,7 +37,7 @@ target_compile_definitions(airshot_core PUBLIC
     UNICODE
     _UNICODE
     WIN32_LEAN_AND_MEAN
-    AIRSHOT_VERSION="${PROJECT_VERSION}"
+    AIRSHOT_VERSION="${AIRSHOT_BUILD_VERSION}"
 )
 target_compile_options(airshot_core PRIVATE /W4 /permissive- /utf-8)
 target_link_libraries(airshot_core PUBLIC

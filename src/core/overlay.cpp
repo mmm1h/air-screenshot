@@ -665,23 +665,26 @@ private:
     friend class OverlayWindow;
 };
 
-ComPtr<ID2D1Factory> d2d_factory() {
-    static ComPtr<ID2D1Factory> factory = [] {
-        ComPtr<ID2D1Factory> value;
-        D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, value.GetAddressOf());
-        return value;
-    }();
+ComPtr<ID2D1Factory>& d2d_factory() {
+    static ComPtr<ID2D1Factory> factory;
+    if (!factory) {
+        D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, factory.GetAddressOf());
+    }
     return factory;
 }
 
-ComPtr<IDWriteFactory> dwrite_factory() {
-    static ComPtr<IDWriteFactory> factory = [] {
-        ComPtr<IDWriteFactory> value;
+ComPtr<IDWriteFactory>& dwrite_factory() {
+    static ComPtr<IDWriteFactory> factory;
+    if (!factory) {
         DWriteCreateFactory(
-            DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(value.GetAddressOf()));
-        return value;
-    }();
+            DWRITE_FACTORY_TYPE_ISOLATED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(factory.GetAddressOf()));
+    }
     return factory;
+}
+
+void release_overlay_factories() {
+    dwrite_factory().Reset();
+    d2d_factory().Reset();
 }
 
 bool OverlayWindow::create() {
@@ -981,7 +984,9 @@ LRESULT CALLBACK OverlayWindow::window_proc(HWND window, UINT message, WPARAM w_
 
 RegionResult run_region_capture(const RegionRequest& request) {
     OverlaySession session(request);
-    return session.run();
+    RegionResult result = session.run();
+    release_overlay_factories();
+    return result;
 }
 
 }  // namespace airshot

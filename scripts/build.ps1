@@ -2,10 +2,14 @@
 param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",
+    [string]$Version,
     [switch]$Clean
 )
 
 $ErrorActionPreference = "Stop"
+if ($Version -and $Version -notmatch "^\d+\.\d+\.\d+$") {
+    throw "构建版本必须使用 X.Y.Z 格式。"
+}
 $root = Split-Path -Parent $PSScriptRoot
 $build = Join-Path $root "build"
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -20,7 +24,7 @@ if ($Clean -and (Test-Path $build)) {
     Remove-Item -LiteralPath $build -Recurse -Force
 }
 
-$command = "`"$vcvars`" && `"$cmake`" -S `"$root`" -B `"$build`" -G Ninja -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_BUILD_TYPE=$Configuration -DBUILD_TESTING=ON && `"$cmake`" --build `"$build`" --config $Configuration"
+$command = "`"$vcvars`" && `"$cmake`" -S `"$root`" -B `"$build`" -G Ninja -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_BUILD_TYPE=$Configuration -DBUILD_TESTING=ON -DAIRSHOT_BUILD_VERSION=$Version && `"$cmake`" --build `"$build`" --config $Configuration"
 & cmd.exe /d /s /c $command
 if ($LASTEXITCODE -ne 0) { throw "构建失败，退出码 $LASTEXITCODE。" }
 

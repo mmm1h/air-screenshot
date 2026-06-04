@@ -10,6 +10,8 @@
 
 #include <shellapi.h>
 
+#include <malloc.h>
+
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.h>
@@ -30,6 +32,15 @@ constexpr UINT kMenuCapture = 2001;
 constexpr UINT kMenuSettings = 2002;
 constexpr UINT kMenuUpdate = 2003;
 constexpr UINT kMenuExit = 2004;
+
+RegionResult run_trimmed_region_capture(const RegionRequest& request) {
+    RegionResult result = run_region_capture(request);
+    _heapmin();
+    HEAP_OPTIMIZE_RESOURCES_INFORMATION heap_information{HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION, 0};
+    HeapSetInformation(nullptr, HeapOptimizeResources, &heap_information, sizeof(heap_information));
+    SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+    return result;
+}
 
 }  // namespace
 
@@ -249,7 +260,7 @@ void HostApp::capture_region(RegionAction action) {
     request.action = action;
     request.config = config_;
     request.copy_ocr = true;
-    const auto result = run_region_capture(request);
+    const auto result = run_trimmed_region_capture(request);
     if (result.code == ExitCode::success) {
         notify(kAppName, result.message);
     } else if (result.code != ExitCode::user_cancelled) {
@@ -299,7 +310,7 @@ CommandResponse HostApp::execute_capture(const JsonObject& request) {
             region.action = RegionAction::interactive;
             features_.activate(L"annotation", config_);
         }
-        const auto result = run_region_capture(region);
+        const auto result = run_trimmed_region_capture(region);
         return {result.code, result.message, result.path, result.text};
     }
     if (mode == L"window") {
@@ -329,7 +340,7 @@ CommandResponse HostApp::execute_ocr(const JsonObject& request) {
     region.config = config_;
     region.action = RegionAction::ocr;
     region.copy_ocr = request.GetNamedBoolean(L"copy", false);
-    const auto result = run_region_capture(region);
+    const auto result = run_trimmed_region_capture(region);
     return {result.code, result.message, result.path, result.text};
 }
 

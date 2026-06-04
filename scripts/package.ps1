@@ -23,7 +23,8 @@ if ([string]::IsNullOrWhiteSpace($PackageName) -or [string]::IsNullOrWhiteSpace(
 }
 
 $root = Split-Path -Parent $PSScriptRoot
-& (Join-Path $PSScriptRoot "build.ps1") -Configuration Release
+$semver = ($Version -split "\.")[0..2] -join "."
+& (Join-Path $PSScriptRoot "build.ps1") -Configuration Release -Version $semver
 
 $stage = Join-Path $root "dist\stage"
 $site = Join-Path $root "dist\site"
@@ -59,7 +60,6 @@ $manifest = Get-Content (Join-Path $root "packaging\AppxManifest.xml.in") -Raw
 $manifest = $manifest.Replace("__VERSION__", $Version).Replace("__PACKAGE_NAME__", $PackageName).Replace("__PUBLISHER__", $Publisher)
 Set-Content -Path (Join-Path $stage "AppxManifest.xml") -Value $manifest -Encoding utf8NoBOM
 
-$semver = ($Version -split "\.")[0..2] -join "."
 if (-not $PackageUri) {
     $PackageUri = "https://mmm1h.github.io/air-screenshot/AirScreenshot-$semver.msix"
 }

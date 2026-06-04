@@ -13,10 +13,12 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $semver = ($Version -split "\.")[0..2] -join "."
 $site = Join-Path $root "dist\site"
+$cli = Join-Path $root "dist\stage\airshot.exe"
 $msix = Join-Path $site "AirScreenshot-$semver.msix"
 $appInstallerPath = Join-Path $site "AirScreenshot.appinstaller"
 
 foreach ($path in @(
+    $cli,
     $msix,
     $appInstallerPath,
     (Join-Path $site "Install-AirScreenshot.ps1"),
@@ -25,6 +27,11 @@ foreach ($path in @(
     if (-not (Test-Path -LiteralPath $path)) {
         throw "缺少发布文件：$path"
     }
+}
+
+$reportedVersion = (& $cli --version | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne "airshot $semver") {
+    throw "CLI 版本与发布版本不匹配：$reportedVersion"
 }
 
 $package = Get-Item -LiteralPath $msix
