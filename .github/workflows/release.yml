@@ -117,7 +117,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          assets="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '[.assets[].name]')"
+          assets="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name]')"
           test "$assets" = '["AirScreenshot.exe"]'
 
           expected_version="${GITHUB_REF_NAME#v}"
