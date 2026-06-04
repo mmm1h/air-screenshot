@@ -8,6 +8,8 @@
 #include "airshot/overlay.h"
 
 #include <shellapi.h>
+#include <vector>
+#include "pin_window.h"
 
 #include <winrt/Windows.Data.Json.h>
 
@@ -38,6 +40,7 @@ private:
     void show_settings();
     void notify(std::wstring_view title, std::wstring_view message);
     void capture_region(RegionAction action);
+    void check_for_updates(bool user_triggered);
     CommandResponse execute_request(std::wstring_view request_json);
     CommandResponse execute_capture(const winrt::Windows::Data::Json::JsonObject& request);
     CommandResponse execute_ocr(const winrt::Windows::Data::Json::JsonObject& request);
@@ -59,6 +62,7 @@ private:
     FeatureRegistry features_;
     PipeServer pipe_server_;
     NOTIFYICONDATAW tray_{};
+    std::vector<std::unique_ptr<PinWindow>> pin_windows_;
 };
 
 }  // namespace airshot

@@ -15,6 +15,10 @@
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Web.Http.h>
+#include <winrt/Windows.Data.Xml.Dom.h>
+#include <winrt/Windows.Management.Deployment.h>
+#include <thread>
 
 namespace airshot {
 namespace {
@@ -32,6 +36,7 @@ constexpr UINT kMenuCapture = 2001;
 constexpr UINT kMenuSettings = 2002;
 constexpr UINT kMenuUpdate = 2003;
 constexpr UINT kMenuExit = 2004;
+constexpr UINT kMenuCloseAllPins = 2005;
 
 RegionResult run_trimmed_region_capture(const RegionRequest& request) {
     RegionResult result = run_region_capture(request);
@@ -73,6 +78,8 @@ bool HostApp::initialize() {
     window_class.lpfnWndProc = window_proc;
     window_class.hInstance = instance_;
     window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(101));
+    window_class.hIconSm = LoadIconW(instance_, MAKEINTRESOURCEW(101));
     window_class.lpszClassName = kAppWindowClass;
     RegisterClassExW(&window_class);
     window_ = CreateWindowExW(WS_EX_TOOLWINDOW,
@@ -102,6 +109,7 @@ bool HostApp::initialize() {
     });
     if (!transient_) {
         apply_shell();
+        check_for_updates(false);
     }
     return true;
 }
@@ -114,6 +122,7 @@ void HostApp::shutdown() {
     unregister_hotkeys();
     remove_tray();
     pipe_server_.stop();
+    pin_windows_.clear();
     if (window_) {
         DestroyWindow(window_);
         window_ = nullptr;
@@ -165,7 +174,7 @@ void HostApp::add_tray() {
     tray_.uID = 1;
     tray_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     tray_.uCallbackMessage = kTrayMessage;
-    tray_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    tray_.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(101));
     wcscpy_s(tray_.szTip, kAppName);
     tray_added_ = Shell_NotifyIconW(NIM_ADD, &tray_) == TRUE;
     if (tray_added_) {
@@ -208,6 +217,9 @@ void HostApp::show_tray_menu() {
     AppendMenuW(menu, MF_STRING, kMenuCapture, strings::tray_capture.data());
     AppendMenuW(menu, MF_STRING, kMenuSettings, strings::tray_settings.data());
     AppendMenuW(menu, MF_STRING, kMenuUpdate, strings::tray_update.data());
+    if (!pin_windows_.empty()) {
+        AppendMenuW(menu, MF_STRING, kMenuCloseAllPins, L"销毁所有贴图 (Close All Pins)");
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuExit, strings::tray_exit.data());
     POINT cursor{};
@@ -261,8 +273,19 @@ void HostApp::capture_region(RegionAction action) {
     request.config = config_;
     request.copy_ocr = true;
     const auto result = run_trimmed_region_capture(request);
+    if (result.config.custom_color != config_.custom_color) {
+        config_.custom_color = result.config.custom_color;
+        save_config(config_);
+    }
     if (result.code == ExitCode::success) {
-        notify(kAppName, result.message);
+        if (result.action == RegionAction::pin) {
+            auto pin = PinWindow::create(instance_, window_, result.bitmap, result.bounds.left, result.bounds.top);
+            if (pin) {
+                pin_windows_.push_back(std::move(pin));
+            }
+        } else {
+            notify(kAppName, result.message);
+        }
     } else if (result.code != ExitCode::user_cancelled) {
         notify(kAppName, result.message);
     }
@@ -311,6 +334,10 @@ CommandResponse HostApp::execute_capture(const JsonObject& request) {
             features_.activate(L"annotation", config_);
         }
         const auto result = run_trimmed_region_capture(region);
+        if (result.config.custom_color != config_.custom_color) {
+            config_.custom_color = result.config.custom_color;
+            save_config(config_);
+        }
         return {result.code, result.message, result.path, result.text};
     }
     if (mode == L"window") {
@@ -341,6 +368,10 @@ CommandResponse HostApp::execute_ocr(const JsonObject& request) {
     region.action = RegionAction::ocr;
     region.copy_ocr = request.GetNamedBoolean(L"copy", false);
     const auto result = run_trimmed_region_capture(region);
+    if (result.config.custom_color != config_.custom_color) {
+        config_.custom_color = result.config.custom_color;
+        save_config(config_);
+    }
     return {result.code, result.message, result.path, result.text};
 }
 
@@ -421,6 +452,13 @@ CommandResponse HostApp::output_bitmap(
 }
 
 LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
+    if (message == WM_PIN_WINDOW_CLOSED) {
+        auto* pin_ptr = reinterpret_cast<PinWindow*>(l_param);
+        std::erase_if(pin_windows_, [pin_ptr](const auto& pin) {
+            return pin.get() == pin_ptr;
+        });
+        return 0;
+    }
     if (message == kDispatchRequest) {
         auto* context = reinterpret_cast<RequestContext*>(l_param);
         context->response = response_to_json(execute_request(context->request));
@@ -457,7 +495,9 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
         } else if (LOWORD(w_param) == kMenuSettings) {
             show_settings();
         } else if (LOWORD(w_param) == kMenuUpdate) {
-            ShellExecuteW(window_, L"open", kAppInstallerUrl, nullptr, nullptr, SW_SHOWNORMAL);
+            check_for_updates(true);
+        } else if (LOWORD(w_param) == kMenuCloseAllPins) {
+            pin_windows_.clear();
         } else if (LOWORD(w_param) == kMenuExit) {
             PostMessageW(window_, WM_CLOSE, 0, 0);
         }
@@ -483,6 +523,127 @@ LRESULT CALLBACK HostApp::window_proc(HWND window, UINT message, WPARAM w_param,
         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
     }
     return app ? app->handle_message(message, w_param, l_param) : DefWindowProcW(window, message, w_param, l_param);
+}
+
+namespace {
+
+std::vector<int> parse_version(const std::wstring& s) {
+    std::vector<int> parts;
+    std::wstring part;
+    for (wchar_t c : s) {
+        if (c == L'.') {
+            try {
+                parts.push_back(std::stoi(part));
+            } catch (...) {
+                parts.push_back(0);
+            }
+            part.clear();
+        } else if (c >= L'0' && c <= L'9') {
+            part.push_back(c);
+        }
+    }
+    if (!part.empty()) {
+        try {
+            parts.push_back(std::stoi(part));
+        } catch (...) {
+            parts.push_back(0);
+        }
+    }
+    return parts;
+}
+
+bool is_newer_version(const std::wstring& current_str, const std::wstring& latest_str) {
+    auto current = parse_version(current_str);
+    auto latest = parse_version(latest_str);
+    for (size_t i = 0; i < std::max(current.size(), latest.size()); ++i) {
+        int c = i < current.size() ? current[i] : 0;
+        int l = i < latest.size() ? latest[i] : 0;
+        if (l > c) return true;
+        if (l < c) return false;
+    }
+    return false;
+}
+
+} // namespace
+
+void HostApp::check_for_updates(bool user_triggered) {
+    const HWND owner_window = window_;
+    std::thread([owner_window, user_triggered]() {
+        const ScopedWinrtApartment apartment(true);
+        if (!apartment.available()) {
+            if (user_triggered) {
+                MessageBoxW(owner_window, L"无法初始化 Windows Runtime，检查更新失败。", kAppName, MB_OK | MB_ICONERROR);
+            }
+            return;
+        }
+
+        try {
+            winrt::Windows::Web::Http::HttpClient client;
+            winrt::Windows::Foundation::Uri uri(kAppInstallerUrl);
+            winrt::hstring content = client.GetStringAsync(uri).get();
+
+            winrt::Windows::Data::Xml::Dom::XmlDocument doc;
+            doc.LoadXml(content);
+            auto elements = doc.GetElementsByTagName(L"AppInstaller");
+            if (elements.Length() == 0) {
+                if (user_triggered) {
+                    MessageBoxW(owner_window, L"更新配置文件格式无效。", kAppName, MB_OK | MB_ICONERROR);
+                }
+                return;
+            }
+
+            auto version_attr = elements.Item(0).Attributes().GetNamedItem(L"Version");
+            if (!version_attr) {
+                if (user_triggered) {
+                    MessageBoxW(owner_window, L"无法获取最新版本号。", kAppName, MB_OK | MB_ICONERROR);
+                }
+                return;
+            }
+
+            std::wstring latest_version = version_attr.NodeValue().as<winrt::hstring>().c_str();
+            std::wstring current_version = from_utf8(AIRSHOT_VERSION);
+
+            if (is_newer_version(current_version, latest_version)) {
+                std::wstring prompt = std::format(L"发现新版本 (v{})，当前版本为 (v{})。\n\n是否立即开始自动更新？", latest_version, current_version);
+                if (MessageBoxW(owner_window, prompt.c_str(), kAppName, MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                    if (is_process_packaged()) {
+                        MessageBoxW(owner_window, L"正在启动自动更新，程序将会关闭并应用更新。", kAppName, MB_OK | MB_ICONINFORMATION);
+
+                        winrt::Windows::Management::Deployment::PackageManager pm;
+                        pm.AddPackageByAppInstallerFileAsync(
+                            uri,
+                            winrt::Windows::Management::Deployment::AddPackageByAppInstallerOptions::ForceTargetAppShutdown,
+                            nullptr
+                        );
+                    } else {
+                        if (reinterpret_cast<INT_PTR>(
+                                ShellExecuteW(owner_window, L"open", kAppInstallerUrl, nullptr, nullptr, SW_SHOWNORMAL)) <= 32) {
+                            MessageBoxW(owner_window, L"无法打开安装入口。", kAppName, MB_OK | MB_ICONERROR);
+                        }
+                    }
+                }
+            } else {
+                if (user_triggered) {
+                    std::wstring msg = std::format(L"当前已是最新版本 (v{})。", current_version);
+                    MessageBoxW(owner_window, msg.c_str(), kAppName, MB_OK | MB_ICONINFORMATION);
+                }
+            }
+        } catch (const winrt::hresult_error& error) {
+            if (user_triggered) {
+                std::wstring msg = std::format(L"检查更新失败：{}", error.message().c_str());
+                MessageBoxW(owner_window, msg.c_str(), kAppName, MB_OK | MB_ICONERROR);
+            }
+        } catch (const std::exception& e) {
+            if (user_triggered) {
+                std::wstring msg = std::format(L"检查更新出错：{}", from_utf8(e.what()));
+                MessageBoxW(owner_window, msg.c_str(), kAppName, MB_OK | MB_ICONERROR);
+            }
+        } catch (...) {
+            if (user_triggered) {
+                MessageBoxW(owner_window, L"检查更新时发生未知错误。", kAppName, MB_OK | MB_ICONERROR);
+            }
+        }
+    }).detach();
 }
 
 }  // namespace airshot

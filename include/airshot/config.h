@@ -15,6 +15,7 @@ struct AppConfig {
     std::wstring global_ocr_hotkey{L"Ctrl+Alt+O"};
     std::wstring capture_ocr_shortcut{L"Shift+C"};
     std::wstring default_output{L"clipboard"};
+    std::wstring custom_color{L"#8000FF"};
 };
 
 struct Hotkey {

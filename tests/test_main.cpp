@@ -45,10 +45,12 @@ void test_config() {
     config.global_ocr_enabled = true;
     config.capture_hotkey = L"Ctrl+Shift+F9";
     config.global_ocr_hotkey = L"Ctrl+Alt+\\\"O";
+    config.custom_color = L"#123456";
     const auto parsed = airshot::config_from_json(airshot::config_to_json(config));
     expect(parsed.has_value(), L"config JSON round trip parses");
     expect(parsed && !parsed->annotation_enabled && parsed->global_ocr_enabled &&
-               parsed->capture_hotkey == L"Ctrl+Shift+F9" && parsed->global_ocr_hotkey == L"Ctrl+Alt+\\\"O",
+               parsed->capture_hotkey == L"Ctrl+Shift+F9" && parsed->global_ocr_hotkey == L"Ctrl+Alt+\\\"O" &&
+               parsed->custom_color == L"#123456",
            L"config JSON round trip values");
 
     const auto future = airshot::config_from_json(

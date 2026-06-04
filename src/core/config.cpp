@@ -395,7 +395,8 @@ std::wstring config_to_json(const AppConfig& config) {
     result += L",\"globalOcrEnabled\":" + std::wstring(json_boolean(config.global_ocr_enabled));
     result += L",\"globalOcr\":" + quote_json(config.global_ocr_hotkey) + L"}";
     result += L",\"shortcut\":{\"captureOcr\":" + quote_json(config.capture_ocr_shortcut) + L"}";
-    result += L",\"capture\":{\"defaultOutput\":" + quote_json(config.default_output) + L"}}";
+    result += L",\"capture\":{\"defaultOutput\":" + quote_json(config.default_output);
+    result += L",\"customColor\":" + quote_json(config.custom_color) + L"}}";
     return result;
 }
 
@@ -427,6 +428,7 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text) {
     }
     if (const auto* capture = member(*root, L"capture")) {
         config.default_output = named_string(*capture, L"defaultOutput", L"clipboard");
+        config.custom_color = named_string(*capture, L"customColor", L"#8000FF");
     }
     return config;
 }

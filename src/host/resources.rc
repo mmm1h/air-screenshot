@@ -1,0 +1,5 @@
+#pragma code_page(65001) // UTF-8
+
+#define IDI_APP_ICON 101
+
+IDI_APP_ICON ICON "app.ico"

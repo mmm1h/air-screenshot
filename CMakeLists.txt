@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(AirScreenshot VERSION 0.1.0 LANGUAGES CXX)
+project(AirScreenshot VERSION 0.1.5.0 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "Air Screenshot only supports Windows.")
@@ -56,6 +56,9 @@ add_executable(AirScreenshot WIN32
     src/host/host_app.cpp
     src/host/main.cpp
     src/host/settings_window.cpp
+    src/host/pin_window.cpp
+    src/host/resources.rc
+    src/host/AirScreenshot.exe.manifest
 )
 target_include_directories(AirScreenshot PRIVATE src/host)
 target_compile_options(AirScreenshot PRIVATE /W4 /permissive- /utf-8 "$<$<CONFIG:Release>:/Zi>")

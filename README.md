@@ -6,7 +6,7 @@ Air Screenshot 是一个面向 Windows 10 2004+ x64 的轻量原生截图工具�
 
 - 区域、活动窗口、显示器和全虚拟桌面截图
 - 剪贴板与 PNG 输出
-- 可关闭的轻量标注和 Windows 系统 OCR
+- 可关闭的轻量标注、贴图和 Windows 系统 OCR
 - 托盘、开机自启、全局快捷键与正式 CLI
 - MSIX 安装与 App Installer 自动更新
 
@@ -84,7 +84,7 @@ airshot app settings
 ## 限制
 
 - GDI `BitBlt` 无法捕获受保护内容和部分硬件覆盖层。
-- 首版不包含长截图、钉图、录屏、历史记录或第三方 DLL 插件。
+- 首版不包含长截图、录屏、历史记录或第三方 DLL 插件。
 - OCR 只调用 Windows 系统 `Windows.Media.Ocr`，可用语言取决于系统语言包。
 
 项目采用 `LGPL-3.0-only`，第三方来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

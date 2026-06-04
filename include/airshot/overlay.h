@@ -10,6 +10,7 @@ enum class RegionAction {
     clipboard,
     file,
     ocr,
+    pin,
 };
 
 struct RegionRequest {
@@ -24,6 +25,10 @@ struct RegionResult {
     std::wstring message;
     std::wstring path;
     std::wstring text;
+    RegionAction action{RegionAction::interactive};
+    Bitmap bitmap;
+    RectI bounds;
+    AppConfig config;
 };
 
 [[nodiscard]] RegionResult run_region_capture(const RegionRequest& request);
