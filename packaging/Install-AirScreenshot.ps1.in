@@ -1,0 +1,27 @@
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = "Stop"
+$appInstallerUri = "__APPINSTALLER_URI__"
+$certificateUri = "__CERTIFICATE_URI__"
+$temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) "AirScreenshot-Install"
+$certificatePath = Join-Path $temporaryDirectory "AirScreenshot.cer"
+$appInstallerPath = Join-Path $temporaryDirectory "AirScreenshot.appinstaller"
+
+$principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "首次安装需要管理员权限以信任 Air Screenshot 发布证书。请在管理员 PowerShell 中重新运行此脚本。"
+}
+
+New-Item -ItemType Directory -Path $temporaryDirectory -Force | Out-Null
+Invoke-WebRequest -Uri $certificateUri -OutFile $certificatePath
+Invoke-WebRequest -Uri $appInstallerUri -OutFile $appInstallerPath
+
+$certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($certificatePath)
+$storePath = "Cert:\LocalMachine\TrustedPeople"
+if (-not (Test-Path (Join-Path $storePath $certificate.Thumbprint))) {
+    Import-Certificate -FilePath $certificatePath -CertStoreLocation $storePath | Out-Null
+}
+
+Add-AppxPackage -AppInstallerFile -Path $appInstallerPath -ForceTargetApplicationShutdown
+Write-Host "Air Screenshot 已安装，并已启用 Windows 静默更新。"
