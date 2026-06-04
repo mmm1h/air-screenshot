@@ -74,7 +74,7 @@ Set-Content -Path (Join-Path $site "AirScreenshot.appinstaller") -Value $appinst
 $certificateUri = [Uri]::new([Uri]$AppInstallerUri, "AirScreenshot.cer").AbsoluteUri
 $installScript = Get-Content (Join-Path $root "packaging\Install-AirScreenshot.ps1.in") -Raw
 $installScript = $installScript.Replace("__APPINSTALLER_URI__", $AppInstallerUri).Replace("__CERTIFICATE_URI__", $certificateUri)
-Set-Content -Path (Join-Path $site "Install-AirScreenshot.ps1") -Value $installScript -Encoding utf8NoBOM
+Set-Content -Path (Join-Path $site "Install-AirScreenshot.ps1") -Value $installScript -Encoding utf8BOM
 
 $index = Get-Content (Join-Path $root "packaging\index.html.in") -Raw
 $index = $index.Replace("__SEMVER__", $semver)
