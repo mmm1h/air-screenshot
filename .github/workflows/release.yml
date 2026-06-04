@@ -89,7 +89,10 @@ jobs:
           [IO.File]::WriteAllBytes(
             "dist/site/AirScreenshot.cer",
             $certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-          Import-Certificate -FilePath "dist/site/AirScreenshot.cer" -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
+          certutil.exe -user -addstore -f Root "dist/site/AirScreenshot.cer"
+          if ($LASTEXITCODE -ne 0) {
+            throw "无法在 runner 上信任发布证书。"
+          }
 
       - name: Validate release package
         shell: pwsh
