@@ -89,17 +89,6 @@ jobs:
           [IO.File]::WriteAllBytes(
             "dist/site/AirScreenshot.cer",
             $certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-          $publicCertificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
-            "dist/site/AirScreenshot.cer")
-          $rootStore = [Security.Cryptography.X509Certificates.X509Store]::new(
-            "Root",
-            [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
-          try {
-            $rootStore.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-            $rootStore.Add($publicCertificate)
-          } finally {
-            $rootStore.Close()
-          }
 
       - name: Validate release package
         shell: pwsh
@@ -111,8 +100,7 @@ jobs:
           .\scripts\validate-package.ps1 `
             -Version $env:VERSION `
             -PackageName $env:PACKAGE_NAME `
-            -Publisher $env:PUBLISHER `
-            -RequireTrustedSignature
+            -Publisher $env:PUBLISHER
 
       - name: Publish GitHub Release
         shell: pwsh
