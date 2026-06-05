@@ -1,110 +1,360 @@
 #include "overlay_session.h"
 
 namespace airshot::overlay_detail {
+namespace {
+
+bool hidden(const AppConfig& config, std::wstring_view id) {
+    return annotation_tool_hidden(config.annotation_hidden_tools, id);
+}
+
+void trim_trailing_separators(std::vector<std::pair<std::wstring, std::wstring>>& items) {
+    while (!items.empty() && items.back().first == L"|") {
+        items.pop_back();
+    }
+}
+
+void add_separator(std::vector<std::pair<std::wstring, std::wstring>>& items) {
+    if (!items.empty() && items.back().first != L"|") {
+        items.push_back({L"|", L""});
+    }
+}
+
+struct ToolbarMetrics {
+    int button_width;
+    int button_height;
+    int spacing;
+    int padding;
+};
+
+struct ToolbarRow {
+    std::vector<std::pair<std::wstring, std::wstring>> items;
+    int width{};
+};
+
+int item_width(std::wstring_view id, const ToolbarMetrics& metrics) {
+    return id == L"|" ? 12 : metrics.button_width;
+}
+
+int row_width(const std::vector<std::pair<std::wstring, std::wstring>>& items, const ToolbarMetrics& metrics) {
+    int width = 0;
+    for (std::size_t index = 0; index < items.size(); ++index) {
+        if (index > 0) {
+            width += metrics.spacing;
+        }
+        width += item_width(items[index].first, metrics);
+    }
+    return width;
+}
+
+void trim_row(ToolbarRow& row, const ToolbarMetrics& metrics) {
+    while (!row.items.empty() && row.items.back().first == L"|") {
+        row.items.pop_back();
+    }
+    row.width = row_width(row.items, metrics);
+}
+
+std::vector<ToolbarRow> wrap_toolbar_items(const std::vector<std::pair<std::wstring, std::wstring>>& items,
+                                           const ToolbarMetrics& metrics,
+                                           const RectI& bounds) {
+    const int available_width = std::max(metrics.button_width, bounds.width() - 2 * metrics.padding);
+    std::vector<ToolbarRow> rows;
+    ToolbarRow current;
+    for (const auto& item : items) {
+        const bool separator = item.first == L"|";
+        if (separator && current.items.empty()) {
+            continue;
+        }
+        const int width = item_width(item.first, metrics);
+        const int next_width = current.items.empty() ? width : current.width + metrics.spacing + width;
+        if (!current.items.empty() && next_width > available_width) {
+            trim_row(current, metrics);
+            if (!current.items.empty()) {
+                rows.push_back(std::move(current));
+            }
+            current = {};
+            if (separator) {
+                continue;
+            }
+        }
+        current.width = current.items.empty() ? width : current.width + metrics.spacing + width;
+        current.items.push_back(item);
+    }
+    trim_row(current, metrics);
+    if (!current.items.empty()) {
+        rows.push_back(std::move(current));
+    }
+    return rows;
+}
+
+int toolbar_width(const std::vector<ToolbarRow>& rows, const ToolbarMetrics& metrics) {
+    int width = 0;
+    for (const auto& row : rows) {
+        width = std::max(width, row.width);
+    }
+    return width + 2 * metrics.padding;
+}
+
+int toolbar_height(const std::vector<ToolbarRow>& rows, const ToolbarMetrics& metrics) {
+    if (rows.empty()) {
+        return 0;
+    }
+    return static_cast<int>(rows.size()) * metrics.button_height +
+           static_cast<int>(rows.size() - 1) * metrics.spacing + 2 * metrics.padding;
+}
+
+int clamp_axis(int value, int size, int minimum, int maximum) {
+    if (size >= maximum - minimum) {
+        return minimum;
+    }
+    return std::clamp(value, minimum, maximum - size);
+}
+
+void place_toolbar_rows(std::vector<ToolbarButton>& target,
+                        const std::vector<ToolbarRow>& rows,
+                        const ToolbarMetrics& metrics,
+                        int left,
+                        int top) {
+    target.clear();
+    int y = top + metrics.padding;
+    for (const auto& row : rows) {
+        int x = left + metrics.padding;
+        for (const auto& item : row.items) {
+            const int width = item_width(item.first, metrics);
+            target.push_back({item.first, item.second, {x, y, x + width, y + metrics.button_height}});
+            x += width + metrics.spacing;
+        }
+        y += metrics.button_height + metrics.spacing;
+    }
+}
+
+RectI buttons_bounds(const std::vector<ToolbarButton>& buttons) {
+    if (buttons.empty()) {
+        return {};
+    }
+    RectI bounds = buttons.front().bounds;
+    for (const auto& button : buttons) {
+        bounds.left = std::min(bounds.left, button.bounds.left);
+        bounds.top = std::min(bounds.top, button.bounds.top);
+        bounds.right = std::max(bounds.right, button.bounds.right);
+        bounds.bottom = std::max(bounds.bottom, button.bounds.bottom);
+    }
+    return bounds;
+}
+
+Tool tool_from_id(std::wstring_view id) {
+    if (id == L"rect") return Tool::rectangle;
+    if (id == L"ellipse") return Tool::ellipse;
+    if (id == L"line") return Tool::line;
+    if (id == L"arrow") return Tool::arrow;
+    if (id == L"pen") return Tool::pen;
+    if (id == L"mosaic") return Tool::mosaic;
+    if (id == L"highlight") return Tool::highlight;
+    if (id == L"text") return Tool::text;
+    if (id == L"serial") return Tool::serial;
+    if (id == L"eraser") return Tool::eraser;
+    return Tool::none;
+}
+
+bool tool_supports_color(Tool tool) {
+    return tool == Tool::rectangle || tool == Tool::ellipse || tool == Tool::line || tool == Tool::arrow ||
+           tool == Tool::pen || tool == Tool::highlight || tool == Tool::text || tool == Tool::serial;
+}
+
+bool tool_supports_width(Tool tool) {
+    return tool == Tool::rectangle || tool == Tool::ellipse || tool == Tool::line || tool == Tool::arrow ||
+           tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::eraser;
+}
+
+bool tool_supports_alpha(Tool tool) {
+    return tool == Tool::highlight;
+}
+
+void blend_pixel(Bitmap& bitmap, int x, int y, COLORREF color, int alpha) {
+    if (x < 0 || y < 0 || x >= bitmap.width || y >= bitmap.height) {
+        return;
+    }
+    alpha = std::clamp(alpha, 0, 255);
+    const std::size_t index = static_cast<std::size_t>(y * bitmap.width + x) * 4U;
+    auto blend = [alpha](std::uint8_t dst, std::uint8_t src) {
+        return static_cast<std::uint8_t>((static_cast<int>(src) * alpha + static_cast<int>(dst) * (255 - alpha)) / 255);
+    };
+    bitmap.pixels[index] = blend(bitmap.pixels[index], GetBValue(color));
+    bitmap.pixels[index + 1] = blend(bitmap.pixels[index + 1], GetGValue(color));
+    bitmap.pixels[index + 2] = blend(bitmap.pixels[index + 2], GetRValue(color));
+    bitmap.pixels[index + 3] = 255;
+}
+
+void blend_circle(Bitmap& bitmap, POINT center, int radius, COLORREF color, int alpha) {
+    const int radius_sq = radius * radius;
+    for (int y = center.y - radius; y <= center.y + radius; ++y) {
+        for (int x = center.x - radius; x <= center.x + radius; ++x) {
+            const int dx = x - center.x;
+            const int dy = y - center.y;
+            if (dx * dx + dy * dy <= radius_sq) {
+                blend_pixel(bitmap, x, y, color, alpha);
+            }
+        }
+    }
+}
+
+void blend_line(Bitmap& bitmap, POINT start, POINT end, int radius, COLORREF color, int alpha) {
+    const int dx = end.x - start.x;
+    const int dy = end.y - start.y;
+    const int steps = std::max(std::abs(dx), std::abs(dy));
+    if (steps <= 0) {
+        blend_circle(bitmap, start, radius, color, alpha);
+        return;
+    }
+    for (int index = 0; index <= steps; ++index) {
+        const double t = static_cast<double>(index) / static_cast<double>(steps);
+        POINT point{
+            static_cast<LONG>(std::lround(start.x + dx * t)),
+            static_cast<LONG>(std::lround(start.y + dy * t)),
+        };
+        blend_circle(bitmap, point, radius, color, alpha);
+    }
+}
+
+void draw_polyline(HDC dc, const std::vector<POINT>& points) {
+    if (points.empty()) {
+        return;
+    }
+    MoveToEx(dc, points.front().x, points.front().y, nullptr);
+    for (std::size_t index = 1; index < points.size(); ++index) {
+        LineTo(dc, points[index].x, points[index].y);
+    }
+}
+
+}  // namespace
 
 void OverlaySession::build_toolbar() {
     toolbar_.clear();
     std::vector<std::pair<std::wstring, std::wstring>> items;
     if (request_.config.annotation_enabled) {
-        items.push_back({L"rect", std::wstring(strings::toolbar_rectangle)});
-        items.push_back({L"arrow", std::wstring(strings::toolbar_arrow)});
-        items.push_back({L"mosaic", std::wstring(strings::toolbar_mosaic)});
-        items.push_back({L"text", std::wstring(strings::toolbar_text)});
+        auto add_tool = [&](std::wstring_view id, std::wstring_view label) {
+            if (!hidden(request_.config, id)) {
+                items.push_back({std::wstring(id), std::wstring(label)});
+            }
+        };
+        add_tool(L"lock", strings::toolbar_lock);
+        add_separator(items);
+        add_tool(L"rect", strings::toolbar_rectangle);
+        add_tool(L"ellipse", strings::toolbar_ellipse);
+        add_tool(L"line", strings::toolbar_line);
+        add_tool(L"arrow", strings::toolbar_arrow);
+        add_tool(L"pen", strings::toolbar_pen);
+        add_tool(L"mosaic", strings::toolbar_mosaic);
+        add_tool(L"highlight", strings::toolbar_highlight);
+        add_tool(L"text", strings::toolbar_text);
+        add_tool(L"serial", strings::toolbar_serial);
+        add_tool(L"eraser", strings::toolbar_eraser);
         bool show_undo = !annotations_.empty();
         bool show_redo = !redo_.empty();
         if (show_undo || show_redo) {
-            items.push_back({L"|", L""});
-            if (show_undo) {
+            add_separator(items);
+            if (show_undo && !hidden(request_.config, L"undo")) {
                 items.push_back({L"undo", std::wstring(strings::toolbar_undo)});
             }
-            if (show_redo) {
+            if (show_redo && !hidden(request_.config, L"redo")) {
                 items.push_back({L"redo", std::wstring(strings::toolbar_redo)});
             }
         }
-        items.push_back({L"|", L""});
+        add_separator(items);
     }
     if (request_.config.ocr_enabled) {
-        items.push_back({L"ocr", std::wstring(strings::toolbar_ocr)});
-    }
-    items.push_back({L"scroll", L"长"});
-    items.push_back({L"pin", L"钉"});
-    items.push_back({L"|", L""});
-    items.push_back({L"copy", std::wstring(strings::toolbar_copy)});
-    items.push_back({L"save", std::wstring(strings::toolbar_save)});
-    items.push_back({L"close", std::wstring(strings::toolbar_close)});
-
-    constexpr int button_width = 36;
-    constexpr int button_height = 32;
-    constexpr int spacing = 4;
-    constexpr int padding = 6;
-    constexpr int toolbar_height = button_height + 2 * padding;
-
-    int total_width = 2 * padding;
-    for (std::size_t index = 0; index < items.size(); ++index) {
-        int w = (items[index].first == L"|") ? 12 : button_width;
-        total_width += w;
-        if (index > 0) {
-            total_width += spacing;
+        if (!hidden(request_.config, L"ocr")) {
+            items.push_back({L"ocr", std::wstring(strings::toolbar_ocr)});
         }
     }
+    if (!hidden(request_.config, L"scroll")) items.push_back({L"scroll", L"长"});
+    if (!hidden(request_.config, L"pin")) items.push_back({L"pin", L"钉"});
+    add_separator(items);
+    if (!hidden(request_.config, L"copy")) items.push_back({L"copy", std::wstring(strings::toolbar_copy)});
+    if (!hidden(request_.config, L"save")) items.push_back({L"save", std::wstring(strings::toolbar_save)});
+    if (!hidden(request_.config, L"close")) items.push_back({L"close", std::wstring(strings::toolbar_close)});
+    trim_trailing_separators(items);
 
-    int left = std::min(selection_.right - total_width, virtual_bounds_.right - total_width);
-    left = std::max(left, virtual_bounds_.left);
-    int top = selection_.bottom + 6;
-    if (top + toolbar_height > virtual_bounds_.bottom) {
-        top = selection_.top - toolbar_height - 6;
+    const ToolbarMetrics metrics{36, 32, 4, 6};
+    const auto rows = wrap_toolbar_items(items, metrics, virtual_bounds_);
+    const int total_width = toolbar_width(rows, metrics);
+    const int total_height = toolbar_height(rows, metrics);
+    if (rows.empty()) {
+        toolbar_.clear();
+        sub_toolbar_.clear();
+        return;
     }
-    top = std::max(virtual_bounds_.top, top);
 
-    int current_x = left + padding;
-    for (std::size_t index = 0; index < items.size(); ++index) {
-        int w = (items[index].first == L"|") ? 12 : button_width;
-        int y = top + padding;
-        toolbar_.push_back({items[index].first, items[index].second, {current_x, y, current_x + w, y + button_height}});
-        current_x += w + spacing;
+    const int preferred_left = selection_.right - total_width;
+    const int left = clamp_axis(preferred_left, total_width, virtual_bounds_.left, virtual_bounds_.right);
+    const int below_top = selection_.bottom + 6;
+    const int above_top = selection_.top - total_height - 6;
+    int top = below_top;
+    if (below_top + total_height > virtual_bounds_.bottom && above_top >= virtual_bounds_.top) {
+        top = above_top;
     }
+    top = clamp_axis(top, total_height, virtual_bounds_.top, virtual_bounds_.bottom);
+
+    place_toolbar_rows(toolbar_, rows, metrics, left, top);
     build_sub_toolbar();
 }
 
 void OverlaySession::build_sub_toolbar() {
     sub_toolbar_.clear();
-    if (active_tool_ != Tool::rectangle && active_tool_ != Tool::arrow && active_tool_ != Tool::text) {
+    if (active_tool_ == Tool::none) {
         return;
     }
-    std::vector<std::pair<std::wstring, std::wstring>> items = {
-        {L"color_red", L"红"},
-        {L"color_green", L"绿"},
-        {L"color_blue", L"蓝"},
-        {L"color_yellow", L"黄"},
-        {L"color_black", L"黑"},
-        {L"color_white", L"白"},
-        {L"width_small", L"细"},
-        {L"width_medium", L"中"},
-        {L"width_large", L"粗"}
-    };
-
-    constexpr int button_width = 32;
-    constexpr int button_height = 30;
-    constexpr int spacing = 4;
-    constexpr int padding = 6;
-    constexpr int sub_toolbar_height = button_height + 2 * padding;
+    std::vector<std::pair<std::wstring, std::wstring>> items;
+    if (tool_supports_color(active_tool_)) {
+        items.push_back({L"color_red", L"红"});
+        items.push_back({L"color_green", L"绿"});
+        items.push_back({L"color_blue", L"蓝"});
+        items.push_back({L"color_yellow", L"黄"});
+        items.push_back({L"color_black", L"黑"});
+        items.push_back({L"color_white", L"白"});
+        items.push_back({L"color_custom", L"自"});
+    }
+    if (tool_supports_width(active_tool_)) {
+        if (!items.empty()) {
+            items.push_back({L"|", L""});
+        }
+        items.push_back({L"width_small", L"细"});
+        items.push_back({L"width_medium", L"中"});
+        items.push_back({L"width_large", L"粗"});
+    }
+    if (tool_supports_alpha(active_tool_)) {
+        if (!items.empty()) {
+            items.push_back({L"|", L""});
+        }
+        items.push_back({L"alpha_low", L"浅"});
+        items.push_back({L"alpha_medium", L"中"});
+        items.push_back({L"alpha_high", L"深"});
+    }
+    if (items.empty()) {
+        return;
+    }
 
     if (toolbar_.empty()) return;
-    int left = toolbar_.front().bounds.left - padding;
-
-    bool main_above = (toolbar_.front().bounds.top < selection_.top);
-    int top = 0;
-    if (main_above) {
-        top = toolbar_.front().bounds.top - padding - sub_toolbar_height - 6;
-    } else {
-        top = toolbar_.front().bounds.bottom + padding + 6;
+    const ToolbarMetrics metrics{32, 30, 4, 6};
+    const auto rows = wrap_toolbar_items(items, metrics, virtual_bounds_);
+    const int total_width = toolbar_width(rows, metrics);
+    const int total_height = toolbar_height(rows, metrics);
+    if (rows.empty()) {
+        return;
     }
 
-    for (std::size_t i = 0; i < items.size(); ++i) {
-        int x = left + padding + static_cast<int>(i) * (button_width + spacing);
-        int y = top + padding;
-        sub_toolbar_.push_back({items[i].first, items[i].second, {x, y, x + button_width, y + button_height}});
+    const RectI anchor = buttons_bounds(toolbar_);
+    const int left = clamp_axis(anchor.left - metrics.padding, total_width, virtual_bounds_.left, virtual_bounds_.right);
+    const bool main_above = anchor.top < selection_.top;
+    const int preferred_top = main_above ? anchor.top - total_height - 6 : anchor.bottom + 6;
+    const int fallback_top = main_above ? anchor.bottom + 6 : anchor.top - total_height - 6;
+    int top = preferred_top;
+    if ((top < virtual_bounds_.top || top + total_height > virtual_bounds_.bottom) &&
+        fallback_top >= virtual_bounds_.top && fallback_top + total_height <= virtual_bounds_.bottom) {
+        top = fallback_top;
     }
+    top = clamp_axis(top, total_height, virtual_bounds_.top, virtual_bounds_.bottom);
+
+    place_toolbar_rows(sub_toolbar_, rows, metrics, left, top);
 }
 
 void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
@@ -140,18 +390,27 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
         active_width_ = 4.0F;
     } else if (id == L"width_large") {
         active_width_ = 8.0F;
+    } else if (id == L"alpha_low") {
+        active_highlight_alpha_ = 64;
+        request_.config.annotation_highlight_alpha = active_highlight_alpha_;
+    } else if (id == L"alpha_medium") {
+        active_highlight_alpha_ = 96;
+        request_.config.annotation_highlight_alpha = active_highlight_alpha_;
+    } else if (id == L"alpha_high") {
+        active_highlight_alpha_ = 144;
+        request_.config.annotation_highlight_alpha = active_highlight_alpha_;
     }
 }
 
 void OverlaySession::invoke(std::wstring_view id, HWND source) {
-    if (id == L"rect") {
-        active_tool_ = Tool::rectangle;
-    } else if (id == L"arrow") {
-        active_tool_ = Tool::arrow;
-    } else if (id == L"mosaic") {
-        active_tool_ = Tool::mosaic;
-    } else if (id == L"text") {
-        active_tool_ = Tool::text;
+    if (id == L"lock") {
+        request_.config.annotation_locked_tool = !request_.config.annotation_locked_tool;
+    } else if (const Tool tool = tool_from_id(id); tool != Tool::none) {
+        const bool switching_on = active_tool_ != tool;
+        active_tool_ = switching_on ? tool : Tool::none;
+        if (switching_on && tool == Tool::highlight && active_color_ == RGB(245, 34, 45)) {
+            active_color_ = RGB(250, 219, 20);
+        }
     } else if (id == L"undo") {
         undo();
     } else if (id == L"redo") {
@@ -169,7 +428,16 @@ void OverlaySession::invoke(std::wstring_view id, HWND source) {
     } else if (id == L"close") {
         finish({ExitCode::user_cancelled, L"已取消。"});
     }
+    build_toolbar();
     build_sub_toolbar();
+    invalidate_all();
+}
+
+void OverlaySession::finish_annotation() {
+    if (!request_.config.annotation_locked_tool) {
+        active_tool_ = Tool::none;
+    }
+    build_toolbar();
     invalidate_all();
 }
 
@@ -203,6 +471,15 @@ Bitmap OverlaySession::rendered_selection() const {
         if (annotation.tool == Tool::mosaic) {
             for (const POINT point : annotation.points) {
                 pixelate_circle(result, point, 14, 8);
+            }
+        } else if (annotation.tool == Tool::highlight) {
+            const int radius = std::max(4, static_cast<int>(std::lround(annotation.width * 1.6F)));
+            if (annotation.points.size() > 1) {
+                for (std::size_t index = 1; index < annotation.points.size(); ++index) {
+                    blend_line(result, annotation.points[index - 1], annotation.points[index], radius, annotation.color, annotation.alpha);
+                }
+            } else {
+                blend_line(result, annotation.start, annotation.end, radius, annotation.color, annotation.alpha);
             }
         }
     }
@@ -243,7 +520,16 @@ Bitmap OverlaySession::rendered_selection() const {
         SetTextColor(dc, annotation.color);
 
         if (annotation.tool == Tool::rectangle) {
-            Rectangle(dc, annotation.start.x, annotation.start.y, annotation.end.x, annotation.end.y);
+            const RectI bounds{annotation.start.x, annotation.start.y, annotation.end.x, annotation.end.y};
+            const RectI normalized = bounds.normalized();
+            Rectangle(dc, normalized.left, normalized.top, normalized.right, normalized.bottom);
+        } else if (annotation.tool == Tool::ellipse) {
+            const RectI bounds{annotation.start.x, annotation.start.y, annotation.end.x, annotation.end.y};
+            const RectI normalized = bounds.normalized();
+            Ellipse(dc, normalized.left, normalized.top, normalized.right, normalized.bottom);
+        } else if (annotation.tool == Tool::line) {
+            MoveToEx(dc, annotation.start.x, annotation.start.y, nullptr);
+            LineTo(dc, annotation.end.x, annotation.end.y);
         } else if (annotation.tool == Tool::arrow) {
             MoveToEx(dc, annotation.start.x, annotation.start.y, nullptr);
             LineTo(dc, annotation.end.x, annotation.end.y);
@@ -257,12 +543,36 @@ Bitmap OverlaySession::rendered_selection() const {
                        annotation.end.x - static_cast<int>(std::cos(angle + offset) * length),
                        annotation.end.y - static_cast<int>(std::sin(angle + offset) * length));
             }
+        } else if (annotation.tool == Tool::pen) {
+            draw_polyline(dc, annotation.points);
         } else if (annotation.tool == Tool::text) {
             TextOutW(dc,
                      annotation.start.x,
                      annotation.start.y,
                      annotation.text.c_str(),
                      static_cast<int>(annotation.text.size()));
+        } else if (annotation.tool == Tool::serial) {
+            constexpr int radius = 13;
+            HBRUSH fill_brush = CreateSolidBrush(annotation.color);
+            HGDIOBJ old_fill = SelectObject(dc, fill_brush);
+            Ellipse(dc,
+                    annotation.start.x - radius,
+                    annotation.start.y - radius,
+                    annotation.start.x + radius,
+                    annotation.start.y + radius);
+            SelectObject(dc, old_fill);
+            DeleteObject(fill_brush);
+
+            const std::wstring serial_text = std::to_wstring(annotation.serial);
+            RECT text_rect{
+                annotation.start.x - radius,
+                annotation.start.y - radius,
+                annotation.start.x + radius,
+                annotation.start.y + radius,
+            };
+            SetTextColor(dc, RGB(255, 255, 255));
+            DrawTextW(dc, serial_text.c_str(), static_cast<int>(serial_text.size()), &text_rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(dc, annotation.color);
         }
         SelectObject(dc, previous_pen);
         DeleteObject(pen);

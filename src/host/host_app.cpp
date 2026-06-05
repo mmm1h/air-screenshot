@@ -244,6 +244,27 @@ void HostApp::notify(std::wstring_view title, std::wstring_view message) {
     tray_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
 }
 
+void HostApp::sync_region_config(const RegionResult& result) {
+    if (result.code == ExitCode::operation_failed && result.bounds.empty()) {
+        return;
+    }
+    const AppConfig& next = result.config;
+    const bool changed = config_.custom_color != next.custom_color ||
+                         config_.annotation_locked_tool != next.annotation_locked_tool ||
+                         config_.annotation_hidden_tools != next.annotation_hidden_tools ||
+                         config_.annotation_highlight_alpha != next.annotation_highlight_alpha ||
+                         config_.annotation_next_serial != next.annotation_next_serial;
+    if (!changed) {
+        return;
+    }
+    config_.custom_color = next.custom_color;
+    config_.annotation_locked_tool = next.annotation_locked_tool;
+    config_.annotation_hidden_tools = next.annotation_hidden_tools;
+    config_.annotation_highlight_alpha = next.annotation_highlight_alpha;
+    config_.annotation_next_serial = next.annotation_next_serial;
+    save_config(config_);
+}
+
 void HostApp::capture_region(RegionAction action) {
     if (action == RegionAction::interactive && config_.annotation_enabled) {
         features_.activate(L"annotation", config_);
@@ -255,10 +276,7 @@ void HostApp::capture_region(RegionAction action) {
     request.config = config_;
     request.copy_ocr = true;
     const auto result = run_trimmed_region_capture(request);
-    if (result.config.custom_color != config_.custom_color) {
-        config_.custom_color = result.config.custom_color;
-        save_config(config_);
-    }
+    sync_region_config(result);
     if (result.code == ExitCode::success) {
         if (result.action == RegionAction::pin) {
             auto pin = PinWindow::create(instance_, window_, result.bitmap, result.bounds.left, result.bounds.top);
@@ -318,10 +336,7 @@ CommandResponse HostApp::execute_capture(const JsonObject& request) {
             features_.activate(L"annotation", config_);
         }
         const auto result = run_trimmed_region_capture(region);
-        if (result.config.custom_color != config_.custom_color) {
-            config_.custom_color = result.config.custom_color;
-            save_config(config_);
-        }
+        sync_region_config(result);
         return {result.code, result.message, result.path, result.text};
     }
     if (mode == L"window") {
@@ -352,10 +367,7 @@ CommandResponse HostApp::execute_ocr(const JsonObject& request) {
     region.action = RegionAction::ocr;
     region.copy_ocr = request.GetNamedBoolean(L"copy", false);
     const auto result = run_trimmed_region_capture(region);
-    if (result.config.custom_color != config_.custom_color) {
-        config_.custom_color = result.config.custom_color;
-        save_config(config_);
-    }
+    sync_region_config(result);
     return {result.code, result.message, result.path, result.text};
 }
 

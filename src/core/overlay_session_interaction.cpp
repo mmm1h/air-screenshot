@@ -1,9 +1,84 @@
 #include "overlay_session.h"
 
 namespace airshot::overlay_detail {
+namespace {
+
+bool tool_uses_points(Tool tool) {
+    return tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::eraser;
+}
+
+bool annotation_has_size(const Annotation& annotation) {
+    if (tool_uses_points(annotation.tool)) {
+        return annotation.points.size() > 1;
+    }
+    return annotation.start.x != annotation.end.x || annotation.start.y != annotation.end.y;
+}
+
+double distance_to_segment(POINT point, POINT start, POINT end) {
+    const double dx = static_cast<double>(end.x - start.x);
+    const double dy = static_cast<double>(end.y - start.y);
+    if (dx == 0.0 && dy == 0.0) {
+        return std::hypot(static_cast<double>(point.x - start.x), static_cast<double>(point.y - start.y));
+    }
+    double t = (static_cast<double>(point.x - start.x) * dx + static_cast<double>(point.y - start.y) * dy) /
+               (dx * dx + dy * dy);
+    t = std::clamp(t, 0.0, 1.0);
+    const double nearest_x = static_cast<double>(start.x) + t * dx;
+    const double nearest_y = static_cast<double>(start.y) + t * dy;
+    return std::hypot(static_cast<double>(point.x) - nearest_x, static_cast<double>(point.y) - nearest_y);
+}
+
+bool near_polyline(POINT point, const std::vector<POINT>& points, double threshold) {
+    if (points.empty()) {
+        return false;
+    }
+    if (points.size() == 1) {
+        return std::hypot(static_cast<double>(point.x - points.front().x), static_cast<double>(point.y - points.front().y)) <= threshold;
+    }
+    for (std::size_t index = 1; index < points.size(); ++index) {
+        if (distance_to_segment(point, points[index - 1], points[index]) <= threshold) {
+            return true;
+        }
+    }
+    return false;
+}
+
+RectI inflated(RectI rect, int amount) {
+    rect.left -= amount;
+    rect.top -= amount;
+    rect.right += amount;
+    rect.bottom += amount;
+    return rect;
+}
+
+bool hit_annotation(const Annotation& annotation, POINT point) {
+    const double threshold = std::max(8.0, static_cast<double>(annotation.width) + 5.0);
+    const RectI bounds{annotation.start.x, annotation.start.y, annotation.end.x, annotation.end.y};
+    switch (annotation.tool) {
+        case Tool::rectangle:
+        case Tool::ellipse:
+            return inflated(bounds.normalized(), static_cast<int>(threshold)).contains(point);
+        case Tool::line:
+        case Tool::arrow:
+            return distance_to_segment(point, annotation.start, annotation.end) <= threshold;
+        case Tool::pen:
+        case Tool::mosaic:
+        case Tool::highlight:
+            return near_polyline(point, annotation.points, threshold + (annotation.tool == Tool::mosaic ? 10.0 : 0.0));
+        case Tool::text:
+            return RectI{annotation.start.x, annotation.start.y, annotation.start.x + 160, annotation.start.y + 32}.contains(point);
+        case Tool::serial:
+            return std::hypot(static_cast<double>(point.x - annotation.start.x), static_cast<double>(point.y - annotation.start.y)) <= 18.0;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
 
 OverlaySession::OverlaySession(RegionRequest request) : request_(std::move(request)) {
     custom_color_ = parse_hex_color(request_.config.custom_color, RGB(128, 0, 255));
+    active_highlight_alpha_ = std::clamp(request_.config.annotation_highlight_alpha, 24, 192);
 }
 
 RegionResult OverlaySession::run() {
@@ -83,6 +158,19 @@ DragMode OverlaySession::hit_test_drag_mode(POINT point) const {
     return DragMode::none;
 }
 
+bool OverlaySession::erase_annotation_at(POINT relative) {
+    for (auto it = annotations_.rbegin(); it != annotations_.rend(); ++it) {
+        if (hit_annotation(*it, relative)) {
+            redo_.clear();
+            annotations_.erase((it + 1).base());
+            build_toolbar();
+            invalidate_all();
+            return true;
+        }
+    }
+    return false;
+}
+
 void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
     if (right) {
         finish({ExitCode::user_cancelled, L"已取消。"});
@@ -97,6 +185,7 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
             }
         }
         for (const auto& button : sub_toolbar_) {
+            if (button.id == L"|") continue;
             if (button.bounds.contains(point)) {
                 invoke_sub(button.id, source);
                 invalidate_all();
@@ -115,13 +204,43 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
                 if (auto text = prompt_text(source, point)) {
                     discard_redo();
                     annotations_.push_back({Tool::text, relative, relative, {}, std::move(*text), active_color_, active_width_});
-                    invalidate_all();
+                    finish_annotation();
                 }
                 return;
             }
+            if (active_tool_ == Tool::serial) {
+                discard_redo();
+                annotations_.push_back({Tool::serial,
+                                        relative,
+                                        relative,
+                                        {},
+                                        {},
+                                        active_color_,
+                                        active_width_,
+                                        255,
+                                        std::max(1, request_.config.annotation_next_serial)});
+                request_.config.annotation_next_serial = std::max(1, request_.config.annotation_next_serial) + 1;
+                finish_annotation();
+                return;
+            }
+            if (active_tool_ == Tool::eraser) {
+                erase_annotation_at(relative);
+                drawing_annotation_ = true;
+                preview_ = {active_tool_, relative, relative, {relative}, {}, active_color_, active_width_};
+                current_drag_mode_ = DragMode::annotate;
+                SetCapture(source);
+                return;
+            }
             drawing_annotation_ = true;
-            preview_ = {active_tool_, relative, relative, {}, {}, active_color_, active_width_};
-            if (active_tool_ == Tool::mosaic) {
+            preview_ = {active_tool_,
+                        relative,
+                        relative,
+                        {},
+                        {},
+                        active_color_,
+                        active_width_,
+                        active_tool_ == Tool::highlight ? active_highlight_alpha_ : 255};
+            if (tool_uses_points(active_tool_)) {
                 preview_.points.push_back(relative);
             }
             current_drag_mode_ = DragMode::annotate;
@@ -149,9 +268,15 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
 void OverlaySession::on_mouse_move(POINT point) {
     cursor_pos_ = point;
     if (selection_complete_ && drawing_annotation_) {
-        preview_.end = {point.x - selection_.left, point.y - selection_.top};
-        if (preview_.tool == Tool::mosaic && selection_.contains(point)) {
-            const POINT relative{point.x - selection_.left, point.y - selection_.top};
+        const POINT relative{point.x - selection_.left, point.y - selection_.top};
+        preview_.end = relative;
+        if (preview_.tool == Tool::eraser) {
+            if (selection_.contains(point)) {
+                erase_annotation_at(relative);
+            }
+            return;
+        }
+        if (tool_uses_points(preview_.tool) && selection_.contains(point)) {
             if (preview_.points.empty() || std::abs(relative.x - preview_.points.back().x) > 2 ||
                 std::abs(relative.y - preview_.points.back().y) > 2) {
                 preview_.points.push_back(relative);
@@ -240,6 +365,7 @@ void OverlaySession::on_mouse_move(POINT point) {
         }
         if (current_hovered.empty()) {
             for (const auto& button : sub_toolbar_) {
+                if (button.id == L"|") continue;
                 if (button.bounds.contains(point)) {
                     current_hovered = button.id;
                     break;
@@ -267,15 +393,13 @@ void OverlaySession::on_mouse_up(POINT point) {
     ReleaseCapture();
     if (selection_complete_ && drawing_annotation_) {
         drawing_annotation_ = false;
-        if (preview_.tool == Tool::mosaic ? preview_.points.size() > 1
-                                          : (preview_.start.x != preview_.end.x ||
-                                             preview_.start.y != preview_.end.y)) {
+        if (preview_.tool != Tool::eraser && annotation_has_size(preview_)) {
             discard_redo();
             annotations_.push_back(preview_);
         }
         preview_ = {};
         current_drag_mode_ = DragMode::none;
-        invalidate_all();
+        finish_annotation();
         return;
     }
     if (!dragging_selection_) {

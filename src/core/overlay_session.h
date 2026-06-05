@@ -44,7 +44,9 @@ public:
     [[nodiscard]] COLORREF active_color() const noexcept { return active_color_; }
     [[nodiscard]] COLORREF custom_color() const noexcept { return custom_color_; }
     [[nodiscard]] float active_width() const noexcept { return active_width_; }
+    [[nodiscard]] int active_highlight_alpha() const noexcept { return active_highlight_alpha_; }
     [[nodiscard]] Tool active_tool() const noexcept { return active_tool_; }
+    [[nodiscard]] bool annotation_locked_tool() const noexcept { return request_.config.annotation_locked_tool; }
     [[nodiscard]] std::wstring hovered_button_id() const noexcept { return hovered_button_id_; }
     [[nodiscard]] bool dragging_selection() const noexcept { return dragging_selection_; }
     [[nodiscard]] POINT cursor_pos() const noexcept { return cursor_pos_; }
@@ -58,6 +60,8 @@ private:
     void build_sub_toolbar();
     void invoke_sub(std::wstring_view id, HWND source);
     void invoke(std::wstring_view id, HWND source);
+    void finish_annotation();
+    bool erase_annotation_at(POINT relative);
     void undo();
     void redo();
     void discard_redo();
@@ -97,6 +101,7 @@ private:
     COLORREF active_color_{RGB(245, 34, 45)};
     COLORREF custom_color_{RGB(128, 0, 255)};
     float active_width_{4.0F};
+    int active_highlight_alpha_{96};
     std::wstring hovered_button_id_;
     POINT cursor_pos_{};
     bool color_format_hex_{true};

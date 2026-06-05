@@ -3,6 +3,8 @@
 #include <appmodel.h>
 #include <shlobj.h>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cwctype>
 #include <fstream>
@@ -267,6 +269,12 @@ std::wstring upper(std::wstring_view value) {
     return result;
 }
 
+std::wstring lower(std::wstring_view value) {
+    std::wstring result(value);
+    std::ranges::transform(result, result.begin(), [](wchar_t ch) { return static_cast<wchar_t>(::towlower(ch)); });
+    return result;
+}
+
 std::vector<std::wstring> split(std::wstring_view value, wchar_t delimiter) {
     std::vector<std::wstring> result;
     std::size_t start = 0;
@@ -304,6 +312,10 @@ int named_integer(const JsonNode& object, std::wstring_view name, int fallback) 
     return value && value->kind == JsonKind::number ? static_cast<int>(value->number) : fallback;
 }
 
+int named_clamped_integer(const JsonNode& object, std::wstring_view name, int fallback, int minimum, int maximum) {
+    return std::clamp(named_integer(object, name, fallback), minimum, maximum);
+}
+
 std::wstring quote_json(std::wstring_view value) {
     std::wstring result{L"\""};
     for (const wchar_t current : value) {
@@ -329,6 +341,90 @@ std::wstring quote_json(std::wstring_view value) {
 
 std::wstring_view json_boolean(bool value) {
     return value ? L"true" : L"false";
+}
+
+constexpr std::array<std::wstring_view, 19> kAnnotationToolbarTools{
+    L"lock",
+    L"rect",
+    L"ellipse",
+    L"line",
+    L"arrow",
+    L"pen",
+    L"mosaic",
+    L"highlight",
+    L"text",
+    L"serial",
+    L"eraser",
+    L"undo",
+    L"redo",
+    L"ocr",
+    L"scroll",
+    L"pin",
+    L"copy",
+    L"save",
+    L"close",
+};
+
+bool is_hidden_tool_delimiter(wchar_t value) {
+    return value == L',' || value == L';' || value == L'|' || std::iswspace(value);
+}
+
+std::vector<std::wstring> split_hidden_tools(std::wstring_view value) {
+    std::vector<std::wstring> result;
+    std::wstring current;
+    for (const wchar_t ch : value) {
+        if (is_hidden_tool_delimiter(ch)) {
+            if (!current.empty()) {
+                result.push_back(std::move(current));
+                current.clear();
+            }
+        } else {
+            current.push_back(ch);
+        }
+    }
+    if (!current.empty()) {
+        result.push_back(std::move(current));
+    }
+    return result;
+}
+
+bool tool_id_matches(std::wstring_view left, std::wstring_view right) {
+    return lower(left) == lower(right);
+}
+
+std::wstring hidden_tools_to_json_array(std::wstring_view hidden_tools) {
+    const std::wstring normalized = normalize_annotation_hidden_tools(hidden_tools);
+    std::wstring result{L"["};
+    bool first = true;
+    for (const auto& tool : split_hidden_tools(normalized)) {
+        if (!first) {
+            result += L",";
+        }
+        first = false;
+        result += quote_json(tool);
+    }
+    result += L"]";
+    return result;
+}
+
+std::wstring hidden_tools_from_json_node(const JsonNode& node, std::wstring_view fallback) {
+    if (node.kind == JsonKind::string) {
+        return normalize_annotation_hidden_tools(node.string);
+    }
+    if (node.kind != JsonKind::array) {
+        return normalize_annotation_hidden_tools(fallback);
+    }
+    std::wstring joined;
+    for (const auto& item : node.array) {
+        if (item.kind != JsonKind::string) {
+            continue;
+        }
+        if (!joined.empty()) {
+            joined += L",";
+        }
+        joined += item.string;
+    }
+    return normalize_annotation_hidden_tools(joined);
 }
 
 }  // namespace
@@ -370,11 +466,41 @@ std::optional<Hotkey> parse_hotkey(std::wstring_view value) {
     return hotkey;
 }
 
+std::wstring normalize_annotation_hidden_tools(std::wstring_view value) {
+    std::wstring result;
+    for (const auto tool_id : kAnnotationToolbarTools) {
+        for (const auto& token : split_hidden_tools(value)) {
+            if (tool_id_matches(token, tool_id)) {
+                if (!result.empty()) {
+                    result += L",";
+                }
+                result += tool_id;
+                break;
+            }
+        }
+    }
+    return result;
+}
+
+bool annotation_tool_hidden(std::wstring_view hidden_tools, std::wstring_view tool_id) {
+    const std::wstring normalized = normalize_annotation_hidden_tools(hidden_tools);
+    for (const auto& token : split_hidden_tools(normalized)) {
+        if (tool_id_matches(token, tool_id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::wstring config_to_json(const AppConfig& config) {
     std::wstring result;
     result.reserve(384);
     result += L"{\"schemaVersion\":" + std::to_wstring(config.schema_version);
-    result += L",\"annotation\":{\"enabled\":" + std::wstring(json_boolean(config.annotation_enabled)) + L"}";
+    result += L",\"annotation\":{\"enabled\":" + std::wstring(json_boolean(config.annotation_enabled));
+    result += L",\"lockedTool\":" + std::wstring(json_boolean(config.annotation_locked_tool));
+    result += L",\"hiddenTools\":" + hidden_tools_to_json_array(config.annotation_hidden_tools);
+    result += L",\"highlightAlpha\":" + std::to_wstring(std::clamp(config.annotation_highlight_alpha, 24, 192));
+    result += L",\"nextSerial\":" + std::to_wstring(std::max(1, config.annotation_next_serial)) + L"}";
     result += L",\"ocr\":{\"enabled\":" + std::wstring(json_boolean(config.ocr_enabled)) + L"}";
     result += L",\"shell\":{\"enabled\":" + std::wstring(json_boolean(config.shell_enabled));
     result += L",\"startAtLogin\":" + std::wstring(json_boolean(config.start_at_login));
@@ -398,6 +524,12 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text) {
     config.schema_version = named_integer(*root, L"schemaVersion", 1);
     if (const auto* annotation = member(*root, L"annotation")) {
         config.annotation_enabled = named_boolean(*annotation, L"enabled", true);
+        config.annotation_locked_tool = named_boolean(*annotation, L"lockedTool", true);
+        if (const auto* hidden_tools = member(*annotation, L"hiddenTools")) {
+            config.annotation_hidden_tools = hidden_tools_from_json_node(*hidden_tools, L"");
+        }
+        config.annotation_highlight_alpha = named_clamped_integer(*annotation, L"highlightAlpha", 96, 24, 192);
+        config.annotation_next_serial = std::max(1, named_integer(*annotation, L"nextSerial", 1));
     }
     if (const auto* ocr = member(*root, L"ocr")) {
         config.ocr_enabled = named_boolean(*ocr, L"enabled", true);

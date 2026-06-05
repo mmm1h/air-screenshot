@@ -40,6 +40,7 @@ private:
     void show_settings();
     void notify(std::wstring_view title, std::wstring_view message);
     void capture_region(RegionAction action);
+    void sync_region_config(const RegionResult& result);
     void check_for_updates(bool user_triggered);
     CommandResponse execute_request(std::wstring_view request_json);
     CommandResponse execute_capture(const winrt::Windows::Data::Json::JsonObject& request);

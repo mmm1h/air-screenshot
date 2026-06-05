@@ -10,9 +10,15 @@ namespace airshot::overlay_detail {
 enum class Tool {
     none,
     rectangle,
+    ellipse,
+    line,
     arrow,
+    pen,
     mosaic,
+    highlight,
     text,
+    serial,
+    eraser,
 };
 
 enum class DragMode {
@@ -37,6 +43,8 @@ struct Annotation {
     std::wstring text;
     COLORREF color{RGB(22, 119, 255)};
     float width{3.0F};
+    int alpha{255};
+    int serial{};
 };
 
 struct ToolbarButton {

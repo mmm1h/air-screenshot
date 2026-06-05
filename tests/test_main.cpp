@@ -52,6 +52,10 @@ void test_rect_and_bitmap() {
 void test_config() {
     airshot::AppConfig config;
     config.annotation_enabled = false;
+    config.annotation_locked_tool = false;
+    config.annotation_hidden_tools = L"pen,banana,rect,pen,close";
+    config.annotation_highlight_alpha = 300;
+    config.annotation_next_serial = 12;
     config.global_ocr_enabled = true;
     config.capture_hotkey = L"Ctrl+Shift+F9";
     config.global_ocr_hotkey = L"Ctrl+Alt+\\\"O";
@@ -59,15 +63,25 @@ void test_config() {
     const auto parsed = airshot::config_from_json(airshot::config_to_json(config));
     expect(parsed.has_value(), L"config JSON round trip parses");
     expect(parsed && !parsed->annotation_enabled && parsed->global_ocr_enabled &&
+               !parsed->annotation_locked_tool && parsed->annotation_hidden_tools == L"rect,pen,close" &&
+               parsed->annotation_highlight_alpha == 192 && parsed->annotation_next_serial == 12 &&
                parsed->capture_hotkey == L"Ctrl+Shift+F9" && parsed->global_ocr_hotkey == L"Ctrl+Alt+\\\"O" &&
                parsed->custom_color == L"#123456",
            L"config JSON round trip values");
 
     const auto future = airshot::config_from_json(
         LR"({"schemaVersion":2,"annotation":{"enabled":false},"future":[null,true,{"name":"\u4E2D"}]})");
-    expect(future && future->schema_version == 2 && !future->annotation_enabled,
-           L"config accepts unknown future fields");
+    expect(future && future->schema_version == 2 && !future->annotation_enabled &&
+               future->annotation_locked_tool && future->annotation_hidden_tools.empty() &&
+               future->annotation_highlight_alpha == 96 && future->annotation_next_serial == 1,
+           L"config accepts unknown future fields and keeps annotation defaults");
     expect(!airshot::config_from_json(L"{\"annotation\":[}"), L"config rejects malformed JSON");
+
+    expect(airshot::normalize_annotation_hidden_tools(L"pen,unknown,RECT;pen close") == L"rect,pen,close",
+           L"hidden annotation tools normalize, dedupe, and skip unknown values");
+    expect(airshot::annotation_tool_hidden(L"rect,pen", L"PEN") &&
+               !airshot::annotation_tool_hidden(L"rect,pen", L"arrow"),
+           L"hidden annotation tool lookup");
 
     const auto hotkey = airshot::parse_hotkey(L"Ctrl+Alt+A");
     expect(hotkey && (hotkey->modifiers & MOD_CONTROL) && (hotkey->modifiers & MOD_ALT) &&

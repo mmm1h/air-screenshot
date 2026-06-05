@@ -6,6 +6,7 @@
 #include <array>
 #include <mutex>
 #include <algorithm>
+#include <vector>
 
 #pragma comment(lib, "comctl32.lib")
 
@@ -24,13 +25,21 @@ enum ControlId : int {
     static_label_capture = 109,
     static_label_ocr = 110,
     notifications = 111,
+    annotation_lock = 112,
+    hide_ellipse = 113,
+    hide_line = 114,
+    hide_pen = 115,
+    hide_highlight = 116,
+    hide_serial = 117,
+    hide_eraser = 118,
+    reset_serial = 119,
 };
 
 struct SettingsState {
     AppConfig config;
     bool accepted{};
     HWND window{};
-    std::array<HWND, 8> controls{};
+    std::array<HWND, 15> controls{};
     HWND focused_control{};
 };
 
@@ -106,6 +115,72 @@ void set_font(HWND control) {
     SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(create_ui_font()), TRUE);
 }
 
+std::wstring tool_for_hidden_control(int id) {
+    switch (id) {
+        case hide_ellipse: return L"ellipse";
+        case hide_line: return L"line";
+        case hide_pen: return L"pen";
+        case hide_highlight: return L"highlight";
+        case hide_serial: return L"serial";
+        case hide_eraser: return L"eraser";
+        default: return {};
+    }
+}
+
+bool is_hidden_tool_control(int id) {
+    return !tool_for_hidden_control(id).empty();
+}
+
+std::vector<std::wstring> split_hidden_tools(std::wstring_view value) {
+    std::vector<std::wstring> result;
+    std::size_t start = 0;
+    while (start <= value.size()) {
+        const std::size_t end = value.find(L',', start);
+        const std::size_t count = end == std::wstring_view::npos ? value.size() - start : end - start;
+        if (count > 0) {
+            result.emplace_back(value.substr(start, count));
+        }
+        if (end == std::wstring_view::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return result;
+}
+
+void set_hidden_tool(AppConfig& config, std::wstring_view tool, bool hide) {
+    std::wstring next;
+    for (const auto& current : split_hidden_tools(normalize_annotation_hidden_tools(config.annotation_hidden_tools))) {
+        if (_wcsicmp(current.c_str(), std::wstring(tool).c_str()) != 0) {
+            if (!next.empty()) {
+                next += L",";
+            }
+            next += current;
+        }
+    }
+    if (hide) {
+        if (!next.empty()) {
+            next += L",";
+        }
+        next += tool;
+    }
+    config.annotation_hidden_tools = normalize_annotation_hidden_tools(next);
+}
+
+bool checkbox_checked(const SettingsState& state, int id) {
+    if (id == annotation) return state.config.annotation_enabled;
+    if (id == ocr) return state.config.ocr_enabled;
+    if (id == shell) return state.config.shell_enabled;
+    if (id == startup) return state.config.start_at_login;
+    if (id == notifications) return state.config.notifications_enabled;
+    if (id == global_ocr) return state.config.global_ocr_enabled;
+    if (id == annotation_lock) return state.config.annotation_locked_tool;
+    if (is_hidden_tool_control(id)) {
+        return annotation_tool_hidden(state.config.annotation_hidden_tools, tool_for_hidden_control(id));
+    }
+    return false;
+}
+
 // Subclass proc to trigger smooth hover fade transitions
 LRESULT CALLBACK HoverAnimSubclassProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
     (void)uIdSubclass;
@@ -165,14 +240,14 @@ LRESULT CALLBACK HoverAnimSubclassProc(HWND hwnd, UINT msg, WPARAM wparam, LPARA
     return DefSubclassProc(hwnd, msg, wparam, lparam);
 }
 
-HWND add_checkbox(HWND parent, int id, const wchar_t* text, int x, int y, [[maybe_unused]] bool checked) {
+HWND add_checkbox(HWND parent, int id, const wchar_t* text, int x, int y, [[maybe_unused]] bool checked, int width = 360) {
     HWND control = CreateWindowExW(0,
                                    L"BUTTON",
                                    text,
                                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                                    x,
                                    y,
-                                   360,
+                                   width,
                                    28,
                                    parent,
                                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
@@ -255,29 +330,59 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
     }
     if (message == WM_CREATE) {
         state->controls[0] =
-            add_checkbox(window, annotation, strings::settings_annotation.data(), 40, 70, state->config.annotation_enabled);
+            add_checkbox(window, annotation, strings::settings_annotation.data(), 40, 70, state->config.annotation_enabled, 300);
         state->controls[1] =
-            add_checkbox(window, ocr, strings::settings_ocr.data(), 40, 110, state->config.ocr_enabled);
+            add_checkbox(window, ocr, strings::settings_ocr.data(), 40, 110, state->config.ocr_enabled, 300);
         state->controls[2] =
-            add_checkbox(window, shell, strings::settings_shell.data(), 40, 150, state->config.shell_enabled);
+            add_checkbox(window, shell, strings::settings_shell.data(), 40, 150, state->config.shell_enabled, 300);
         state->controls[3] =
-            add_checkbox(window, startup, strings::settings_startup.data(), 40, 190, state->config.start_at_login);
+            add_checkbox(window, startup, strings::settings_startup.data(), 40, 190, state->config.start_at_login, 300);
         state->controls[4] =
-            add_checkbox(window, notifications, L"启用截图与 OCR 成功提示", 40, 230, state->config.notifications_enabled);
+            add_checkbox(window, notifications, L"启用截图与 OCR 成功提示", 40, 230, state->config.notifications_enabled, 300);
         state->controls[5] =
-            add_checkbox(window, global_ocr, strings::settings_global_ocr.data(), 40, 340, state->config.global_ocr_enabled);
+            add_checkbox(window, global_ocr, strings::settings_global_ocr.data(), 390, 70, state->config.global_ocr_enabled, 310);
         state->controls[6] =
-            add_edit(window, capture_hotkey, static_label_capture, strings::settings_capture_hotkey.data(), 40, 380, 150, 280, state->config.capture_hotkey);
+            add_edit(window, capture_hotkey, static_label_capture, strings::settings_capture_hotkey.data(), 390, 110, 110, 190, state->config.capture_hotkey);
         state->controls[7] =
-            add_edit(window, global_ocr_hotkey, static_label_ocr, strings::settings_global_ocr_hotkey.data(), 40, 418, 150, 280, state->config.global_ocr_hotkey);
+            add_edit(window, global_ocr_hotkey, static_label_ocr, strings::settings_global_ocr_hotkey.data(), 390, 148, 110, 190, state->config.global_ocr_hotkey);
+        state->controls[8] =
+            add_checkbox(window, annotation_lock, L"标注后保持当前工具", 40, 340, state->config.annotation_locked_tool, 300);
+        state->controls[9] =
+            add_checkbox(window, hide_ellipse, L"隐藏椭圆工具", 40, 385, annotation_tool_hidden(state->config.annotation_hidden_tools, L"ellipse"), 210);
+        state->controls[10] =
+            add_checkbox(window, hide_line, L"隐藏直线工具", 270, 385, annotation_tool_hidden(state->config.annotation_hidden_tools, L"line"), 210);
+        state->controls[11] =
+            add_checkbox(window, hide_pen, L"隐藏画笔工具", 500, 385, annotation_tool_hidden(state->config.annotation_hidden_tools, L"pen"), 210);
+        state->controls[12] =
+            add_checkbox(window, hide_highlight, L"隐藏高亮工具", 40, 425, annotation_tool_hidden(state->config.annotation_hidden_tools, L"highlight"), 210);
+        state->controls[13] =
+            add_checkbox(window, hide_serial, L"隐藏序号工具", 270, 425, annotation_tool_hidden(state->config.annotation_hidden_tools, L"serial"), 210);
+        state->controls[14] =
+            add_checkbox(window, hide_eraser, L"隐藏橡皮擦工具", 500, 425, annotation_tool_hidden(state->config.annotation_hidden_tools, L"eraser"), 210);
+
+        HWND reset = CreateWindowExW(0,
+                                     L"BUTTON",
+                                     L"重置序号",
+                                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                                     590,
+                                     336,
+                                     110,
+                                     34,
+                                     window,
+                                     reinterpret_cast<HMENU>(static_cast<INT_PTR>(reset_serial)),
+                                     nullptr,
+                                     nullptr);
+        set_font(reset);
+        SetPropW(reset, L"AnimData", new ControlAnimData());
+        SetWindowSubclass(reset, HoverAnimSubclassProc, 0, 0);
 
         HWND note = CreateWindowExW(0,
                                     L"STATIC",
                                     strings::settings_note.data(),
                                     WS_CHILD | WS_VISIBLE,
                                     20,
-                                    480,
-                                    480,
+                                    540,
+                                    680,
                                     40,
                                     window,
                                     reinterpret_cast<HMENU>(static_cast<INT_PTR>(static_note)),
@@ -289,8 +394,8 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                                     L"BUTTON",
                                     strings::settings_save.data(),
                                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                                    300,
-                                    545,
+                                    500,
+                                    600,
                                     90,
                                     34,
                                     window,
@@ -301,8 +406,8 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                                       L"BUTTON",
                                       strings::settings_cancel.data(),
                                       WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                                      410,
-                                      545,
+                                      610,
+                                      600,
                                       90,
                                       34,
                                       window,
@@ -325,14 +430,9 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
         RECT rect = dis->rcItem;
         int id = dis->CtlID;
 
-        if (id == annotation || id == ocr || id == shell || id == startup || id == global_ocr || id == notifications) {
-            bool is_checked = false;
-            if (id == annotation) is_checked = state->config.annotation_enabled;
-            else if (id == ocr) is_checked = state->config.ocr_enabled;
-            else if (id == shell) is_checked = state->config.shell_enabled;
-            else if (id == startup) is_checked = state->config.start_at_login;
-            else if (id == notifications) is_checked = state->config.notifications_enabled;
-            else if (id == global_ocr) is_checked = state->config.global_ocr_enabled;
+        if (id == annotation || id == ocr || id == shell || id == startup || id == global_ocr || id == notifications ||
+            id == annotation_lock || is_hidden_tool_control(id)) {
+            bool is_checked = checkbox_checked(*state, id);
 
             HBRUSH bg_brush = CreateSolidBrush(RGB(30, 32, 36));
             FillRect(hdc, &rect, bg_brush);
@@ -399,7 +499,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
             SelectObject(hdc, old_font);
             return TRUE;
         }
-        else if (id == IDOK || id == IDCANCEL) {
+        else if (id == IDOK || id == IDCANCEL || id == reset_serial) {
             bool is_pushed = (dis->itemState & ODS_SELECTED) != 0;
 
             auto* anim_data = reinterpret_cast<ControlAnimData*>(GetPropW(dis->hwndItem, L"AnimData"));
@@ -454,12 +554,14 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
         HFONT title_font = create_ui_title_font();
 
         // Draw Card 1: 常规设置
-        RECT card1_rect{ 20, 20, 500, 270 };
+        RECT card1_rect{ 20, 20, 350, 270 };
         draw_card(hdc, card1_rect, L"常规设置", title_font);
 
-        // Draw Card 2: 快捷键配置
-        RECT card2_rect{ 20, 290, 500, 460 };
+        RECT card2_rect{ 370, 20, 720, 220 };
         draw_card(hdc, card2_rect, L"快捷键配置", title_font);
+
+        RECT card3_rect{ 20, 290, 720, 520 };
+        draw_card(hdc, card3_rect, L"标注工具", title_font);
 
         // Draw Edit Borders dynamically
         if (state->controls[6]) {
@@ -545,6 +647,20 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
             state->config.global_ocr_enabled = !state->config.global_ocr_enabled;
             InvalidateRect(state->controls[5], nullptr, TRUE);
             return 0;
+        } else if (id == annotation_lock) {
+            state->config.annotation_locked_tool = !state->config.annotation_locked_tool;
+            InvalidateRect(reinterpret_cast<HWND>(l_param), nullptr, TRUE);
+            return 0;
+        } else if (is_hidden_tool_control(id)) {
+            const std::wstring tool = tool_for_hidden_control(id);
+            const bool next_hidden = !annotation_tool_hidden(state->config.annotation_hidden_tools, tool);
+            set_hidden_tool(state->config, tool, next_hidden);
+            InvalidateRect(reinterpret_cast<HWND>(l_param), nullptr, TRUE);
+            return 0;
+        } else if (id == reset_serial) {
+            state->config.annotation_next_serial = 1;
+            InvalidateRect(reinterpret_cast<HWND>(l_param), nullptr, TRUE);
+            return 0;
         }
 
         if (id == IDOK) {
@@ -588,18 +704,32 @@ bool show_settings_window(HWND owner, AppConfig& config) {
 
     SettingsState state;
     state.config = config;
+    constexpr int window_width = 740;
+    constexpr int window_height = 700;
     RECT owner_rect{};
     GetWindowRect(owner, &owner_rect);
-    const int x = std::max(20L, owner_rect.left + 40L);
-    const int y = std::max(20L, owner_rect.top + 40L);
+    RECT work_area{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    MONITORINFO monitor_info{sizeof(monitor_info)};
+    if (HMONITOR monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
+        monitor && GetMonitorInfoW(monitor, &monitor_info)) {
+        work_area = monitor_info.rcWork;
+    }
+    auto clamp_position = [](LONG value, LONG size, LONG minimum, LONG maximum) {
+        if (size >= maximum - minimum) {
+            return static_cast<int>(minimum);
+        }
+        return static_cast<int>(std::clamp(value, minimum, maximum - size));
+    };
+    const int x = clamp_position(owner_rect.left + 40L, window_width, work_area.left + 8L, work_area.right - 8L);
+    const int y = clamp_position(owner_rect.top + 40L, window_height, work_area.top + 8L, work_area.bottom - 8L);
     HWND window = CreateWindowExW(WS_EX_TOOLWINDOW,
                                   L"AirScreenshot.Settings",
                                   strings::settings_title.data(),
                                   WS_CAPTION | WS_SYSMENU,
                                   x,
                                   y,
-                                  536,
-                                  680,
+                                  window_width,
+                                  window_height,
                                   owner,
                                   nullptr,
                                   GetModuleHandleW(nullptr),

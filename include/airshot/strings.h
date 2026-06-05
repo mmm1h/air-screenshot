@@ -27,9 +27,16 @@ inline constexpr std::wstring_view common_confirm = L"确定";
 inline constexpr std::wstring_view common_cancel = L"取消";
 
 inline constexpr std::wstring_view toolbar_rectangle = L"框";
+inline constexpr std::wstring_view toolbar_ellipse = L"圆";
+inline constexpr std::wstring_view toolbar_line = L"线";
 inline constexpr std::wstring_view toolbar_arrow = L"箭";
+inline constexpr std::wstring_view toolbar_pen = L"笔";
 inline constexpr std::wstring_view toolbar_mosaic = L"糊";
+inline constexpr std::wstring_view toolbar_highlight = L"亮";
 inline constexpr std::wstring_view toolbar_text = L"字";
+inline constexpr std::wstring_view toolbar_serial = L"号";
+inline constexpr std::wstring_view toolbar_eraser = L"擦";
+inline constexpr std::wstring_view toolbar_lock = L"锁";
 inline constexpr std::wstring_view toolbar_undo = L"撤";
 inline constexpr std::wstring_view toolbar_redo = L"重";
 inline constexpr std::wstring_view toolbar_ocr = L"识";
