@@ -555,8 +555,8 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text) {
     }
     if (const auto* ocr = member(*root, L"ocr")) {
         config.ocr_enabled = named_boolean(*ocr, L"enabled", true);
-        config.ocr_engine = named_clamped_integer(*ocr, L"engine", 0, 0, 2);
-        config.ocr_download_url = named_string(*ocr, L"downloadUrl", L"https://github.com/mg-chao/snow-shot/releases/download/v1.0.0/ocr_dependency.zip");
+        config.ocr_engine = named_clamped_integer(*ocr, L"engine", kDefaultOcrEngine, 0, 2);
+        config.ocr_download_url = named_string(*ocr, L"downloadUrl", kDefaultOcrDependencyManifestUrl);
     }
     if (const auto* shell = member(*root, L"shell")) {
         config.shell_enabled = named_boolean(*shell, L"enabled", true);

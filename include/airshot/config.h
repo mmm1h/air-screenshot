@@ -4,6 +4,17 @@
 
 namespace airshot {
 
+enum class OcrEngine : int {
+    system = 0,
+    wechat = 1,
+    rapid_ocr = 2,
+};
+
+inline constexpr int kDefaultOcrEngine = static_cast<int>(OcrEngine::rapid_ocr);
+inline constexpr wchar_t kRapidOcrPackageId[] = L"rapidocr-ppocrv5-mobile-v1";
+inline constexpr wchar_t kDefaultOcrDependencyManifestUrl[] =
+    L"https://mmm1h.github.io/air-screenshot/ocr-dependencies.json";
+
 struct AppConfig {
     int schema_version{1};
     bool annotation_enabled{true};
@@ -13,8 +24,8 @@ struct AppConfig {
     bool start_at_login{true};
     bool global_ocr_enabled{false};
     bool notifications_enabled{false};
-    int ocr_engine{0};
-    std::wstring ocr_download_url{L"https://github.com/mg-chao/snow-shot/releases/download/v1.0.0/ocr_dependency.zip"};
+    int ocr_engine{kDefaultOcrEngine};
+    std::wstring ocr_download_url{kDefaultOcrDependencyManifestUrl};
     std::wstring capture_hotkey{L"Ctrl+Alt+A"};
     std::wstring global_ocr_hotkey{L"Ctrl+Alt+O"};
     std::wstring capture_ocr_shortcut{L"Shift+C"};

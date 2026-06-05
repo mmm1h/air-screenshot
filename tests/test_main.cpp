@@ -90,6 +90,10 @@ void test_rect_and_bitmap() {
 }
 
 void test_config() {
+    expect(airshot::AppConfig{}.ocr_engine == airshot::kDefaultOcrEngine &&
+               airshot::kDefaultOcrEngine == static_cast<int>(airshot::OcrEngine::rapid_ocr),
+           L"default OCR engine is local high accuracy");
+
     airshot::AppConfig config;
     config.annotation_enabled = false;
     config.annotation_locked_tool = false;
@@ -106,6 +110,8 @@ void test_config() {
     config.text_font_family = L"Consolas";
     config.text_font_bold = true;
     config.text_font_italic = true;
+    config.ocr_engine = static_cast<int>(airshot::OcrEngine::wechat);
+    config.ocr_download_url = L"https://example.com/ocr-dependencies.json";
     const auto parsed = airshot::config_from_json(airshot::config_to_json(config));
     expect(parsed.has_value(), L"config JSON round trip parses");
     expect(parsed && !parsed->annotation_enabled && parsed->global_ocr_enabled &&
@@ -118,7 +124,9 @@ void test_config() {
                parsed->toolbar_order == L"rect,pen,close" &&
                parsed->text_font_family == L"Consolas" &&
                parsed->text_font_bold == true &&
-               parsed->text_font_italic == true,
+               parsed->text_font_italic == true &&
+               parsed->ocr_engine == static_cast<int>(airshot::OcrEngine::wechat) &&
+               parsed->ocr_download_url == L"https://example.com/ocr-dependencies.json",
            L"config JSON round trip values");
 
     const auto future = airshot::config_from_json(
@@ -126,9 +134,13 @@ void test_config() {
     expect(future && future->schema_version == 2 && !future->annotation_enabled &&
                future->annotation_locked_tool && future->annotation_hidden_tools.empty() &&
                future->annotation_highlight_alpha == 96 && future->annotation_next_serial == 1 &&
-               future->text_font_family == L"Microsoft YaHei" && !future->text_font_bold && !future->text_font_italic,
+               future->text_font_family == L"Microsoft YaHei" && !future->text_font_bold && !future->text_font_italic &&
+               future->ocr_engine == airshot::kDefaultOcrEngine,
            L"config accepts unknown future fields and keeps annotation defaults");
     expect(!airshot::config_from_json(L"{\"annotation\":[}"), L"config rejects malformed JSON");
+    const auto clamped_ocr = airshot::config_from_json(LR"({"ocr":{"engine":99}})");
+    expect(clamped_ocr && clamped_ocr->ocr_engine == static_cast<int>(airshot::OcrEngine::rapid_ocr),
+           L"config clamps invalid OCR engine");
 
     expect(airshot::normalize_annotation_hidden_tools(L"pen,unknown,RECT;pen close") == L"rect,pen,close",
            L"hidden annotation tools normalize, dedupe, and skip unknown values");
@@ -166,6 +178,27 @@ void test_cli() {
 void test_ocr_join() {
     const std::vector<std::wstring> lines{L"第一行", L"second"};
     expect(airshot::join_ocr_lines(lines) == L"第一行\r\nsecond", L"OCR line join");
+}
+
+void test_ocr_dependency_manifest() {
+    const auto manifest = airshot::parse_ocr_dependency_manifest(
+        LR"({"packageId":"rapidocr-ppocrv5-mobile-v1","files":[)"
+        LR"({"path":"rapidocr_api.dll","url":"https://example.com/rapidocr_api.dll","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1},)"
+        LR"({"path":"onnxruntime.dll","url":"https://example.com/onnxruntime.dll","sha256":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","size":2},)"
+        LR"({"path":"models/ch_PP-OCRv5_det_mobile.onnx","url":"https://example.com/det.onnx","sha256":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","size":3},)"
+        LR"({"path":"models/ch_PP-OCRv5_rec_mobile.onnx","url":"https://example.com/rec.onnx","sha256":"DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD","size":4},)"
+        LR"({"path":"models/ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx","url":"https://example.com/cls.onnx","sha256":"EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE","size":5},)"
+        LR"({"path":"models/ppocrv5_dict.txt","url":"https://example.com/dict.txt","sha256":"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF","size":6})"
+        LR"(]})");
+    expect(manifest && manifest->package_id == airshot::kRapidOcrPackageId && manifest->files.size() == 6,
+           L"OCR dependency manifest parses required files");
+
+    expect(!airshot::parse_ocr_dependency_manifest(
+               LR"({"packageId":"rapidocr-ppocrv5-mobile-v1","files":[{"path":"../rapidocr_api.dll","url":"https://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]})"),
+           L"OCR dependency manifest rejects unsafe paths");
+    expect(!airshot::parse_ocr_dependency_manifest(
+               LR"({"packageId":"rapidocr-ppocrv5-mobile-v1","files":[{"path":"rapidocr_api.dll","url":"http://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]})"),
+           L"OCR dependency manifest rejects non-HTTPS URLs");
 }
 
 void test_portable_runtime() {
@@ -274,6 +307,7 @@ int wmain() {
     test_config();
     test_cli();
     test_ocr_join();
+    test_ocr_dependency_manifest();
     test_portable_runtime();
     test_feature_registry();
     test_clipboard_formats();

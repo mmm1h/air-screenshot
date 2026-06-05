@@ -1,10 +1,12 @@
 #include "settings_window.h"
 
+#include "airshot/ocr.h"
 #include "airshot/strings.h"
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <array>
 #include <mutex>
 #include <vector>
 #include <string>
@@ -13,7 +15,6 @@
 #include <windowsx.h>
 #include <thread>
 #include <filesystem>
-#include <urlmon.h>
 
 namespace airshot {
 namespace {
@@ -104,6 +105,31 @@ struct OcrDownloadContext {
     int progress{0};
     std::wstring error;
 } g_ocr_download;
+
+struct OcrEngineButton {
+    int engine;
+    const wchar_t* label;
+    int left;
+    int right;
+};
+
+constexpr std::array<OcrEngineButton, 3> kOcrEngineButtons{{
+    {static_cast<int>(OcrEngine::rapid_ocr), L"本地高精度", 230, 360},
+    {static_cast<int>(OcrEngine::wechat), L"微信 OCR", 370, 500},
+    {static_cast<int>(OcrEngine::system), L"系统 OCR", 510, 640},
+}};
+
+const OcrEngineButton* hit_test_ocr_engine_button(POINT pt) {
+    if (pt.y < 515 || pt.y > 545) {
+        return nullptr;
+    }
+    for (const auto& button : kOcrEngineButtons) {
+        if (pt.x >= button.left && pt.x <= button.right) {
+            return &button;
+        }
+    }
+    return nullptr;
+}
 
 std::wstring get_wechat_install_path() {
     HKEY hKey;
@@ -196,80 +222,7 @@ std::wstring find_wechat_ocr_exe_dir() {
     return L"";
 }
 
-bool check_dependency_exists(const wchar_t* rel_path) {
-    // 1. Check current exe folder
-    wchar_t exe_path[MAX_PATH];
-    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-    std::filesystem::path local_path = std::filesystem::path(exe_path).parent_path() / L"ocr_onnx" / rel_path;
-    if (std::filesystem::exists(local_path)) {
-        return true;
-    }
-    // 2. Check AppData folder
-    std::filesystem::path app_data_path = config_directory() / L"ocr_onnx" / rel_path;
-    if (std::filesystem::exists(app_data_path)) {
-        return true;
-    }
-    return false;
-}
-
-class DownloadProgressCallback : public IBindStatusCallback {
-public:
-    DownloadProgressCallback(HWND hwnd, int* progress_ptr)
-        : hwnd_(hwnd), progress_ptr_(progress_ptr), ref_count_(1) {}
-
-    HRESULT __stdcall QueryInterface(REFIID riid, void** ppvObject) override {
-        if (!ppvObject) return E_POINTER;
-        if (riid == IID_IUnknown || riid == IID_IBindStatusCallback) {
-            *ppvObject = static_cast<IBindStatusCallback*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *ppvObject = nullptr;
-        return E_NOINTERFACE;
-    }
-
-    ULONG __stdcall AddRef() override {
-        return InterlockedIncrement(&ref_count_);
-    }
-
-    ULONG __stdcall Release() override {
-        ULONG count = InterlockedDecrement(&ref_count_);
-        if (count == 0) {
-            delete this;
-            return 0;
-        }
-        return count;
-    }
-
-    HRESULT __stdcall OnStartBinding(DWORD, IBinding*) override { return S_OK; }
-    HRESULT __stdcall GetPriority(LONG*) override { return S_OK; }
-    HRESULT __stdcall OnLowResource(DWORD) override { return S_OK; }
-    HRESULT __stdcall OnStopBinding(HRESULT, LPCWSTR) override { return S_OK; }
-    HRESULT __stdcall GetBindInfo(DWORD*, BINDINFO*) override { return S_OK; }
-    HRESULT __stdcall OnDataAvailable(DWORD, DWORD, FORMATETC*, STGMEDIUM*) override { return S_OK; }
-    HRESULT __stdcall OnObjectAvailable(REFIID, IUnknown*) override { return S_OK; }
-
-    HRESULT __stdcall OnProgress(ULONG ulProgress, ULONG ulProgressMax, ULONG /*ulStatusCode*/, LPCWSTR /*szStatusText*/) override {
-        if (ulProgressMax > 0) {
-            int new_progress = static_cast<int>((static_cast<double>(ulProgress) / ulProgressMax) * 100.0);
-            {
-                std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
-                g_ocr_download.progress = new_progress;
-            }
-            if (IsWindow(hwnd_)) {
-                InvalidateRect(hwnd_, nullptr, TRUE);
-            }
-        }
-        return S_OK;
-    }
-
-private:
-    HWND hwnd_;
-    int* progress_ptr_;
-    ULONG ref_count_;
-};
-
-void start_ocr_download(HWND hwnd, std::wstring_view url) {
+void start_ocr_download(HWND hwnd, std::wstring_view manifest_url) {
     {
         std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
         if (g_ocr_download.is_downloading) return;
@@ -281,68 +234,28 @@ void start_ocr_download(HWND hwnd, std::wstring_view url) {
         InvalidateRect(hwnd, nullptr, TRUE);
     }
 
-    std::wstring url_str(url);
+    std::wstring manifest_url_str(manifest_url);
     
-    std::thread([url_str, hwnd]() {
-        std::filesystem::path data_dir = config_directory();
-        std::filesystem::path zip_path = data_dir / L"ocr_dependency.zip";
-        std::filesystem::path ocr_dir = data_dir / L"ocr_onnx";
-
-        std::filesystem::create_directories(data_dir);
-
-        DownloadProgressCallback* callback = new DownloadProgressCallback(hwnd, &g_ocr_download.progress);
-        HRESULT hr = URLDownloadToFileW(nullptr, url_str.c_str(), zip_path.c_str(), 0, callback);
-        callback->Release();
-        
-        bool download_failed = FAILED(hr);
-        
-        if (download_failed) {
-            {
-                std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
-                g_ocr_download.is_downloading = false;
-                g_ocr_download.error = L"下载失败。";
-            }
-            std::error_code ec;
-            std::filesystem::remove(zip_path, ec);
-            if (IsWindow(hwnd)) {
-                InvalidateRect(hwnd, nullptr, TRUE);
-            }
-            return;
-        }
-
-        std::filesystem::create_directories(ocr_dir);
-        
-        std::wstring cmd = L"tar.exe -xf \"" + zip_path.wstring() + L"\" -C \"" + ocr_dir.wstring() + L"\"";
-        
-        STARTUPINFOW si{};
-        si.cb = sizeof(si);
-        PROCESS_INFORMATION pi{};
-        
-        BOOL success = CreateProcessW(
-            nullptr,
-            cmd.data(),
-            nullptr,
-            nullptr,
-            FALSE,
-            CREATE_NO_WINDOW,
-            nullptr,
-            nullptr,
-            &si,
-            &pi
-        );
-        
-        if (success) {
-            WaitForSingleObject(pi.hProcess, INFINITE);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-        }
-
-        std::error_code ec;
-        std::filesystem::remove(zip_path, ec);
+    std::thread([manifest_url_str, hwnd]() {
+        std::wstring error;
+        const bool ok = download_ocr_dependencies(
+            manifest_url_str,
+            [hwnd](int progress) {
+                {
+                    std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
+                    g_ocr_download.progress = progress;
+                }
+                if (IsWindow(hwnd)) {
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                }
+            },
+            &error);
 
         {
             std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
             g_ocr_download.is_downloading = false;
+            g_ocr_download.progress = ok ? 100 : g_ocr_download.progress;
+            g_ocr_download.error = ok ? std::wstring{} : error;
         }
         if (IsWindow(hwnd)) {
             InvalidateRect(hwnd, nullptr, TRUE);
@@ -541,6 +454,21 @@ void draw_button(SettingsState* state, int x1, int y1, int x2, int y2, const wch
     state->render_target->DrawTextW(label, static_cast<UINT32>(wcslen(label)), state->text_format.Get(), rect, state->text_white_brush.Get());
 }
 
+void draw_choice_button(SettingsState* state, int x1, int y1, int x2, int y2, const wchar_t* label, bool is_selected, bool is_hovered) {
+    D2D1_RECT_F rect = D2D1::RectF(static_cast<float>(x1), static_cast<float>(y1), static_cast<float>(x2), static_cast<float>(y2));
+    D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(rect, 4.0f, 4.0f);
+
+    if (is_selected) {
+        state->render_target->FillRoundedRectangle(rounded, state->blue_brush.Get());
+        state->render_target->DrawRoundedRectangle(rounded, state->hover_blue_brush.Get(), 1.0f);
+        state->render_target->DrawTextW(label, static_cast<UINT32>(wcslen(label)), state->text_format.Get(), rect, state->text_white_brush.Get());
+    } else {
+        state->render_target->FillRoundedRectangle(rounded, is_hovered ? state->active_tab_brush.Get() : state->control_bg_brush.Get());
+        state->render_target->DrawRoundedRectangle(rounded, is_hovered ? state->hover_blue_brush.Get() : state->border_brush.Get(), 1.0f);
+        state->render_target->DrawTextW(label, static_cast<UINT32>(wcslen(label)), state->text_format.Get(), rect, state->text_grey_brush.Get());
+    }
+}
+
 void draw_hotkey_box(SettingsState* state, int x1, int y1, int x2, int y2, const wchar_t* hotkey_str, bool is_capturing, bool is_hovered) {
     D2D1_RECT_F rect = D2D1::RectF(static_cast<float>(x1), static_cast<float>(y1), static_cast<float>(x2), static_cast<float>(y2));
     D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(rect, 4.0f, 4.0f);
@@ -661,17 +589,16 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                     state->render_target->DrawTextW(L"文本倾斜 (Italic)", static_cast<UINT32>(wcslen(L"文本倾斜 (Italic)")), state->small_format.Get(), italic_label_rect, state->text_white_brush.Get());
                     draw_switch(state, 600, 465, state->config.text_font_italic);
 
-                    // OCR Engine selection
-                    std::wstring ocr_desc;
-                    if (state->config.ocr_engine == 0) ocr_desc = L"OCR 引擎: 系统自带";
-                    else if (state->config.ocr_engine == 1) ocr_desc = L"OCR 引擎: 微信 OCR";
-                    else ocr_desc = L"OCR 引擎: 本地高精度";
-                    bool ocr_hovered = (state->mouse_pos.x >= 230 && state->mouse_pos.x <= 420 && state->mouse_pos.y >= 515 && state->mouse_pos.y <= 545);
-                    draw_button(state, 230, 515, 420, 545, ocr_desc.c_str(), ocr_hovered);
+                    D2D1_RECT_F ocr_label_rect = D2D1::RectF(230.0f, 492.0f, 420.0f, 512.0f);
+                    state->render_target->DrawTextW(L"OCR 默认引擎", static_cast<UINT32>(wcslen(L"OCR 默认引擎")), state->small_format.Get(), ocr_label_rect, state->text_grey_brush.Get());
 
-                    // Check status
-                    std::wstring status_text;
-                    bool needs_download = false;
+                    for (const auto& button : kOcrEngineButtons) {
+                        const bool selected = state->config.ocr_engine == button.engine;
+                        const bool hovered = state->mouse_pos.x >= button.left && state->mouse_pos.x <= button.right &&
+                                             state->mouse_pos.y >= 515 && state->mouse_pos.y <= 545;
+                        draw_choice_button(state, button.left, 515, button.right, 545, button.label, selected, hovered);
+                    }
+
                     bool is_downloading = false;
                     int progress = 0;
                     std::wstring dl_error;
@@ -683,64 +610,39 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                         dl_error = g_ocr_download.error;
                     }
 
+                    OcrDependencyStatus dependency_status = ocr_dependency_status(state->config.ocr_engine);
+                    std::wstring status_text = dependency_status.message;
+                    bool needs_download = dependency_status.can_download;
+
                     if (is_downloading) {
                         status_text = std::format(L"正在下载... {}%", progress);
                     } else if (!dl_error.empty()) {
                         status_text = dl_error;
-                    } else {
-                        if (state->config.ocr_engine == 0) {
-                            status_text = L"状态: 就绪";
-                        } else if (state->config.ocr_engine == 1) {
-                            std::wstring wechat_dir = get_wechat_install_path();
-                            std::wstring ocr_dir = find_wechat_ocr_exe_dir();
-                            bool wechat_installed = !wechat_dir.empty() && !ocr_dir.empty();
-                            bool dll_exists = check_dependency_exists(L"wechat_ocr_api.dll");
-                            if (!wechat_installed) {
-                                status_text = L"状态: 未找到微信";
-                            } else if (!dll_exists) {
-                                status_text = L"状态: 未下载依赖";
-                                needs_download = true;
-                            } else {
-                                status_text = L"状态: 就绪";
-                            }
-                        } else if (state->config.ocr_engine == 2) {
-                            bool files_exist = check_dependency_exists(L"rapidocr_api.dll") &&
-                                               check_dependency_exists(L"onnxruntime.dll") &&
-                                               check_dependency_exists(L"models/ch_PP-OCRv4_det_infer.onnx");
-                            if (!files_exist) {
-                                status_text = L"状态: 未下载依赖";
-                                needs_download = true;
-                            } else {
-                                status_text = L"状态: 就绪";
-                            }
-                        }
                     }
 
-                    D2D1_RECT_F status_rect = D2D1::RectF(440.0f, 520.0f, 580.0f, 545.0f);
+                    D2D1_RECT_F status_rect = D2D1::RectF(230.0f, 560.0f, 500.0f, 585.0f);
                     if (is_downloading) {
-                        // Draw progress bar
-                        D2D1_RECT_F progress_track = D2D1::RectF(440.0f, 522.0f, 640.0f, 538.0f);
+                        D2D1_RECT_F progress_track = D2D1::RectF(230.0f, 562.0f, 500.0f, 578.0f);
                         state->render_target->FillRectangle(progress_track, state->control_bg_brush.Get());
                         state->render_target->DrawRectangle(progress_track, state->border_brush.Get(), 1.0f);
 
-                        float fill_width = 200.0f * (static_cast<float>(progress) / 100.0f);
-                        D2D1_RECT_F progress_fill = D2D1::RectF(440.0f, 522.0f, 440.0f + fill_width, 538.0f);
+                        float fill_width = 270.0f * (static_cast<float>(std::clamp(progress, 0, 100)) / 100.0f);
+                        D2D1_RECT_F progress_fill = D2D1::RectF(230.0f, 562.0f, 230.0f + fill_width, 578.0f);
                         state->render_target->FillRectangle(progress_fill, state->blue_brush.Get());
 
-                        D2D1_RECT_F text_rect = D2D1::RectF(650.0f, 517.0f, 730.0f, 545.0f);
+                        D2D1_RECT_F text_rect = D2D1::RectF(515.0f, 555.0f, 730.0f, 585.0f);
                         state->render_target->DrawTextW(status_text.c_str(), static_cast<UINT32>(status_text.size()), state->small_format.Get(), text_rect, state->text_white_brush.Get());
                     } else if (needs_download) {
-                        bool dl_hovered = (state->mouse_pos.x >= 440 && state->mouse_pos.x <= 560 && state->mouse_pos.y >= 515 && state->mouse_pos.y <= 545);
-                        draw_button(state, 440, 515, 560, 545, L"下载依赖", dl_hovered);
+                        bool dl_hovered = (state->mouse_pos.x >= 520 && state->mouse_pos.x <= 640 && state->mouse_pos.y >= 555 && state->mouse_pos.y <= 585);
+                        draw_button(state, 520, 555, 640, 585, L"下载依赖", dl_hovered);
 
-                        D2D1_RECT_F text_rect = D2D1::RectF(575.0f, 520.0f, 730.0f, 545.0f);
+                        D2D1_RECT_F text_rect = D2D1::RectF(230.0f, 560.0f, 510.0f, 585.0f);
                         state->render_target->DrawTextW(status_text.c_str(), static_cast<UINT32>(status_text.size()), state->small_format.Get(), text_rect, state->text_grey_brush.Get());
                     } else {
                         state->render_target->DrawTextW(status_text.c_str(), static_cast<UINT32>(status_text.size()), state->small_format.Get(), status_rect, state->text_grey_brush.Get());
                     }
 
-                    // Note text (moved down)
-                    D2D1_RECT_F note_rect = D2D1::RectF(230.0f, 570.0f, 700.0f, 615.0f);
+                    D2D1_RECT_F note_rect = D2D1::RectF(230.0f, 590.0f, 700.0f, 615.0f);
                     state->render_target->DrawTextW(strings::settings_note.data(), static_cast<UINT32>(strings::settings_note.size()), state->small_format.Get(), note_rect, state->text_grey_brush.Get());
 
                 } else if (state->active_tab == 1) {
@@ -941,69 +843,34 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                     InvalidateRect(window, nullptr, TRUE);
                     return 0;
                 }
-                // OCR Engine selection button
-                if (pt.x >= 230 && pt.x <= 420 && pt.y >= 515 && pt.y <= 545) {
+                // OCR engine buttons
+                if (const auto* button = hit_test_ocr_engine_button(pt)) {
                     bool is_downloading = false;
                     {
                         std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
                         is_downloading = g_ocr_download.is_downloading;
                     }
                     if (!is_downloading) {
-                        state->config.ocr_engine = (state->config.ocr_engine + 1) % 3;
-                        
-                        // Automatically trigger download if selected engine lacks dependencies
-                        bool needs_download = false;
-                        if (state->config.ocr_engine == 1) {
-                            std::wstring wechat_dir = get_wechat_install_path();
-                            std::wstring ocr_dir = find_wechat_ocr_exe_dir();
-                            bool wechat_installed = !wechat_dir.empty() && !ocr_dir.empty();
-                            bool dll_exists = check_dependency_exists(L"wechat_ocr_api.dll");
-                            if (wechat_installed && !dll_exists) {
-                                needs_download = true;
-                            }
-                        } else if (state->config.ocr_engine == 2) {
-                            bool files_exist = check_dependency_exists(L"rapidocr_api.dll") &&
-                                               check_dependency_exists(L"onnxruntime.dll") &&
-                                               check_dependency_exists(L"models/ch_PP-OCRv4_det_infer.onnx");
-                            if (!files_exist) {
-                                needs_download = true;
-                            }
+                        state->config.ocr_engine = button->engine;
+                        {
+                            std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
+                            g_ocr_download.error.clear();
                         }
-                        
-                        if (needs_download) {
-                            start_ocr_download(window, state->config.ocr_download_url);
-                        }
-                        
                         InvalidateRect(window, nullptr, TRUE);
                     }
                     return 0;
                 }
                 // Download button
-                if (pt.x >= 440 && pt.x <= 560 && pt.y >= 515 && pt.y <= 545) {
-                    bool needs_download = false;
+                if (pt.x >= 520 && pt.x <= 640 && pt.y >= 555 && pt.y <= 585) {
                     bool is_downloading = false;
                     {
                         std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
                         is_downloading = g_ocr_download.is_downloading;
                     }
-                    if (state->config.ocr_engine == 1) {
-                        std::wstring wechat_dir = get_wechat_install_path();
-                        std::wstring ocr_dir = find_wechat_ocr_exe_dir();
-                        bool wechat_installed = !wechat_dir.empty() && !ocr_dir.empty();
-                        bool dll_exists = check_dependency_exists(L"wechat_ocr_api.dll");
-                        if (wechat_installed && !dll_exists) {
-                            needs_download = true;
-                        }
-                    } else if (state->config.ocr_engine == 2) {
-                        bool files_exist = check_dependency_exists(L"rapidocr_api.dll") &&
-                                           check_dependency_exists(L"onnxruntime.dll") &&
-                                           check_dependency_exists(L"models/ch_PP-OCRv4_det_infer.onnx");
-                        if (!files_exist) {
-                            needs_download = true;
-                        }
-                    }
-                    if (needs_download && !is_downloading) {
+                    const OcrDependencyStatus status = ocr_dependency_status(state->config.ocr_engine);
+                    if (status.can_download && !is_downloading) {
                         start_ocr_download(window, state->config.ocr_download_url);
+                        InvalidateRect(window, nullptr, TRUE);
                     }
                     return 0;
                 }
@@ -1180,8 +1047,8 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                 if (pt.x >= 600 && pt.x <= 644 && pt.y >= 465 && pt.y <= 487) {
                     is_hovering_interactive = true;
                 }
-                // OCR Engine selection button
-                if (pt.x >= 230 && pt.x <= 420 && pt.y >= 515 && pt.y <= 545) {
+                // OCR engine buttons
+                if (hit_test_ocr_engine_button(pt)) {
                     bool is_downloading = false;
                     {
                         std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
@@ -1192,26 +1059,14 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                     }
                 }
                 // Download button
-                if (pt.x >= 440 && pt.x <= 560 && pt.y >= 515 && pt.y <= 545) {
-                    bool needs_download = false;
+                if (pt.x >= 520 && pt.x <= 640 && pt.y >= 555 && pt.y <= 585) {
                     bool is_downloading = false;
                     {
                         std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
                         is_downloading = g_ocr_download.is_downloading;
                     }
-                    if (state->config.ocr_engine == 1) {
-                        std::wstring wechat_dir = get_wechat_install_path();
-                        std::wstring ocr_dir = find_wechat_ocr_exe_dir();
-                        bool wechat_installed = !wechat_dir.empty() && !ocr_dir.empty();
-                        bool dll_exists = check_dependency_exists(L"wechat_ocr_api.dll");
-                        if (wechat_installed && !dll_exists) needs_download = true;
-                    } else if (state->config.ocr_engine == 2) {
-                        bool files_exist = check_dependency_exists(L"rapidocr_api.dll") &&
-                                           check_dependency_exists(L"onnxruntime.dll") &&
-                                           check_dependency_exists(L"models/ch_PP-OCRv4_det_infer.onnx");
-                        if (!files_exist) needs_download = true;
-                    }
-                    if (needs_download && !is_downloading) {
+                    const OcrDependencyStatus status = ocr_dependency_status(state->config.ocr_engine);
+                    if (status.can_download && !is_downloading) {
                         is_hovering_interactive = true;
                     }
                 }

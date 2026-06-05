@@ -51,7 +51,7 @@ try {
 
     $version = Invoke-AirScreenshot $firstExecutable @("--version")
     if ($version.ExitCode -ne 0 -or $version.Output -notmatch "^AirScreenshot \d+\.\d+\.\d+$") {
-        throw "单 EXE 版本命令失败：$($version.Output) $($version.Error)"
+        throw "便携版版本命令失败：$($version.Output) $($version.Error)"
     }
 
     $start = Invoke-AirScreenshot $firstExecutable @("app", "start")
@@ -104,7 +104,7 @@ try {
         throw "便携更新替换器未正确覆盖目标文件。"
     }
 
-    Write-Host "便携单 EXE 烟测通过。"
+    Write-Host "便携版烟测通过。"
 }
 finally {
     Get-Process AirScreenshot -ErrorAction SilentlyContinue |

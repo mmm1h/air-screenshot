@@ -12,8 +12,9 @@
 </head>
 <body>
   <h1>Air Screenshot __SEMVER__</h1>
-  <p>下载一个 EXE，双击即可运行。无需安装、管理员权限或证书脚本。</p>
+  <p>下载主程序和 OCR helper，放在同一目录后双击运行。无需安装、管理员权限或证书脚本。</p>
   <p><a class="download" href="__DOWNLOAD_URL__">下载 AirScreenshot.exe</a></p>
+  <p><a href="airshot_ocr.exe">下载 airshot_ocr.exe</a></p>
   <p>Windows SmartScreen 可能提示未知发布者；确认来源为本项目后可选择继续运行。</p>
   <p>程序会在后台下载经过哈希和签名校验的新版本，并在退出或下次启动时完成更新。</p>
   <p><a href="https://github.com/mmm1h/air-screenshot">源代码与发布记录</a></p>

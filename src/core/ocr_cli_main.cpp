@@ -1,4 +1,5 @@
 #include "airshot/bitmap.h"
+#include "airshot/config.h"
 #include <windows.h>
 #include <wincodec.h>
 #include <winrt/Windows.Foundation.h>
@@ -6,6 +7,7 @@
 #include <winrt/Windows.Media.Ocr.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <robuffer.h>
+#include <algorithm>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -144,6 +146,8 @@ bool run_wechat_ocr(const std::filesystem::path& dll_path, const std::filesystem
         fn_free(result_str);
     } else {
         out_error = L"微信 OCR 未识别到任何文本。";
+        FreeLibrary(hModule);
+        return false;
     }
 
     FreeLibrary(hModule);
@@ -154,28 +158,42 @@ bool run_wechat_ocr(const std::filesystem::path& dll_path, const std::filesystem
 typedef bool (__stdcall* FnONNXOCRInit)(const wchar_t* model_dir);
 typedef wchar_t* (__stdcall* FnONNXOCRRecognize)(const wchar_t* image_path);
 typedef void (__stdcall* FnONNXOCRFreeResult)(wchar_t* text);
+typedef void (__stdcall* FnONNXOCRSetThreadCount)(int thread_count);
 
 bool run_onnx_ocr(const std::filesystem::path& dll_path, const std::filesystem::path& image_path,
-                  const std::wstring& model_dir, std::wstring& out_text, std::wstring& out_error) {
+                  const std::wstring& model_dir, int ort_threads, std::wstring& out_text, std::wstring& out_error) {
+    SetDllDirectoryW(dll_path.parent_path().c_str());
+    const std::wstring thread_count = std::to_wstring(std::max(1, ort_threads));
+    SetEnvironmentVariableW(L"OMP_NUM_THREADS", thread_count.c_str());
+    SetEnvironmentVariableW(L"OMP_WAIT_POLICY", L"PASSIVE");
+
     HMODULE hModule = LoadLibraryW(dll_path.c_str());
     if (!hModule) {
         out_error = L"无法加载 rapidocr_api.dll (错误码 " + std::to_wstring(GetLastError()) + L")。";
+        SetDllDirectoryW(nullptr);
         return false;
     }
 
     auto fn_init = reinterpret_cast<FnONNXOCRInit>(GetProcAddress(hModule, "ONNXOCR_Init"));
     auto fn_recognize = reinterpret_cast<FnONNXOCRRecognize>(GetProcAddress(hModule, "ONNXOCR_Recognize"));
     auto fn_free = reinterpret_cast<FnONNXOCRFreeResult>(GetProcAddress(hModule, "ONNXOCR_FreeResult"));
+    auto fn_set_threads = reinterpret_cast<FnONNXOCRSetThreadCount>(GetProcAddress(hModule, "ONNXOCR_SetThreadCount"));
 
     if (!fn_init || !fn_recognize || !fn_free) {
         out_error = L"rapidocr_api.dll 中缺少必要的导出函数。";
         FreeLibrary(hModule);
+        SetDllDirectoryW(nullptr);
         return false;
+    }
+
+    if (fn_set_threads) {
+        fn_set_threads(std::max(1, ort_threads));
     }
 
     if (!fn_init(model_dir.c_str())) {
         out_error = L"ONNX OCR 引擎模型载入失败。";
         FreeLibrary(hModule);
+        SetDllDirectoryW(nullptr);
         return false;
     }
 
@@ -185,28 +203,50 @@ bool run_onnx_ocr(const std::filesystem::path& dll_path, const std::filesystem::
         fn_free(result_str);
     } else {
         out_error = L"本地 ONNX OCR 未识别到任何文本。";
+        FreeLibrary(hModule);
+        SetDllDirectoryW(nullptr);
+        return false;
     }
 
     FreeLibrary(hModule);
+    SetDllDirectoryW(nullptr);
     return true;
 }
 
-std::filesystem::path get_dependency_dll_path(const wchar_t* argv0, const wchar_t* dll_name) {
+std::filesystem::path get_dependency_file_path(const wchar_t* argv0, const std::wstring& dependency_dir, const wchar_t* relative_path) {
+    if (!dependency_dir.empty()) {
+        std::filesystem::path explicit_path = std::filesystem::path(dependency_dir) / relative_path;
+        if (std::filesystem::exists(explicit_path)) {
+            return explicit_path;
+        }
+    }
+
     // 1. Check current exe folder
     std::filesystem::path current_dir = std::filesystem::path(argv0).parent_path();
-    std::filesystem::path local_path = current_dir / L"ocr_onnx" / dll_name;
-    if (std::filesystem::exists(local_path)) {
-        return local_path;
+    const std::filesystem::path packaged_path = current_dir / L"ocr" / airshot::kRapidOcrPackageId / relative_path;
+    if (std::filesystem::exists(packaged_path)) {
+        return packaged_path;
     }
+    const std::filesystem::path legacy_local_path = current_dir / L"ocr_onnx" / relative_path;
+    if (std::filesystem::exists(legacy_local_path)) {
+        return legacy_local_path;
+    }
+
     // 2. Check AppData folder
     const wchar_t* local_appdata = _wgetenv(L"LOCALAPPDATA");
     if (local_appdata) {
-        std::filesystem::path app_data_path = std::filesystem::path(local_appdata) / L"AirScreenshot" / L"ocr_onnx" / dll_name;
+        const std::filesystem::path app_data_path =
+            std::filesystem::path(local_appdata) / L"AirScreenshot" / L"ocr" / airshot::kRapidOcrPackageId / relative_path;
         if (std::filesystem::exists(app_data_path)) {
             return app_data_path;
         }
+        const std::filesystem::path legacy_app_data_path =
+            std::filesystem::path(local_appdata) / L"AirScreenshot" / L"ocr_onnx" / relative_path;
+        if (std::filesystem::exists(legacy_app_data_path)) {
+            return legacy_app_data_path;
+        }
     }
-    return local_path; // fallback
+    return legacy_local_path; // fallback
 }
 
 } // namespace
@@ -221,6 +261,8 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wstring wechat_dir;
     std::wstring ocr_dir;
     std::wstring model_dir;
+    std::wstring dependency_dir;
+    int ort_threads = 2;
 
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
@@ -234,6 +276,14 @@ int wmain(int argc, wchar_t* argv[]) {
             ocr_dir = argv[++i];
         } else if (arg == L"--model-dir" && i + 1 < argc) {
             model_dir = argv[++i];
+        } else if (arg == L"--dependency-dir" && i + 1 < argc) {
+            dependency_dir = argv[++i];
+        } else if (arg == L"--ort-threads" && i + 1 < argc) {
+            try {
+                ort_threads = std::max(1, std::stoi(argv[++i]));
+            } catch (...) {
+                ort_threads = 2;
+            }
         }
     }
 
@@ -256,11 +306,14 @@ int wmain(int argc, wchar_t* argv[]) {
         }
         success = run_winrt_ocr(bitmap, out_text, out_error);
     } else if (engine == L"wechat") {
-        std::filesystem::path dll_path = get_dependency_dll_path(argv[0], L"wechat_ocr_api.dll");
+        std::filesystem::path dll_path = get_dependency_file_path(argv[0], dependency_dir, L"wechat_ocr_api.dll");
         success = run_wechat_ocr(dll_path, image_path, wechat_dir, ocr_dir, out_text, out_error);
     } else if (engine == L"onnx") {
-        std::filesystem::path dll_path = get_dependency_dll_path(argv[0], L"rapidocr_api.dll");
-        success = run_onnx_ocr(dll_path, image_path, model_dir, out_text, out_error);
+        std::filesystem::path dll_path = get_dependency_file_path(argv[0], dependency_dir, L"rapidocr_api.dll");
+        if (model_dir.empty()) {
+            model_dir = (dll_path.parent_path() / L"models").wstring();
+        }
+        success = run_onnx_ocr(dll_path, image_path, model_dir, ort_threads, out_text, out_error);
     } else {
         std::wcerr << L"错误: 未知的 OCR 引擎 \"" << engine << L"\"。\n";
         return 1;

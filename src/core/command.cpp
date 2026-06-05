@@ -33,7 +33,7 @@ ParsedCli request_result(JsonObject request, bool json_output) {
 }  // namespace
 
 std::wstring help_text() {
-    return LR"(Air Screenshot 单 EXE / CLI
+    return LR"(Air Screenshot Portable / CLI
 
 用法:
   AirScreenshot.exe capture region [--output clipboard|file] [--path <路径>] [--json]

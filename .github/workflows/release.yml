@@ -78,14 +78,16 @@ jobs:
           VERSION: ${{ steps.metadata.outputs.version }}
         run: |
           $asset = "dist/site/AirScreenshot.exe"
+          $ocrHelper = "dist/site/airshot_ocr.exe"
           if (gh release view $env:GITHUB_REF_NAME 2>$null) {
             gh release upload $env:GITHUB_REF_NAME $asset --clobber
+            gh release upload $env:GITHUB_REF_NAME $ocrHelper --clobber
           } else {
-            gh release create $env:GITHUB_REF_NAME $asset `
+            gh release create $env:GITHUB_REF_NAME $asset $ocrHelper `
               --verify-tag `
               --title "Air Screenshot $env:VERSION" `
               --generate-notes `
-              --notes "下载 AirScreenshot.exe 后双击即可运行，无需安装。"
+              --notes "下载 AirScreenshot.exe 和 airshot_ocr.exe，放在同一目录后双击即可运行，无需安装。"
           }
 
       - name: Configure GitHub Pages
@@ -117,13 +119,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          assets="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name]')"
-          test "$assets" = '["AirScreenshot.exe"]'
+          assets="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name] | sort')"
+          test "$assets" = '["AirScreenshot.exe","airshot_ocr.exe"]'
 
           expected_version="${GITHUB_REF_NAME#v}"
           for attempt in {1..30}; do
             if curl -fsS -H 'Cache-Control: no-cache' -o latest.json "https://mmm1h.github.io/air-screenshot/latest.json" &&
-               curl -fsS -H 'Cache-Control: no-cache' -o index.html "https://mmm1h.github.io/air-screenshot/"; then
+               curl -fsS -H 'Cache-Control: no-cache' -o index.html "https://mmm1h.github.io/air-screenshot/" &&
+               curl -fsS -H 'Cache-Control: no-cache' -o airshot_ocr.exe "https://mmm1h.github.io/air-screenshot/airshot_ocr.exe"; then
               actual_version="$(jq -r '.version' latest.json)"
               download_url="$(jq -r '.url' latest.json)"
               expected_sha256="$(jq -r '.sha256 | ascii_downcase' latest.json)"
@@ -136,7 +139,9 @@ jobs:
                  [[ "$download_url" = "https://mmm1h.github.io/air-screenshot/AirScreenshot.exe" ]] &&
                  [[ "$actual_sha256" = "$expected_sha256" ]] &&
                  [[ "$actual_size" = "$expected_size" ]] &&
+                 [[ -s airshot_ocr.exe ]] &&
                  grep -q "AirScreenshot.exe" index.html &&
+                 grep -q "airshot_ocr.exe" index.html &&
                  ! grep -Eqi 'msix|appinstaller|Install-AirScreenshot' index.html; then
                 exit 0
               fi

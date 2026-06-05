@@ -6,15 +6,15 @@ Air Screenshot 是一个面向 Windows 10 2004+ x64 的轻量原生截图工具�
 
 - 区域、活动窗口、显示器、全虚拟桌面截图和长截图
 - 剪贴板与 PNG 输出
-- 可关闭的轻量标注、贴图和 Windows 系统 OCR
-- 托盘、开机自启、全局快捷键与单 EXE CLI
+- 可关闭的轻量标注、贴图和可切换 OCR 引擎
+- 托盘、开机自启、全局快捷键与便携 CLI
 - 便携 EXE 静默下载更新，退出或下次启动时应用
 
 常驻宿主只负责托盘、快捷键和命名管道；截图缓冲、Direct2D 资源和 OCR 引擎都在使用时创建。
 
 ## 下载与使用
 
-从 [公开下载页](https://mmm1h.github.io/air-screenshot/) 下载 `AirScreenshot.exe`，放到普通可写目录后双击运行。无需安装、管理员权限或证书脚本。
+从 [公开下载页](https://mmm1h.github.io/air-screenshot/) 下载 `AirScreenshot.exe` 和 `airshot_ocr.exe`，放到同一个普通可写目录后双击运行。无需安装、管理员权限或证书脚本。
 
 首次启动默认注册当前用户开机启动项，可在设置中关闭。移动 EXE 后再次启动会自动修正启动项路径。
 
@@ -68,7 +68,7 @@ git push origin v0.2.1
 
 ## CLI
 
-同一个 EXE 同时提供 GUI 与 CLI：
+主程序同时提供 GUI 与 CLI：
 
 ```powershell
 .\AirScreenshot.exe capture region
@@ -81,11 +81,21 @@ git push origin v0.2.1
 
 无参数双击时启动托盘宿主。CLI 主要面向 PowerShell 与 Windows Terminal；程序保持 GUI 子系统，因此双击不会弹出黑色控制台窗口。
 
+## OCR
+
+OCR 默认使用本地高精度引擎，设置中也可切换为微信 OCR 或 Windows 系统 OCR：
+
+- 本地高精度：基于 RapidOCR / PP-OCRv5 mobile / ONNX Runtime CPU，首次使用前在设置中点击“下载依赖”。依赖按清单校验 SHA256 后安装到 `%LOCALAPPDATA%\AirScreenshot\ocr\rapidocr-ppocrv5-mobile-v1`。
+- 微信 OCR：复用本机微信 OCR 组件，需要本机已安装微信，并提供 `wechat_ocr_api.dll` 适配 DLL。
+- 系统 OCR：调用 Windows `Windows.Media.Ocr`，可用语言取决于系统语言包。
+
+OCR 识别在 `airshot_ocr.exe` 子进程中完成；模型和推理运行时不会常驻托盘进程，单次识别超时会停止子进程。离线环境可提前把依赖目录放到程序同目录下的 `ocr\rapidocr-ppocrv5-mobile-v1`。
+
 ## 限制
 
 - GDI `BitBlt` 无法捕获受保护内容和部分硬件覆盖层。
-- 不包含录屏、历史记录或第三方 DLL 插件。
-- OCR 只调用 Windows 系统 `Windows.Media.Ocr`，可用语言取决于系统语言包。
+- 不包含录屏、历史记录或通用第三方插件系统。
+- 本地高精度 OCR 依赖需要单独下载；未安装依赖时会提示到设置中下载。
 - 旧 MSIX 版本不会自动迁移配置，需要用户自行卸载。
 
 项目采用 `LGPL-3.0-only`。完整许可证见 [LICENSE](LICENSE)，第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
