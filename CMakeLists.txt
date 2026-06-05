@@ -36,6 +36,10 @@ add_library(airshot_core STATIC
     src/core/ocr.cpp
     src/core/output.cpp
     src/core/overlay.cpp
+    src/core/overlay_color_picker.cpp
+    src/core/overlay_prompt.cpp
+    src/core/overlay_scroll.cpp
+    src/core/overlay_scroll_windows.cpp
     src/core/portable.cpp
 )
 
