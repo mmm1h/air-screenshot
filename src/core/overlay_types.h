@@ -9,6 +9,7 @@ namespace airshot::overlay_detail {
 
 enum class Tool {
     none,
+    select,
     rectangle,
     ellipse,
     line,
@@ -19,6 +20,7 @@ enum class Tool {
     text,
     serial,
     eraser,
+    blur,
 };
 
 enum class DragMode {

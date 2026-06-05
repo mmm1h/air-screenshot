@@ -26,11 +26,14 @@ private:
     LRESULT handle_message(UINT msg, WPARAM wparam, LPARAM lparam);
     void paint();
     void show_context_menu(POINT screen_pos);
+    void rotate(bool cw);
+    void flip(bool horizontal);
 
     HWND hwnd_{};
     Bitmap bitmap_{};
     HBITMAP hbitmap_{};
     double scale_{1.0};
+    int alpha_{255};
 };
 
 } // namespace airshot

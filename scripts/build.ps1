@@ -8,13 +8,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 if ($Version -and $Version -notmatch "^\d+\.\d+\.\d+$") {
-    throw "构建版本必须使用 X.Y.Z 格式。"
+    throw "Version must be in X.Y.Z format."
 }
 $root = Split-Path -Parent $PSScriptRoot
 $build = Join-Path $root "build"
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-if (-not $vs) { throw "未找到包含 C++ 工具链的 Visual Studio。" }
+if (-not $vs) { throw "Visual Studio with C++ toolchain not found." }
 
 $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
 $cmake = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
@@ -26,6 +26,6 @@ if ($Clean -and (Test-Path $build)) {
 
 $command = "`"$vcvars`" && `"$cmake`" -S `"$root`" -B `"$build`" -G Ninja -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_BUILD_TYPE=$Configuration -DBUILD_TESTING=ON -DAIRSHOT_BUILD_VERSION=$Version && `"$cmake`" --build `"$build`" --config $Configuration"
 & cmd.exe /d /s /c $command
-if ($LASTEXITCODE -ne 0) { throw "构建失败，退出码 $LASTEXITCODE。" }
+if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE." }
 
-Write-Host "构建完成：$build"
+Write-Host "Build complete: $build"

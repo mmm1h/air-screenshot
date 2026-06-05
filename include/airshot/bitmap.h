@@ -21,5 +21,10 @@ struct Bitmap {
 void blit(const Bitmap& source, const RectI& source_rect, Bitmap& target, POINT target_origin);
 [[nodiscard]] Bitmap crop(const Bitmap& source, const RectI& rect);
 void pixelate_circle(Bitmap& bitmap, POINT center, int radius, int block_size);
+void blur_circle(Bitmap& bitmap, POINT center, int radius, int blur_radius);
+[[nodiscard]] Bitmap rotate_90_cw(const Bitmap& source);
+[[nodiscard]] Bitmap rotate_90_ccw(const Bitmap& source);
+[[nodiscard]] Bitmap flip_horizontal(const Bitmap& source);
+[[nodiscard]] Bitmap flip_vertical(const Bitmap& source);
 
 }  // namespace airshot

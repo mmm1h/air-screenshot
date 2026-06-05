@@ -52,6 +52,7 @@ target_compile_definitions(airshot_core PUBLIC
     UNICODE
     _UNICODE
     WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
     AIRSHOT_VERSION="${AIRSHOT_BUILD_VERSION}"
     AIRSHOT_VERSION_MAJOR=${AIRSHOT_VERSION_MAJOR}
     AIRSHOT_VERSION_MINOR=${AIRSHOT_VERSION_MINOR}
@@ -91,6 +92,12 @@ target_compile_options(AirScreenshot PRIVATE /W4 /permissive- /utf-8 "$<$<CONFIG
 target_link_options(AirScreenshot PRIVATE "$<$<CONFIG:Release>:/DEBUG>" "$<$<CONFIG:Release>:/OPT:REF>" "$<$<CONFIG:Release>:/OPT:ICF>")
 target_link_libraries(AirScreenshot PRIVATE airshot_core comctl32)
 
+add_executable(airshot_ocr
+    src/core/ocr_cli_main.cpp
+)
+target_compile_options(airshot_ocr PRIVATE /W4 /permissive- /utf-8)
+target_link_libraries(airshot_ocr PRIVATE airshot_core)
+
 if(BUILD_TESTING)
     add_executable(airshot_tests tests/test_main.cpp)
     target_compile_options(airshot_tests PRIVATE /W4 /permissive- /utf-8)
@@ -98,4 +105,4 @@ if(BUILD_TESTING)
     add_test(NAME airshot_tests COMMAND airshot_tests)
 endif()
 
-install(TARGETS AirScreenshot RUNTIME DESTINATION .)
+install(TARGETS AirScreenshot airshot_ocr RUNTIME DESTINATION .)

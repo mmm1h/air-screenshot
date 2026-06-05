@@ -4,7 +4,7 @@ namespace airshot::overlay_detail {
 namespace {
 
 bool tool_uses_points(Tool tool) {
-    return tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::eraser;
+    return tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::eraser || tool == Tool::blur;
 }
 
 bool annotation_has_size(const Annotation& annotation) {
@@ -64,7 +64,8 @@ bool hit_annotation(const Annotation& annotation, POINT point) {
         case Tool::pen:
         case Tool::mosaic:
         case Tool::highlight:
-            return near_polyline(point, annotation.points, threshold + (annotation.tool == Tool::mosaic ? 10.0 : 0.0));
+        case Tool::blur:
+            return near_polyline(point, annotation.points, threshold + ((annotation.tool == Tool::mosaic || annotation.tool == Tool::blur) ? 10.0 : 0.0));
         case Tool::text:
             return RectI{annotation.start.x, annotation.start.y, annotation.start.x + 160, annotation.start.y + 32}.contains(point);
         case Tool::serial:
@@ -72,6 +73,12 @@ bool hit_annotation(const Annotation& annotation, POINT point) {
         default:
             return false;
     }
+}
+
+bool tool_supports_width(Tool tool) {
+    return tool == Tool::rectangle || tool == Tool::ellipse || tool == Tool::line || tool == Tool::arrow ||
+           tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::eraser ||
+           tool == Tool::blur;
 }
 
 }  // namespace
@@ -173,7 +180,11 @@ bool OverlaySession::erase_annotation_at(POINT relative) {
 
 void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
     if (right) {
-        finish({ExitCode::user_cancelled, L"已取消。"});
+        if (selection_complete_) {
+            show_quick_menu(source, point);
+        } else {
+            finish({ExitCode::user_cancelled, L"已取消。"});
+        }
         return;
     }
     if (selection_complete_) {
@@ -200,10 +211,36 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
 
         if (mode == DragMode::annotate) {
             POINT relative{point.x - selection_.left, point.y - selection_.top};
+            if (active_tool_ == Tool::select) {
+                selected_annotation_idx_ = -1;
+                for (int i = static_cast<int>(annotations_.size()) - 1; i >= 0; --i) {
+                    if (hit_annotation(annotations_[i], relative)) {
+                        selected_annotation_idx_ = i;
+                        original_annotation_ = annotations_[i];
+                        break;
+                    }
+                }
+                if (selected_annotation_idx_ != -1) {
+                    dragging_selection_ = true;
+                    current_drag_mode_ = DragMode::annotate;
+                    drag_start_ = point;
+                    SetCapture(source);
+                    invalidate_all();
+                } else {
+                    selected_annotation_idx_ = -1;
+                    dragging_selection_ = true;
+                    current_drag_mode_ = DragMode::move;
+                    drag_start_ = point;
+                    original_selection_ = selection_;
+                    SetCapture(source);
+                    invalidate_all();
+                }
+                return;
+            }
             if (active_tool_ == Tool::text) {
                 if (auto text = prompt_text(source, point)) {
                     discard_redo();
-                    annotations_.push_back({Tool::text, relative, relative, {}, std::move(*text), active_color_, active_width_});
+                    annotations_.push_back({Tool::text, relative, relative, {}, std::move(*text), active_color_, active_text_size_});
                     finish_annotation();
                 }
                 return;
@@ -308,6 +345,19 @@ void OverlaySession::on_mouse_move(POINT point) {
                 if (top + h > virtual_bounds_.bottom) top = virtual_bounds_.bottom - h;
 
                 selection_ = {left, top, left + w, top + h};
+            } else if (current_drag_mode_ == DragMode::annotate && active_tool_ == Tool::select && selected_annotation_idx_ != -1) {
+                auto& selected = annotations_[selected_annotation_idx_];
+                selected.start.x = original_annotation_.start.x + dx;
+                selected.start.y = original_annotation_.start.y + dy;
+                selected.end.x = original_annotation_.end.x + dx;
+                selected.end.y = original_annotation_.end.y + dy;
+                if (!original_annotation_.points.empty()) {
+                    selected.points.resize(original_annotation_.points.size());
+                    for (std::size_t i = 0; i < original_annotation_.points.size(); ++i) {
+                        selected.points[i].x = original_annotation_.points[i].x + dx;
+                        selected.points[i].y = original_annotation_.points[i].y + dy;
+                    }
+                }
             } else {
                 int left = selection_.left;
                 int top = selection_.top;
@@ -406,6 +456,11 @@ void OverlaySession::on_mouse_up(POINT point) {
         return;
     }
     dragging_selection_ = false;
+    if (current_drag_mode_ == DragMode::annotate && active_tool_ == Tool::select) {
+        current_drag_mode_ = DragMode::none;
+        invalidate_all();
+        return;
+    }
 
     if (current_drag_mode_ == DragMode::none) {
         const int distance = std::abs(point.x - drag_start_.x) + std::abs(point.y - drag_start_.y);
@@ -487,6 +542,106 @@ void OverlaySession::on_key_down(HWND source, WPARAM key) {
     }
 
     // After selection is complete: normal editing shortcuts
+    auto is_shortcut_triggered = [this](std::wstring_view shortcut_str, WPARAM k) {
+        auto hotkey = parse_hotkey(shortcut_str);
+        if (!hotkey) return false;
+        if (hotkey->virtual_key != k) return false;
+        
+        bool ctrl = (hotkey->modifiers & MOD_CONTROL) != 0;
+        bool alt = (hotkey->modifiers & MOD_ALT) != 0;
+        bool shift = (hotkey->modifiers & MOD_SHIFT) != 0;
+        bool win = (hotkey->modifiers & MOD_WIN) != 0;
+        
+        bool actual_ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool actual_alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+        bool actual_shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool actual_win = (GetKeyState(VK_LWIN) & 0x8000) != 0 || (GetKeyState(VK_RWIN) & 0x8000) != 0;
+        
+        return ctrl == actual_ctrl && alt == actual_alt && shift == actual_shift && win == actual_win;
+    };
+
+    Tool target_tool = Tool::none;
+    if (is_shortcut_triggered(request_.config.tool_shortcut_select, key)) target_tool = Tool::select;
+    else if (is_shortcut_triggered(request_.config.tool_shortcut_rectangle, key)) target_tool = Tool::rectangle;
+    else if (is_shortcut_triggered(request_.config.tool_shortcut_ellipse, key)) target_tool = Tool::ellipse;
+    else if (is_shortcut_triggered(request_.config.tool_shortcut_line, key)) target_tool = Tool::line;
+    else if (is_shortcut_triggered(request_.config.tool_shortcut_arrow, key)) target_tool = Tool::arrow;
+    else if (is_shortcut_triggered(request_.config.tool_shortcut_pen, key)) target_tool = Tool::pen;
+    else if (is_shortcut_triggered(request_.config.tool_shortcut_mosaic, key)) target_tool = Tool::mosaic;
+    else if (is_shortcut_triggered(request_.config.tool_shortcut_blur, key)) target_tool = Tool::blur;
+    else if (is_shortcut_triggered(request_.config.tool_shortcut_highlight, key)) target_tool = Tool::highlight;
+    else if (is_shortcut_triggered(request_.config.tool_shortcut_text, key)) target_tool = Tool::text;
+    else if (is_shortcut_triggered(request_.config.tool_shortcut_serial, key)) target_tool = Tool::serial;
+    else if (is_shortcut_triggered(request_.config.tool_shortcut_eraser, key)) target_tool = Tool::eraser;
+
+    if (target_tool != Tool::none) {
+        active_tool_ = target_tool;
+        selected_annotation_idx_ = -1;
+        build_toolbar();
+        build_sub_toolbar();
+        invalidate_all();
+        return;
+    }
+
+    // Arrow keys for micro-adjusting selection
+    if (key == VK_UP || key == VK_DOWN || key == VK_LEFT || key == VK_RIGHT) {
+        int step = (GetKeyState(VK_CONTROL) & 0x8000) ? 10 : 1;
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (shift) {
+            if (key == VK_LEFT) {
+                selection_.right = std::max(selection_.left + 2, selection_.right - step);
+            } else if (key == VK_RIGHT) {
+                selection_.right = std::min(virtual_bounds_.right, selection_.right + step);
+            } else if (key == VK_UP) {
+                selection_.bottom = std::max(selection_.top + 2, selection_.bottom - step);
+            } else if (key == VK_DOWN) {
+                selection_.bottom = std::min(virtual_bounds_.bottom, selection_.bottom + step);
+            }
+        } else {
+            int dx = 0;
+            int dy = 0;
+            if (key == VK_LEFT) dx = -step;
+            else if (key == VK_RIGHT) dx = step;
+            else if (key == VK_UP) dy = -step;
+            else if (key == VK_DOWN) dy = step;
+
+            int w = selection_.width();
+            int h = selection_.height();
+            int left = selection_.left + dx;
+            int top = selection_.top + dy;
+
+            if (left < virtual_bounds_.left) left = virtual_bounds_.left;
+            if (left + w > virtual_bounds_.right) left = virtual_bounds_.right - w;
+            if (top < virtual_bounds_.top) top = virtual_bounds_.top;
+            if (top + h > virtual_bounds_.bottom) top = virtual_bounds_.bottom - h;
+
+            selection_ = {left, top, left + w, top + h};
+        }
+        build_toolbar();
+        invalidate_all();
+        return;
+    }
+
+    // Spacebar to show quick menu
+    if (key == VK_SPACE) {
+        POINT pt{};
+        GetCursorPos(&pt);
+        show_quick_menu(source, pt);
+        return;
+    }
+
+    // Delete/Backspace key to delete selected annotation
+    if (active_tool_ == Tool::select && selected_annotation_idx_ != -1) {
+        if (key == VK_DELETE || key == VK_BACK) {
+            discard_redo();
+            annotations_.erase(annotations_.begin() + selected_annotation_idx_);
+            selected_annotation_idx_ = -1;
+            build_toolbar();
+            invalidate_all();
+            return;
+        }
+    }
+
     if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 && key == 'C') {
         complete_clipboard();
         return;
@@ -601,6 +756,114 @@ void OverlaySession::invalidate_all() const {
         }
     }
     return best_snap;
+}
+
+bool OverlaySession::hit_test_annotation(POINT relative) const {
+    for (const auto& annotation : annotations_) {
+        if (hit_annotation(annotation, relative)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void OverlaySession::on_mouse_wheel(short delta) {
+    if (active_tool_ == Tool::text) {
+        float step = delta > 0 ? 2.0F : -2.0F;
+        active_text_size_ = std::clamp(active_text_size_ + step, 12.0F, 72.0F);
+        if (selected_annotation_idx_ != -1 && static_cast<std::size_t>(selected_annotation_idx_) < annotations_.size()) {
+            if (annotations_[selected_annotation_idx_].tool == Tool::text) {
+                annotations_[selected_annotation_idx_].width = active_text_size_;
+            }
+        }
+        invalidate_all();
+    } else if (tool_supports_width(active_tool_)) {
+        float step = delta > 0 ? 1.0F : -1.0F;
+        active_width_ = std::clamp(active_width_ + step, 1.0F, 50.0F);
+        if (selected_annotation_idx_ != -1 && static_cast<std::size_t>(selected_annotation_idx_) < annotations_.size()) {
+            if (tool_supports_width(annotations_[selected_annotation_idx_].tool)) {
+                annotations_[selected_annotation_idx_].width = active_width_;
+            }
+        }
+        invalidate_all();
+    }
+}
+
+void OverlaySession::show_quick_menu(HWND hwnd, POINT pt) {
+    HMENU menu = CreatePopupMenu();
+    
+    // Tools Submenu
+    HMENU tools_menu = CreatePopupMenu();
+    AppendMenuW(tools_menu, MF_STRING, 101, L"选择工具 (Select)\tSelect");
+    AppendMenuW(tools_menu, MF_STRING, 102, L"矩形 (Rectangle)\tRectangle");
+    AppendMenuW(tools_menu, MF_STRING, 103, L"椭圆 (Ellipse)\tEllipse");
+    AppendMenuW(tools_menu, MF_STRING, 104, L"直线 (Line)\tLine");
+    AppendMenuW(tools_menu, MF_STRING, 105, L"箭头 (Arrow)\tArrow");
+    AppendMenuW(tools_menu, MF_STRING, 106, L"画笔 (Pen)\tPen");
+    AppendMenuW(tools_menu, MF_STRING, 107, L"马赛克 (Mosaic)\tMosaic");
+    AppendMenuW(tools_menu, MF_STRING, 108, L"模糊 (Blur)\tBlur");
+    AppendMenuW(tools_menu, MF_STRING, 109, L"高亮 (Highlight)\tHighlight");
+    AppendMenuW(tools_menu, MF_STRING, 110, L"文本 (Text)\tText");
+    AppendMenuW(tools_menu, MF_STRING, 111, L"序号 (Serial)\tSerial");
+    AppendMenuW(tools_menu, MF_STRING, 112, L"橡皮擦 (Eraser)\tEraser");
+    
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(tools_menu), L"工具 (Tools)");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    
+    AppendMenuW(menu, MF_STRING, 1, L"复制到剪贴板 (Copy)\tCtrl+C / Enter");
+    AppendMenuW(menu, MF_STRING, 2, L"保存到文件 (Save)\tCtrl+S");
+    AppendMenuW(menu, MF_STRING, 3, L"贴图 (Pin)");
+    if (request_.config.ocr_enabled) {
+        AppendMenuW(menu, MF_STRING, 4, L"屏幕识字 (OCR)\tShift+C");
+    }
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    
+    AppendMenuW(menu, MF_STRING, 5, L"撤销 (Undo)\tCtrl+Z");
+    AppendMenuW(menu, MF_STRING, 6, L"重做 (Redo)\tCtrl+Y");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 7, L"退出 (Exit)\tEsc");
+
+    // Show menu
+    int selection = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, nullptr);
+    DestroyMenu(tools_menu);
+    DestroyMenu(menu);
+
+    if (selection == 1) {
+        complete_clipboard();
+    } else if (selection == 2) {
+        complete_file({}, hwnd);
+    } else if (selection == 3) {
+        complete_pin();
+    } else if (selection == 4) {
+        complete_ocr();
+    } else if (selection == 5) {
+        undo();
+    } else if (selection == 6) {
+        redo();
+    } else if (selection == 7) {
+        finish({ExitCode::user_cancelled, L"已取消。"});
+    } else if (selection >= 101 && selection <= 112) {
+        Tool chosen_tool = Tool::none;
+        switch (selection) {
+            case 101: chosen_tool = Tool::select; break;
+            case 102: chosen_tool = Tool::rectangle; break;
+            case 103: chosen_tool = Tool::ellipse; break;
+            case 104: chosen_tool = Tool::line; break;
+            case 105: chosen_tool = Tool::arrow; break;
+            case 106: chosen_tool = Tool::pen; break;
+            case 107: chosen_tool = Tool::mosaic; break;
+            case 108: chosen_tool = Tool::blur; break;
+            case 109: chosen_tool = Tool::highlight; break;
+            case 110: chosen_tool = Tool::text; break;
+            case 111: chosen_tool = Tool::serial; break;
+            case 112: chosen_tool = Tool::eraser; break;
+        }
+        active_tool_ = chosen_tool;
+        selected_annotation_idx_ = -1;
+        build_toolbar();
+        build_sub_toolbar();
+        invalidate_all();
+    }
 }
 
 }  // namespace airshot::overlay_detail

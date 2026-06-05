@@ -33,8 +33,11 @@ public:
     void on_mouse_up(POINT point);
     void on_double_click(POINT point);
     void on_key_down(HWND source, WPARAM key);
+    void on_mouse_wheel(short delta);
+    void show_quick_menu(HWND hwnd, POINT pt);
     void invalidate_all() const;
     [[nodiscard]] RectI display_selection() const;
+    [[nodiscard]] int selected_annotation_idx() const noexcept { return selected_annotation_idx_; }
     [[nodiscard]] const RectI& selection() const noexcept { return selection_; }
     [[nodiscard]] bool selection_complete() const noexcept { return selection_complete_; }
     [[nodiscard]] const std::vector<Annotation>& annotations() const noexcept { return annotations_; }
@@ -44,6 +47,7 @@ public:
     [[nodiscard]] COLORREF active_color() const noexcept { return active_color_; }
     [[nodiscard]] COLORREF custom_color() const noexcept { return custom_color_; }
     [[nodiscard]] float active_width() const noexcept { return active_width_; }
+    [[nodiscard]] float active_text_size() const noexcept { return active_text_size_; }
     [[nodiscard]] int active_highlight_alpha() const noexcept { return active_highlight_alpha_; }
     [[nodiscard]] Tool active_tool() const noexcept { return active_tool_; }
     [[nodiscard]] bool annotation_locked_tool() const noexcept { return request_.config.annotation_locked_tool; }
@@ -54,6 +58,7 @@ public:
     [[nodiscard]] bool is_over_toolbar(POINT point) const noexcept;
     [[nodiscard]] COLORREF get_pixel_color(int x, int y) const noexcept;
     [[nodiscard]] int snap_coordinate(int value, bool is_x, int threshold = 8) const noexcept;
+    [[nodiscard]] bool hit_test_annotation(POINT relative) const;
 
 private:
     void build_toolbar();
@@ -101,10 +106,13 @@ private:
     COLORREF active_color_{RGB(245, 34, 45)};
     COLORREF custom_color_{RGB(128, 0, 255)};
     float active_width_{4.0F};
+    float active_text_size_{22.0F};
     int active_highlight_alpha_{96};
     std::wstring hovered_button_id_;
     POINT cursor_pos_{};
     bool color_format_hex_{true};
+    int selected_annotation_idx_{-1};
+    Annotation original_annotation_;
 
     friend class OverlayWindow;
 };

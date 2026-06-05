@@ -499,16 +499,34 @@ std::wstring config_to_json(const AppConfig& config) {
     result += L",\"annotation\":{\"enabled\":" + std::wstring(json_boolean(config.annotation_enabled));
     result += L",\"lockedTool\":" + std::wstring(json_boolean(config.annotation_locked_tool));
     result += L",\"hiddenTools\":" + hidden_tools_to_json_array(config.annotation_hidden_tools);
+    result += L",\"toolbarOrder\":" + quote_json(config.toolbar_order);
+    result += L",\"textFontFamily\":" + quote_json(config.text_font_family);
+    result += L",\"textFontBold\":" + std::wstring(json_boolean(config.text_font_bold));
+    result += L",\"textFontItalic\":" + std::wstring(json_boolean(config.text_font_italic));
     result += L",\"highlightAlpha\":" + std::to_wstring(std::clamp(config.annotation_highlight_alpha, 24, 192));
     result += L",\"nextSerial\":" + std::to_wstring(std::max(1, config.annotation_next_serial)) + L"}";
-    result += L",\"ocr\":{\"enabled\":" + std::wstring(json_boolean(config.ocr_enabled)) + L"}";
+    result += L",\"ocr\":{\"enabled\":" + std::wstring(json_boolean(config.ocr_enabled));
+    result += L",\"engine\":" + std::to_wstring(config.ocr_engine);
+    result += L",\"downloadUrl\":" + quote_json(config.ocr_download_url) + L"}";
     result += L",\"shell\":{\"enabled\":" + std::wstring(json_boolean(config.shell_enabled));
     result += L",\"startAtLogin\":" + std::wstring(json_boolean(config.start_at_login));
     result += L",\"notificationsEnabled\":" + std::wstring(json_boolean(config.notifications_enabled)) + L"}";
     result += L",\"hotkey\":{\"capture\":" + quote_json(config.capture_hotkey);
     result += L",\"globalOcrEnabled\":" + std::wstring(json_boolean(config.global_ocr_enabled));
     result += L",\"globalOcr\":" + quote_json(config.global_ocr_hotkey) + L"}";
-    result += L",\"shortcut\":{\"captureOcr\":" + quote_json(config.capture_ocr_shortcut) + L"}";
+    result += L",\"shortcut\":{\"captureOcr\":" + quote_json(config.capture_ocr_shortcut);
+    result += L",\"toolSelect\":" + quote_json(config.tool_shortcut_select);
+    result += L",\"toolRectangle\":" + quote_json(config.tool_shortcut_rectangle);
+    result += L",\"toolEllipse\":" + quote_json(config.tool_shortcut_ellipse);
+    result += L",\"toolLine\":" + quote_json(config.tool_shortcut_line);
+    result += L",\"toolArrow\":" + quote_json(config.tool_shortcut_arrow);
+    result += L",\"toolPen\":" + quote_json(config.tool_shortcut_pen);
+    result += L",\"toolMosaic\":" + quote_json(config.tool_shortcut_mosaic);
+    result += L",\"toolBlur\":" + quote_json(config.tool_shortcut_blur);
+    result += L",\"toolHighlight\":" + quote_json(config.tool_shortcut_highlight);
+    result += L",\"toolText\":" + quote_json(config.tool_shortcut_text);
+    result += L",\"toolSerial\":" + quote_json(config.tool_shortcut_serial);
+    result += L",\"toolEraser\":" + quote_json(config.tool_shortcut_eraser) + L"}";
     result += L",\"capture\":{\"defaultOutput\":" + quote_json(config.default_output);
     result += L",\"customColor\":" + quote_json(config.custom_color) + L"}}";
     return result;
@@ -528,11 +546,17 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text) {
         if (const auto* hidden_tools = member(*annotation, L"hiddenTools")) {
             config.annotation_hidden_tools = hidden_tools_from_json_node(*hidden_tools, L"");
         }
+        config.toolbar_order = named_string(*annotation, L"toolbarOrder", L"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,highlight,text,serial,eraser,undo,redo,ocr,scroll,pin,copy,save,close");
+        config.text_font_family = named_string(*annotation, L"textFontFamily", L"Microsoft YaHei");
+        config.text_font_bold = named_boolean(*annotation, L"textFontBold", false);
+        config.text_font_italic = named_boolean(*annotation, L"textFontItalic", false);
         config.annotation_highlight_alpha = named_clamped_integer(*annotation, L"highlightAlpha", 96, 24, 192);
         config.annotation_next_serial = std::max(1, named_integer(*annotation, L"nextSerial", 1));
     }
     if (const auto* ocr = member(*root, L"ocr")) {
         config.ocr_enabled = named_boolean(*ocr, L"enabled", true);
+        config.ocr_engine = named_clamped_integer(*ocr, L"engine", 0, 0, 2);
+        config.ocr_download_url = named_string(*ocr, L"downloadUrl", L"https://github.com/mg-chao/snow-shot/releases/download/v1.0.0/ocr_dependency.zip");
     }
     if (const auto* shell = member(*root, L"shell")) {
         config.shell_enabled = named_boolean(*shell, L"enabled", true);
@@ -546,6 +570,18 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text) {
     }
     if (const auto* shortcut = member(*root, L"shortcut")) {
         config.capture_ocr_shortcut = named_string(*shortcut, L"captureOcr", L"Shift+C");
+        config.tool_shortcut_select = named_string(*shortcut, L"toolSelect", L"S");
+        config.tool_shortcut_rectangle = named_string(*shortcut, L"toolRectangle", L"R");
+        config.tool_shortcut_ellipse = named_string(*shortcut, L"toolEllipse", L"E");
+        config.tool_shortcut_line = named_string(*shortcut, L"toolLine", L"L");
+        config.tool_shortcut_arrow = named_string(*shortcut, L"toolArrow", L"A");
+        config.tool_shortcut_pen = named_string(*shortcut, L"toolPen", L"P");
+        config.tool_shortcut_mosaic = named_string(*shortcut, L"toolMosaic", L"M");
+        config.tool_shortcut_blur = named_string(*shortcut, L"toolBlur", L"B");
+        config.tool_shortcut_highlight = named_string(*shortcut, L"toolHighlight", L"H");
+        config.tool_shortcut_text = named_string(*shortcut, L"toolText", L"T");
+        config.tool_shortcut_serial = named_string(*shortcut, L"toolSerial", L"N");
+        config.tool_shortcut_eraser = named_string(*shortcut, L"toolEraser", L"D");
     }
     if (const auto* capture = member(*root, L"capture")) {
         config.default_output = named_string(*capture, L"defaultOutput", L"clipboard");

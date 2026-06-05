@@ -41,6 +41,46 @@ void test_rect_and_bitmap() {
     const auto cropped = airshot::crop(source, {1, 1, 3, 3});
     expect(cropped.width == 2 && cropped.height == 2 && cropped.pixels == target.pixels, L"bitmap crop");
 
+    // Test rotation and flipping
+    airshot::Bitmap rot_source(2, 3);
+    rot_source.pixels = {
+        1, 0, 0, 255,   2, 0, 0, 255,
+        3, 0, 0, 255,   4, 0, 0, 255,
+        5, 0, 0, 255,   6, 0, 0, 255
+    };
+    const auto rot_cw = airshot::rotate_90_cw(rot_source);
+    expect(rot_cw.width == 3 && rot_cw.height == 2, L"rotate_90_cw dimensions");
+    expect(rot_cw.pixels[0] == 5 && rot_cw.pixels[4] == 3 && rot_cw.pixels[8] == 1, L"rotate_90_cw row 0");
+    expect(rot_cw.pixels[12] == 6 && rot_cw.pixels[16] == 4 && rot_cw.pixels[20] == 2, L"rotate_90_cw row 1");
+
+    const auto rot_ccw = airshot::rotate_90_ccw(rot_source);
+    expect(rot_ccw.width == 3 && rot_ccw.height == 2, L"rotate_90_ccw dimensions");
+    expect(rot_ccw.pixels[0] == 2 && rot_ccw.pixels[4] == 4 && rot_ccw.pixels[8] == 6, L"rotate_90_ccw row 0");
+    expect(rot_ccw.pixels[12] == 1 && rot_ccw.pixels[16] == 3 && rot_ccw.pixels[20] == 5, L"rotate_90_ccw row 1");
+
+    const auto flip_h = airshot::flip_horizontal(rot_source);
+    expect(flip_h.width == 2 && flip_h.height == 3, L"flip_horizontal dimensions");
+    expect(flip_h.pixels[0] == 2 && flip_h.pixels[4] == 1, L"flip_horizontal row 0");
+    expect(flip_h.pixels[8] == 4 && flip_h.pixels[12] == 3, L"flip_horizontal row 1");
+    expect(flip_h.pixels[16] == 6 && flip_h.pixels[20] == 5, L"flip_horizontal row 2");
+
+    const auto flip_v = airshot::flip_vertical(rot_source);
+    expect(flip_v.width == 2 && flip_v.height == 3, L"flip_vertical dimensions");
+    expect(flip_v.pixels[0] == 5 && flip_v.pixels[4] == 6, L"flip_vertical row 0");
+    expect(flip_v.pixels[8] == 3 && flip_v.pixels[12] == 4, L"flip_vertical row 1");
+    expect(flip_v.pixels[16] == 1 && flip_v.pixels[20] == 2, L"flip_vertical row 2");
+
+    // Test blur_circle
+    airshot::Bitmap blur_source(5, 5);
+    std::fill(blur_source.pixels.begin(), blur_source.pixels.end(), static_cast<uint8_t>(0));
+    blur_source.pixels[(2 * 5 + 2) * 4] = 200;
+    blur_source.pixels[(2 * 5 + 2) * 4 + 1] = 200;
+    blur_source.pixels[(2 * 5 + 2) * 4 + 2] = 200;
+    blur_source.pixels[(2 * 5 + 2) * 4 + 3] = 255;
+    airshot::blur_circle(blur_source, POINT{2, 2}, 2, 1);
+    expect(blur_source.pixels[(2 * 5 + 2) * 4] < 200 && blur_source.pixels[(2 * 5 + 2) * 4] > 0, L"blur_circle center pixel blurred");
+    expect(blur_source.pixels[(2 * 5 + 1) * 4] > 0, L"blur_circle spreads to neighbors");
+
     const auto temp_png = std::filesystem::temp_directory_path() / L"airshot-test-save.png";
     std::wstring save_error;
     expect(airshot::save_png(source, temp_png, &save_error), L"save_png works");
@@ -60,20 +100,33 @@ void test_config() {
     config.capture_hotkey = L"Ctrl+Shift+F9";
     config.global_ocr_hotkey = L"Ctrl+Alt+\\\"O";
     config.custom_color = L"#123456";
+    config.tool_shortcut_select = L"Shift+S";
+    config.tool_shortcut_rectangle = L"Shift+R";
+    config.toolbar_order = L"rect,pen,close";
+    config.text_font_family = L"Consolas";
+    config.text_font_bold = true;
+    config.text_font_italic = true;
     const auto parsed = airshot::config_from_json(airshot::config_to_json(config));
     expect(parsed.has_value(), L"config JSON round trip parses");
     expect(parsed && !parsed->annotation_enabled && parsed->global_ocr_enabled &&
                !parsed->annotation_locked_tool && parsed->annotation_hidden_tools == L"rect,pen,close" &&
                parsed->annotation_highlight_alpha == 192 && parsed->annotation_next_serial == 12 &&
                parsed->capture_hotkey == L"Ctrl+Shift+F9" && parsed->global_ocr_hotkey == L"Ctrl+Alt+\\\"O" &&
-               parsed->custom_color == L"#123456",
+               parsed->custom_color == L"#123456" &&
+               parsed->tool_shortcut_select == L"Shift+S" &&
+               parsed->tool_shortcut_rectangle == L"Shift+R" &&
+               parsed->toolbar_order == L"rect,pen,close" &&
+               parsed->text_font_family == L"Consolas" &&
+               parsed->text_font_bold == true &&
+               parsed->text_font_italic == true,
            L"config JSON round trip values");
 
     const auto future = airshot::config_from_json(
         LR"({"schemaVersion":2,"annotation":{"enabled":false},"future":[null,true,{"name":"\u4E2D"}]})");
     expect(future && future->schema_version == 2 && !future->annotation_enabled &&
                future->annotation_locked_tool && future->annotation_hidden_tools.empty() &&
-               future->annotation_highlight_alpha == 96 && future->annotation_next_serial == 1,
+               future->annotation_highlight_alpha == 96 && future->annotation_next_serial == 1 &&
+               future->text_font_family == L"Microsoft YaHei" && !future->text_font_bold && !future->text_font_italic,
            L"config accepts unknown future fields and keeps annotation defaults");
     expect(!airshot::config_from_json(L"{\"annotation\":[}"), L"config rejects malformed JSON");
 

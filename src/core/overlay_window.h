@@ -41,6 +41,7 @@ private:
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> dim_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> blue_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> white_brush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> black_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> toolbar_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> toolbar_bg_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> toolbar_border_brush_;

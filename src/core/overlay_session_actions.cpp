@@ -142,12 +142,14 @@ RectI buttons_bounds(const std::vector<ToolbarButton>& buttons) {
 }
 
 Tool tool_from_id(std::wstring_view id) {
+    if (id == L"select") return Tool::select;
     if (id == L"rect") return Tool::rectangle;
     if (id == L"ellipse") return Tool::ellipse;
     if (id == L"line") return Tool::line;
     if (id == L"arrow") return Tool::arrow;
     if (id == L"pen") return Tool::pen;
     if (id == L"mosaic") return Tool::mosaic;
+    if (id == L"blur") return Tool::blur;
     if (id == L"highlight") return Tool::highlight;
     if (id == L"text") return Tool::text;
     if (id == L"serial") return Tool::serial;
@@ -162,7 +164,8 @@ bool tool_supports_color(Tool tool) {
 
 bool tool_supports_width(Tool tool) {
     return tool == Tool::rectangle || tool == Tool::ellipse || tool == Tool::line || tool == Tool::arrow ||
-           tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::eraser;
+           tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::eraser ||
+           tool == Tool::blur;
 }
 
 bool tool_supports_alpha(Tool tool) {
@@ -230,48 +233,81 @@ void draw_polyline(HDC dc, const std::vector<POINT>& points) {
 void OverlaySession::build_toolbar() {
     toolbar_.clear();
     std::vector<std::pair<std::wstring, std::wstring>> items;
-    if (request_.config.annotation_enabled) {
-        auto add_tool = [&](std::wstring_view id, std::wstring_view label) {
-            if (!hidden(request_.config, id)) {
-                items.push_back({std::wstring(id), std::wstring(label)});
+
+    auto split_by_comma = [](std::wstring_view value) {
+        std::vector<std::wstring> result;
+        std::size_t start = 0;
+        while (start <= value.size()) {
+            const std::size_t end = value.find(L',', start);
+            result.emplace_back(value.substr(start, end == std::wstring_view::npos ? value.size() - start : end - start));
+            if (end == std::wstring_view::npos) {
+                break;
             }
-        };
-        add_tool(L"lock", strings::toolbar_lock);
-        add_separator(items);
-        add_tool(L"rect", strings::toolbar_rectangle);
-        add_tool(L"ellipse", strings::toolbar_ellipse);
-        add_tool(L"line", strings::toolbar_line);
-        add_tool(L"arrow", strings::toolbar_arrow);
-        add_tool(L"pen", strings::toolbar_pen);
-        add_tool(L"mosaic", strings::toolbar_mosaic);
-        add_tool(L"highlight", strings::toolbar_highlight);
-        add_tool(L"text", strings::toolbar_text);
-        add_tool(L"serial", strings::toolbar_serial);
-        add_tool(L"eraser", strings::toolbar_eraser);
-        bool show_undo = !annotations_.empty();
-        bool show_redo = !redo_.empty();
-        if (show_undo || show_redo) {
+            start = end + 1;
+        }
+        return result;
+    };
+
+    auto get_tool_label = [&](std::wstring_view id) -> std::wstring {
+        if (id == L"lock") return std::wstring(strings::toolbar_lock);
+        if (id == L"select") return L"选";
+        if (id == L"rect") return std::wstring(strings::toolbar_rectangle);
+        if (id == L"ellipse") return std::wstring(strings::toolbar_ellipse);
+        if (id == L"line") return std::wstring(strings::toolbar_line);
+        if (id == L"arrow") return std::wstring(strings::toolbar_arrow);
+        if (id == L"pen") return std::wstring(strings::toolbar_pen);
+        if (id == L"mosaic") return std::wstring(strings::toolbar_mosaic);
+        if (id == L"blur") return L"糊";
+        if (id == L"highlight") return std::wstring(strings::toolbar_highlight);
+        if (id == L"text") return std::wstring(strings::toolbar_text);
+        if (id == L"serial") return std::wstring(strings::toolbar_serial);
+        if (id == L"eraser") return std::wstring(strings::toolbar_eraser);
+        if (id == L"undo") return std::wstring(strings::toolbar_undo);
+        if (id == L"redo") return std::wstring(strings::toolbar_redo);
+        if (id == L"ocr") return std::wstring(strings::toolbar_ocr);
+        if (id == L"scroll") return L"长";
+        if (id == L"pin") return L"钉";
+        if (id == L"copy") return std::wstring(strings::toolbar_copy);
+        if (id == L"save") return std::wstring(strings::toolbar_save);
+        if (id == L"close") return std::wstring(strings::toolbar_close);
+        return L"";
+    };
+
+    auto get_tool_category = [](std::wstring_view id) -> int {
+        if (id == L"lock") return 1;
+        if (id == L"select" || id == L"rect" || id == L"ellipse" || id == L"line" ||
+            id == L"arrow" || id == L"pen" || id == L"mosaic" || id == L"blur" ||
+            id == L"highlight" || id == L"text" || id == L"serial" || id == L"eraser") {
+            return 2;
+        }
+        if (id == L"undo" || id == L"redo") return 3;
+        if (id == L"ocr" || id == L"scroll" || id == L"pin") return 4;
+        if (id == L"copy" || id == L"save" || id == L"close") return 5;
+        return 0;
+    };
+
+    int last_category = -1;
+    for (const auto& token : split_by_comma(request_.config.toolbar_order)) {
+        if (token == L"undo" && annotations_.empty()) continue;
+        if (token == L"redo" && redo_.empty()) continue;
+        if (token == L"ocr" && !request_.config.ocr_enabled) continue;
+        if (token == L"lock" && !request_.config.annotation_enabled) continue;
+        
+        int cat = get_tool_category(token);
+        if (cat == 2 && !request_.config.annotation_enabled) continue;
+        if (cat == 3 && !request_.config.annotation_enabled) continue;
+        
+        if (hidden(request_.config, token)) continue;
+        
+        std::wstring label = get_tool_label(token);
+        if (label.empty()) continue;
+        
+        if (last_category != -1 && last_category != cat) {
             add_separator(items);
-            if (show_undo && !hidden(request_.config, L"undo")) {
-                items.push_back({L"undo", std::wstring(strings::toolbar_undo)});
-            }
-            if (show_redo && !hidden(request_.config, L"redo")) {
-                items.push_back({L"redo", std::wstring(strings::toolbar_redo)});
-            }
         }
-        add_separator(items);
+        items.push_back({std::wstring(token), label});
+        last_category = cat;
     }
-    if (request_.config.ocr_enabled) {
-        if (!hidden(request_.config, L"ocr")) {
-            items.push_back({L"ocr", std::wstring(strings::toolbar_ocr)});
-        }
-    }
-    if (!hidden(request_.config, L"scroll")) items.push_back({L"scroll", L"长"});
-    if (!hidden(request_.config, L"pin")) items.push_back({L"pin", L"钉"});
-    add_separator(items);
-    if (!hidden(request_.config, L"copy")) items.push_back({L"copy", std::wstring(strings::toolbar_copy)});
-    if (!hidden(request_.config, L"save")) items.push_back({L"save", std::wstring(strings::toolbar_save)});
-    if (!hidden(request_.config, L"close")) items.push_back({L"close", std::wstring(strings::toolbar_close)});
     trim_trailing_separators(items);
 
     const ToolbarMetrics metrics{36, 32, 4, 6};
@@ -472,6 +508,12 @@ Bitmap OverlaySession::rendered_selection() const {
             for (const POINT point : annotation.points) {
                 pixelate_circle(result, point, 14, 8);
             }
+        } else if (annotation.tool == Tool::blur) {
+            for (const POINT point : annotation.points) {
+                int radius = static_cast<int>(annotation.width * 3.5F);
+                if (radius < 5) radius = 5;
+                blur_circle(result, point, radius, 6);
+            }
         } else if (annotation.tool == Tool::highlight) {
             const int radius = std::max(4, static_cast<int>(std::lround(annotation.width * 1.6F)));
             if (annotation.points.size() > 1) {
@@ -546,22 +588,45 @@ Bitmap OverlaySession::rendered_selection() const {
         } else if (annotation.tool == Tool::pen) {
             draw_polyline(dc, annotation.points);
         } else if (annotation.tool == Tool::text) {
+            HFONT text_font = CreateFontW(static_cast<int>(annotation.width),
+                                         0,
+                                         0,
+                                         0,
+                                         request_.config.text_font_bold ? FW_BOLD : FW_NORMAL,
+                                         request_.config.text_font_italic ? TRUE : FALSE,
+                                         FALSE,
+                                         FALSE,
+                                         DEFAULT_CHARSET,
+                                         OUT_DEFAULT_PRECIS,
+                                         CLIP_DEFAULT_PRECIS,
+                                         CLEARTYPE_QUALITY,
+                                         DEFAULT_PITCH,
+                                         request_.config.text_font_family.c_str());
+            HGDIOBJ previous_text_font = SelectObject(dc, text_font);
             TextOutW(dc,
                      annotation.start.x,
                      annotation.start.y,
                      annotation.text.c_str(),
                      static_cast<int>(annotation.text.size()));
+            SelectObject(dc, previous_text_font);
+            DeleteObject(text_font);
         } else if (annotation.tool == Tool::serial) {
-            constexpr int radius = 13;
+            int radius = static_cast<int>(std::round(8.0F + annotation.width * 1.5F));
             HBRUSH fill_brush = CreateSolidBrush(annotation.color);
             HGDIOBJ old_fill = SelectObject(dc, fill_brush);
+            HPEN white_pen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+            HGDIOBJ old_pen_in_bubble = SelectObject(dc, white_pen);
+
             Ellipse(dc,
                     annotation.start.x - radius,
                     annotation.start.y - radius,
                     annotation.start.x + radius,
                     annotation.start.y + radius);
+
             SelectObject(dc, old_fill);
             DeleteObject(fill_brush);
+            SelectObject(dc, old_pen_in_bubble);
+            DeleteObject(white_pen);
 
             const std::wstring serial_text = std::to_wstring(annotation.serial);
             RECT text_rect{
@@ -570,9 +635,22 @@ Bitmap OverlaySession::rendered_selection() const {
                 annotation.start.x + radius,
                 annotation.start.y + radius,
             };
+            int font_height = static_cast<int>(std::round(radius * 1.0F));
+            HFONT serial_font = CreateFontW(font_height,
+                                          0, 0, 0,
+                                          FW_BOLD,
+                                          FALSE, FALSE, FALSE,
+                                          DEFAULT_CHARSET,
+                                          OUT_DEFAULT_PRECIS,
+                                          CLIP_DEFAULT_PRECIS,
+                                          CLEARTYPE_QUALITY,
+                                          DEFAULT_PITCH,
+                                          L"Consolas");
+            HGDIOBJ old_font_in_bubble = SelectObject(dc, serial_font);
             SetTextColor(dc, RGB(255, 255, 255));
             DrawTextW(dc, serial_text.c_str(), static_cast<int>(serial_text.size()), &text_rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SetTextColor(dc, annotation.color);
+            SelectObject(dc, old_font_in_bubble);
+            DeleteObject(serial_font);
         }
         SelectObject(dc, previous_pen);
         DeleteObject(pen);
@@ -622,7 +700,7 @@ void OverlaySession::complete_ocr() {
         finish({ExitCode::module_unavailable, L"OCR 模块已关闭。"});
         return;
     }
-    const OcrOutput output = recognize_text(original_selection());
+    const OcrOutput output = recognize_text(original_selection(), request_.config);
     if (!output.ok) {
         finish({ExitCode::operation_failed, output.error});
         return;

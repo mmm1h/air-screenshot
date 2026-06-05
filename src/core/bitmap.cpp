@@ -128,4 +128,111 @@ void pixelate_circle(Bitmap& bitmap, POINT center, int radius, int block_size) {
     }
 }
 
+Bitmap rotate_90_cw(const Bitmap& source) {
+    if (source.empty()) {
+        return {};
+    }
+    Bitmap result(source.height, source.width);
+    for (int y = 0; y < source.height; ++y) {
+        const auto* src_row = source.row(y).data();
+        for (int x = 0; x < source.width; ++x) {
+            const int dest_x = source.height - 1 - y;
+            const int dest_y = x;
+            auto* dest_pixel = result.row(dest_y).data() + dest_x * 4;
+            std::memcpy(dest_pixel, src_row + x * 4, 4);
+        }
+    }
+    return result;
+}
+
+Bitmap rotate_90_ccw(const Bitmap& source) {
+    if (source.empty()) {
+        return {};
+    }
+    Bitmap result(source.height, source.width);
+    for (int y = 0; y < source.height; ++y) {
+        const auto* src_row = source.row(y).data();
+        for (int x = 0; x < source.width; ++x) {
+            const int dest_x = y;
+            const int dest_y = source.width - 1 - x;
+            auto* dest_pixel = result.row(dest_y).data() + dest_x * 4;
+            std::memcpy(dest_pixel, src_row + x * 4, 4);
+        }
+    }
+    return result;
+}
+
+Bitmap flip_horizontal(const Bitmap& source) {
+    if (source.empty()) {
+        return {};
+    }
+    Bitmap result(source.width, source.height);
+    for (int y = 0; y < source.height; ++y) {
+        const auto* src_row = source.row(y).data();
+        auto* dest_row = result.row(y).data();
+        for (int x = 0; x < source.width; ++x) {
+            std::memcpy(dest_row + (source.width - 1 - x) * 4, src_row + x * 4, 4);
+        }
+    }
+    return result;
+}
+
+Bitmap flip_vertical(const Bitmap& source) {
+    if (source.empty()) {
+        return {};
+    }
+    Bitmap result(source.width, source.height);
+    for (int y = 0; y < source.height; ++y) {
+        const auto* src_row = source.row(y).data();
+        auto* dest_row = result.row(source.height - 1 - y).data();
+        std::memcpy(dest_row, src_row, static_cast<std::size_t>(source.width) * 4U);
+    }
+    return result;
+}
+
+void blur_circle(Bitmap& bitmap, POINT center, int radius, int blur_radius) {
+    if (bitmap.empty() || radius <= 0 || blur_radius <= 0) return;
+    const int cx = static_cast<int>(center.x);
+    const int cy = static_cast<int>(center.y);
+    const int min_x = std::max(0, cx - radius);
+    const int min_y = std::max(0, cy - radius);
+    const int max_x = std::min(bitmap.width, cx + radius + 1);
+    const int max_y = std::min(bitmap.height, cy + radius + 1);
+    if (min_x >= max_x || min_y >= max_y) return;
+    const int r_sq = radius * radius;
+
+    Bitmap temp = crop(bitmap, RectI{min_x, min_y, max_x, max_y});
+    if (temp.empty()) return;
+
+    for (int y = min_y; y < max_y; ++y) {
+        auto* dest_row = bitmap.row(y).data();
+        for (int x = min_x; x < max_x; ++x) {
+            const int dx = x - cx;
+            const int dy = y - cy;
+            if (dx * dx + dy * dy <= r_sq) {
+                int sum_r = 0, sum_g = 0, sum_b = 0, count = 0;
+                for (int wy = -blur_radius; wy <= blur_radius; ++wy) {
+                    const int py = y + wy;
+                    if (py < min_y || py >= max_y) continue;
+                    const auto* temp_row = temp.row(py - min_y).data();
+                    for (int wx = -blur_radius; wx <= blur_radius; ++wx) {
+                        const int px = x + wx;
+                        if (px < min_x || px >= max_x) continue;
+                        const auto* pixel = temp_row + (px - min_x) * 4;
+                        sum_b += pixel[0];
+                        sum_g += pixel[1];
+                        sum_r += pixel[2];
+                        count++;
+                    }
+                }
+                if (count > 0) {
+                    dest_row[x * 4] = static_cast<uint8_t>(sum_b / count);
+                    dest_row[x * 4 + 1] = static_cast<uint8_t>(sum_g / count);
+                    dest_row[x * 4 + 2] = static_cast<uint8_t>(sum_r / count);
+                }
+            }
+        }
+    }
+}
+
 }  // namespace airshot
