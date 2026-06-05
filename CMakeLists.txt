@@ -40,6 +40,9 @@ add_library(airshot_core STATIC
     src/core/overlay_prompt.cpp
     src/core/overlay_scroll.cpp
     src/core/overlay_scroll_windows.cpp
+    src/core/overlay_session_actions.cpp
+    src/core/overlay_session_interaction.cpp
+    src/core/overlay_window.cpp
     src/core/portable.cpp
 )
 
@@ -61,6 +64,7 @@ target_link_libraries(airshot_core PUBLIC
     d2d1
     dwrite
     dwmapi
+    imm32
     ole32
     shell32
     shlwapi
