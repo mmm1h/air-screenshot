@@ -108,6 +108,7 @@ struct OcrDownloadContext {
 std::wstring get_wechat_install_path() {
     HKEY hKey;
     std::wstring install_path;
+    // 1. Check WeChat registry
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Tencent\\WeChat", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         wchar_t buf[512]{};
         DWORD type = REG_SZ;
@@ -117,37 +118,81 @@ std::wstring get_wechat_install_path() {
         }
         RegCloseKey(hKey);
     }
+    // 2. Check Weixin registry
+    if (install_path.empty()) {
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Tencent\\Weixin", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            wchar_t buf[512]{};
+            DWORD type = REG_SZ;
+            DWORD size = sizeof(buf);
+            if (RegQueryValueExW(hKey, L"InstallPath", nullptr, &type, reinterpret_cast<BYTE*>(buf), &size) == ERROR_SUCCESS) {
+                install_path = buf;
+            }
+            RegCloseKey(hKey);
+        }
+    }
     return install_path;
 }
 
 std::wstring find_wechat_ocr_exe_dir() {
     const wchar_t* appdata = _wgetenv(L"APPDATA");
-    if (appdata) {
-        std::filesystem::path ocr_root = std::filesystem::path(appdata) / L"Tencent" / L"WeChat" / L"XPlugin" / L"Plugins" / L"ocr";
-        if (std::filesystem::exists(ocr_root)) {
-            std::filesystem::path best_dir;
-            int best_ver = -1;
-            for (const auto& entry : std::filesystem::directory_iterator(ocr_root)) {
-                if (entry.is_directory()) {
-                    std::filesystem::path exe_path = entry.path() / L"WeChatOCR.exe";
-                    if (std::filesystem::exists(exe_path)) {
-                        try {
-                            int ver = std::stoi(entry.path().filename().wstring());
-                            if (ver > best_ver) {
-                                best_ver = ver;
-                                best_dir = entry.path();
-                            }
-                        } catch (...) {
-                            if (best_ver == -1) {
-                                best_dir = entry.path();
-                            }
+    if (!appdata) return L"";
+
+    // 1. Scan WeChat 4.x (xwechat/XPlugin/Plugins/WeChatOcr)
+    std::filesystem::path ocr_root_4 = std::filesystem::path(appdata) / L"Tencent" / L"xwechat" / L"XPlugin" / L"Plugins" / L"WeChatOcr";
+    if (std::filesystem::exists(ocr_root_4)) {
+        std::filesystem::path best_dir;
+        int best_ver = -1;
+        for (const auto& entry : std::filesystem::directory_iterator(ocr_root_4)) {
+            if (entry.is_directory()) {
+                std::filesystem::path dll_path = entry.path() / L"extracted" / L"wxocr.dll";
+                if (std::filesystem::exists(dll_path)) {
+                    try {
+                        int ver = std::stoi(entry.path().filename().wstring());
+                        if (ver > best_ver) {
+                            best_ver = ver;
+                            best_dir = entry.path() / L"extracted";
+                        }
+                    } catch (...) {
+                        if (best_ver == -1) {
+                            best_dir = entry.path() / L"extracted";
                         }
                     }
                 }
             }
+        }
+        if (!best_dir.empty()) {
             return best_dir.wstring();
         }
     }
+
+    // 2. Scan WeChat 3.x (Tencent/WeChat/XPlugin/Plugins/ocr)
+    std::filesystem::path ocr_root_3 = std::filesystem::path(appdata) / L"Tencent" / L"WeChat" / L"XPlugin" / L"Plugins" / L"ocr";
+    if (std::filesystem::exists(ocr_root_3)) {
+        std::filesystem::path best_dir;
+        int best_ver = -1;
+        for (const auto& entry : std::filesystem::directory_iterator(ocr_root_3)) {
+            if (entry.is_directory()) {
+                std::filesystem::path exe_path = entry.path() / L"WeChatOCR.exe";
+                if (std::filesystem::exists(exe_path)) {
+                    try {
+                        int ver = std::stoi(entry.path().filename().wstring());
+                        if (ver > best_ver) {
+                            best_ver = ver;
+                            best_dir = entry.path();
+                        }
+                    } catch (...) {
+                        if (best_ver == -1) {
+                            best_dir = entry.path();
+                        }
+                    }
+                }
+            }
+        }
+        if (!best_dir.empty()) {
+            return best_dir.wstring();
+        }
+    }
+
     return L"";
 }
 
