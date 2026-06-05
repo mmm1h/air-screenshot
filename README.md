@@ -4,7 +4,7 @@ Air Screenshot 是一个面向 Windows 10 2004+ x64 的轻量原生截图工具�
 
 ## 能力
 
-- 区域、活动窗口、显示器和全虚拟桌面截图
+- 区域、活动窗口、显示器、全虚拟桌面截图和长截图
 - 剪贴板与 PNG 输出
 - 可关闭的轻量标注、贴图和 Windows 系统 OCR
 - 托盘、开机自启、全局快捷键与单 EXE CLI
@@ -32,7 +32,7 @@ Windows SmartScreen 可能提示未知发布者。这是因为当前使用自签
 生成本地便携包：
 
 ```powershell
-.\scripts\package.ps1 -Version 0.2.0
+.\scripts\package.ps1 -Version 0.2.1
 ```
 
 ## 自动更新
@@ -50,8 +50,8 @@ Windows SmartScreen 可能提示未知发布者。这是因为当前使用自签
 推送格式为 `vX.Y.Z` 的 tag 会自动运行 [release.yml](.github/workflows/release.yml)：
 
 ```powershell
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 工作流会运行测试、生成并验证签名 EXE、执行便携烟测、创建 GitHub Release，并更新 GitHub Pages 下载页与 `latest.json`。
@@ -84,8 +84,8 @@ git push origin v0.2.0
 ## 限制
 
 - GDI `BitBlt` 无法捕获受保护内容和部分硬件覆盖层。
-- 不包含长截图、录屏、历史记录或第三方 DLL 插件。
+- 不包含录屏、历史记录或第三方 DLL 插件。
 - OCR 只调用 Windows 系统 `Windows.Media.Ocr`，可用语言取决于系统语言包。
 - 旧 MSIX 版本不会自动迁移配置，需要用户自行卸载。
 
-项目采用 `LGPL-3.0-only`。完整许可证与第三方声明已嵌入 EXE，可从托盘菜单“关于 / 许可证”查看。
+项目采用 `LGPL-3.0-only`。完整许可证见 [LICENSE](LICENSE)，第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

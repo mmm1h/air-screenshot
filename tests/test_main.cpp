@@ -4,6 +4,7 @@
 #include "airshot/feature.h"
 #include "airshot/ocr.h"
 #include "airshot/portable.h"
+#include "airshot/output.h"
 
 #include <winrt/base.h>
 
@@ -39,6 +40,13 @@ void test_rect_and_bitmap() {
     expect(target.pixels[0] == source.pixels[20], L"bitmap blit");
     const auto cropped = airshot::crop(source, {1, 1, 3, 3});
     expect(cropped.width == 2 && cropped.height == 2 && cropped.pixels == target.pixels, L"bitmap crop");
+
+    const auto temp_png = std::filesystem::temp_directory_path() / L"airshot-test-save.png";
+    std::wstring save_error;
+    expect(airshot::save_png(source, temp_png, &save_error), L"save_png works");
+    expect(std::filesystem::exists(temp_png), L"saved png file exists");
+    std::error_code ignored;
+    std::filesystem::remove(temp_png, ignored);
 }
 
 void test_config() {
@@ -165,6 +173,32 @@ void test_feature_registry() {
            L"disabled feature unloads and cannot activate");
 }
 
+void test_clipboard_formats() {
+    airshot::Bitmap source(2, 2);
+    for (std::size_t index = 0; index < source.pixels.size(); ++index) {
+        source.pixels[index] = 255;
+    }
+    std::wstring error;
+    expect(airshot::copy_bitmap_to_clipboard(source, &error), L"copy_bitmap_to_clipboard works");
+
+    if (OpenClipboard(nullptr)) {
+        UINT format = 0;
+        bool has_png = false;
+        bool has_image_png = false;
+        while ((format = EnumClipboardFormats(format)) != 0) {
+            wchar_t name[256]{};
+            if (GetClipboardFormatNameW(format, name, 256) > 0) {
+                std::wstring sname(name);
+                if (sname == L"PNG") has_png = true;
+                if (sname == L"image/png") has_image_png = true;
+            }
+        }
+        CloseClipboard();
+        expect(has_png, L"clipboard has PNG format");
+        expect(has_image_png, L"clipboard has image/png format");
+    }
+}
+
 }  // namespace
 
 int wmain() {
@@ -175,6 +209,7 @@ int wmain() {
     test_ocr_join();
     test_portable_runtime();
     test_feature_registry();
+    test_clipboard_formats();
     if (failures == 0) {
         std::wcout << L"All tests passed.\n";
     }

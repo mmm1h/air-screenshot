@@ -199,7 +199,6 @@ void HostApp::show_tray_menu() {
     AppendMenuW(menu, MF_STRING, kMenuCapture, strings::tray_capture.data());
     AppendMenuW(menu, MF_STRING, kMenuSettings, strings::tray_settings.data());
     AppendMenuW(menu, MF_STRING, kMenuUpdate, strings::tray_update.data());
-    AppendMenuW(menu, MF_STRING, kMenuAbout, L"关于 / 许可证");
     if (!pin_windows_.empty()) {
         AppendMenuW(menu, MF_STRING, kMenuCloseAllPins, L"销毁所有贴图 (Close All Pins)");
     }
@@ -267,7 +266,9 @@ void HostApp::capture_region(RegionAction action) {
                 pin_windows_.push_back(std::move(pin));
             }
         } else {
-            notify(kAppName, result.message);
+            if (config_.notifications_enabled) {
+                notify(kAppName, result.message);
+            }
         }
     } else if (result.code != ExitCode::user_cancelled) {
         notify(kAppName, result.message);
@@ -479,8 +480,6 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
             show_settings();
         } else if (LOWORD(w_param) == kMenuUpdate) {
             check_for_updates(true);
-        } else if (LOWORD(w_param) == kMenuAbout) {
-            show_about_window(window_);
         } else if (LOWORD(w_param) == kMenuCloseAllPins) {
             pin_windows_.clear();
         } else if (LOWORD(w_param) == kMenuExit) {

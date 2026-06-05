@@ -608,6 +608,423 @@ std::optional<std::wstring> prompt_text(HWND owner, POINT position) {
     return state.accepted ? std::optional(state.text) : std::nullopt;
 }
 
+class ScrollBorderWindow {
+public:
+    static HWND create(HINSTANCE instance, HWND parent, const RectI& bounds) {
+        static std::once_flag class_flag;
+        std::call_once(class_flag, [instance] {
+            WNDCLASSEXW wc{sizeof(wc)};
+            wc.lpfnWndProc = DefWindowProcW;
+            wc.hInstance = instance;
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            wc.hbrBackground = CreateSolidBrush(RGB(0, 0, 0));
+            wc.lpszClassName = L"AirScreenshot.ScrollBorder";
+            RegisterClassExW(&wc);
+        });
+
+        HWND hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            L"AirScreenshot.ScrollBorder",
+            L"",
+            WS_POPUP,
+            bounds.left - 2, bounds.top - 2, bounds.width() + 4, bounds.height() + 4,
+            parent,
+            nullptr,
+            instance,
+            nullptr
+        );
+        if (hwnd) {
+            SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
+            SetWindowSubclass(hwnd, [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) -> LRESULT {
+                if (msg == WM_PAINT) {
+                    PAINTSTRUCT ps;
+                    HDC hdc = BeginPaint(hwnd, &ps);
+                    RECT r;
+                    GetClientRect(hwnd, &r);
+
+                    // 1. Draw selection border (Blue, 2px)
+                    HPEN pen = CreatePen(PS_SOLID, 2, RGB(22, 119, 255));
+                    HGDIOBJ old_pen = SelectObject(hdc, pen);
+                    HGDIOBJ old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                    Rectangle(hdc, r.left, r.top, r.right, r.bottom);
+                    SelectObject(hdc, old_brush);
+                    SelectObject(hdc, old_pen);
+                    DeleteObject(pen);
+
+                    // 2. Draw floating prompt bar at the bottom of the selection
+                    int width = r.right - r.left;
+                    int height = r.bottom - r.top;
+                    if (width >= 360 && height >= 100) {
+                        int bar_w = 340;
+                        int bar_h = 28;
+                        int bar_x = (width - bar_w) / 2;
+                        int bar_y = height - bar_h - 20;
+
+                        HBRUSH bar_bg = CreateSolidBrush(RGB(17, 19, 22));
+                        HPEN bar_border = CreatePen(PS_SOLID, 1, RGB(60, 64, 70));
+                        HGDIOBJ prev_pen = SelectObject(hdc, bar_border);
+                        HGDIOBJ prev_brush = SelectObject(hdc, bar_bg);
+
+                        RoundRect(hdc, bar_x, bar_y, bar_x + bar_w, bar_y + bar_h, 6, 6);
+
+                        SelectObject(hdc, prev_brush);
+                        SelectObject(hdc, prev_pen);
+                        DeleteObject(bar_bg);
+                        DeleteObject(bar_border);
+
+                        SetTextColor(hdc, RGB(220, 224, 230));
+                        SetBkMode(hdc, TRANSPARENT);
+                        HFONT font = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
+                        HGDIOBJ old_font = SelectObject(hdc, font);
+
+                        RECT text_rc{bar_x, bar_y, bar_x + bar_w, bar_y + bar_h};
+                        DrawTextW(hdc, L"滚动滚轮进行长截图 | 单击自动滚动 | Enter完成 | Esc取消", -1, &text_rc, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+
+                        SelectObject(hdc, old_font);
+                        DeleteObject(font);
+                    }
+
+                    EndPaint(hwnd, &ps);
+                    return 0;
+                }
+                return DefSubclassProc(hwnd, msg, wp, lp);
+            }, 0, 0);
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        return hwnd;
+    }
+};
+
+struct ScrollControlState {
+    bool finished{false};
+    bool cancelled{false};
+};
+
+class ScrollControlWindow {
+public:
+    static HWND create(HINSTANCE instance, HWND parent, const RectI& selection, ScrollControlState* state) {
+        static std::once_flag class_flag;
+        std::call_once(class_flag, [instance] {
+            WNDCLASSEXW wc{sizeof(wc)};
+            wc.style = CS_DROPSHADOW;
+            wc.lpfnWndProc = proc;
+            wc.hInstance = instance;
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            wc.hbrBackground = CreateSolidBrush(RGB(17, 19, 22));
+            wc.lpszClassName = L"AirScreenshot.ScrollControl";
+            RegisterClassExW(&wc);
+        });
+
+        int w = 240;
+        int h = 50;
+        int x = selection.right - w;
+        int y = selection.bottom + 6;
+
+        const int screen_w = GetSystemMetrics(SM_CXSCREEN);
+        const int screen_h = GetSystemMetrics(SM_CYSCREEN);
+        if (x + w > screen_w) x = screen_w - w - 10;
+        if (x < 0) x = 10;
+        if (y + h > screen_h) y = selection.top - h - 6;
+        if (y < 0) y = 10;
+
+        HWND hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            L"AirScreenshot.ScrollControl",
+            L"",
+            WS_POPUP,
+            x, y, w, h,
+            parent,
+            nullptr,
+            instance,
+            state
+        );
+        if (hwnd) {
+            ShowWindow(hwnd, SW_SHOW);
+            UpdateWindow(hwnd);
+        }
+        return hwnd;
+    }
+
+private:
+    static LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        auto* state = reinterpret_cast<ScrollControlState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (msg == WM_NCCREATE) {
+            const auto* create = reinterpret_cast<CREATESTRUCTW*>(lp);
+            state = static_cast<ScrollControlState*>(create->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        }
+        if (!state) return DefWindowProcW(hwnd, msg, wp, lp);
+
+        static int hover_btn = 0; // 0 = none, 1 = OK, 2 = Cancel
+        static int pressed_btn = 0; // 0 = none, 1 = OK, 2 = Cancel
+        static int blink_counter = 0;
+
+        switch (msg) {
+            case WM_CREATE: {
+                SetTimer(hwnd, 1, 500, nullptr);
+                hover_btn = 0;
+                pressed_btn = 0;
+                blink_counter = 0;
+                break;
+            }
+            case WM_TIMER: {
+                if (wp == 1) {
+                    blink_counter++;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                break;
+            }
+            case WM_SETTEXT: {
+                LRESULT res = DefWindowProcW(hwnd, msg, wp, lp);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return res;
+            }
+            case WM_MOUSEMOVE: {
+                int x = static_cast<short>(LOWORD(lp));
+                int y = static_cast<short>(HIWORD(lp));
+                int prev_hover = hover_btn;
+
+                if (x >= 110 && x <= 170 && y >= 10 && y <= 40) {
+                    hover_btn = 1;
+                } else if (x >= 175 && x <= 230 && y >= 10 && y <= 40) {
+                    hover_btn = 2;
+                } else {
+                    hover_btn = 0;
+                }
+
+                if (hover_btn != prev_hover) {
+                    InvalidateRect(hwnd, nullptr, FALSE);
+
+                    TRACKMOUSEEVENT tme{sizeof(tme)};
+                    tme.dwFlags = TME_LEAVE;
+                    tme.hwndTrack = hwnd;
+                    TrackMouseEvent(&tme);
+                }
+                break;
+            }
+            case WM_MOUSELEAVE: {
+                if (hover_btn != 0) {
+                    hover_btn = 0;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                break;
+            }
+            case WM_LBUTTONDOWN: {
+                int x = static_cast<short>(LOWORD(lp));
+                int y = static_cast<short>(HIWORD(lp));
+                if (x >= 110 && x <= 170 && y >= 10 && y <= 40) {
+                    pressed_btn = 1;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else if (x >= 175 && x <= 230 && y >= 10 && y <= 40) {
+                    pressed_btn = 2;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                SetCapture(hwnd);
+                break;
+            }
+            case WM_LBUTTONUP: {
+                if (GetCapture() == hwnd) {
+                    ReleaseCapture();
+                }
+                int x = static_cast<short>(LOWORD(lp));
+                int y = static_cast<short>(HIWORD(lp));
+                if (pressed_btn == 1) {
+                    if (x >= 110 && x <= 170 && y >= 10 && y <= 40) {
+                        state->finished = true;
+                        DestroyWindow(hwnd);
+                    }
+                } else if (pressed_btn == 2) {
+                    if (x >= 175 && x <= 230 && y >= 10 && y <= 40) {
+                        state->cancelled = true;
+                        DestroyWindow(hwnd);
+                    }
+                }
+                pressed_btn = 0;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                break;
+            }
+            case WM_PAINT: {
+                PAINTSTRUCT ps;
+                HDC hdc = BeginPaint(hwnd, &ps);
+
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+
+                HDC mem_dc = CreateCompatibleDC(hdc);
+                HBITMAP mem_bm = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+                HGDIOBJ old_bm = SelectObject(mem_dc, mem_bm);
+
+                HBRUSH bg_brush = CreateSolidBrush(RGB(20, 20, 23));
+                FillRect(mem_dc, &rc, bg_brush);
+                DeleteObject(bg_brush);
+
+                HPEN border_pen = CreatePen(PS_SOLID, 1, RGB(60, 64, 70));
+                HGDIOBJ old_pen = SelectObject(mem_dc, border_pen);
+                HGDIOBJ old_brush = SelectObject(mem_dc, GetStockObject(NULL_BRUSH));
+                Rectangle(mem_dc, 0, 0, rc.right, rc.bottom);
+                SelectObject(mem_dc, old_brush);
+                SelectObject(mem_dc, old_pen);
+                DeleteObject(border_pen);
+
+                if (blink_counter % 2 == 0) {
+                    HBRUSH dot_brush = CreateSolidBrush(RGB(245, 34, 45));
+                    HPEN dot_pen = CreatePen(PS_SOLID, 1, RGB(245, 34, 45));
+                    HGDIOBJ prev_brush = SelectObject(mem_dc, dot_brush);
+                    HGDIOBJ prev_pen = SelectObject(mem_dc, dot_pen);
+
+                    Ellipse(mem_dc, 12, 21, 20, 29);
+
+                    SelectObject(mem_dc, prev_brush);
+                    SelectObject(mem_dc, prev_pen);
+                    DeleteObject(dot_brush);
+                    DeleteObject(dot_pen);
+                }
+
+                wchar_t text_buf[128] = L"";
+                GetWindowTextW(hwnd, text_buf, 128);
+
+                SetTextColor(mem_dc, RGB(230, 230, 230));
+                SetBkMode(mem_dc, TRANSPARENT);
+                HFONT font = CreateFontW(14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
+                HGDIOBJ old_font = SelectObject(mem_dc, font);
+
+                RECT text_rc{26, 0, 105, rc.bottom};
+                DrawTextW(mem_dc, text_buf, -1, &text_rc, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+
+                RECT ok_rc{110, 10, 170, 40};
+                COLORREF ok_bg = RGB(22, 119, 255);
+                if (pressed_btn == 1) ok_bg = RGB(9, 88, 217);
+                else if (hover_btn == 1) ok_bg = RGB(64, 150, 255);
+
+                HBRUSH ok_brush = CreateSolidBrush(ok_bg);
+                HPEN ok_pen = CreatePen(PS_SOLID, 1, ok_bg);
+                HGDIOBJ prev_ok_pen = SelectObject(mem_dc, ok_pen);
+                HGDIOBJ prev_ok_brush = SelectObject(mem_dc, ok_brush);
+                RoundRect(mem_dc, ok_rc.left, ok_rc.top, ok_rc.right, ok_rc.bottom, 6, 6);
+                SelectObject(mem_dc, prev_ok_brush);
+                SelectObject(mem_dc, prev_ok_pen);
+                DeleteObject(ok_brush);
+                DeleteObject(ok_pen);
+
+                SetTextColor(mem_dc, RGB(255, 255, 255));
+                DrawTextW(mem_dc, L"完成", -1, &ok_rc, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+
+                RECT cancel_rc{175, 10, 230, 40};
+                COLORREF cancel_bg = RGB(35, 38, 41);
+                if (pressed_btn == 2) cancel_bg = RGB(20, 22, 24);
+                else if (hover_btn == 2) cancel_bg = RGB(50, 55, 60);
+
+                HBRUSH cancel_brush = CreateSolidBrush(cancel_bg);
+                HPEN cancel_pen = CreatePen(PS_SOLID, 1, RGB(90, 95, 100));
+                HGDIOBJ prev_cancel_pen = SelectObject(mem_dc, cancel_pen);
+                HGDIOBJ prev_cancel_brush = SelectObject(mem_dc, cancel_brush);
+                RoundRect(mem_dc, cancel_rc.left, cancel_rc.top, cancel_rc.right, cancel_rc.bottom, 6, 6);
+                SelectObject(mem_dc, prev_cancel_brush);
+                SelectObject(mem_dc, prev_cancel_pen);
+                DeleteObject(cancel_brush);
+                DeleteObject(cancel_pen);
+
+                SetTextColor(mem_dc, RGB(200, 200, 200));
+                DrawTextW(mem_dc, L"取消", -1, &cancel_rc, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+
+                SelectObject(mem_dc, old_font);
+                DeleteObject(font);
+
+                BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem_dc, 0, 0, SRCCOPY);
+
+                SelectObject(mem_dc, old_bm);
+                DeleteObject(mem_bm);
+                DeleteDC(mem_dc);
+
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+            case WM_DESTROY: {
+                KillTimer(hwnd, 1);
+                break;
+            }
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+};
+
+bool is_bitmap_static(const Bitmap& bmp1, const Bitmap& bmp2) {
+    if (bmp1.empty() || bmp2.empty()) return false;
+    if (bmp1.width != bmp2.width || bmp1.height != bmp2.height) return false;
+
+    const int W = bmp1.width;
+    const int H = bmp1.height;
+
+    uint64_t diff = 0;
+    const int step_y = 4;
+    const int step_x = 4;
+    int count = 0;
+
+    for (int y = 0; y < H; y += step_y) {
+        const auto* r1 = bmp1.row(y).data();
+        const auto* r2 = bmp2.row(y).data();
+        for (int x = 0; x < W; x += step_x) {
+            const int idx = x * 4;
+            diff += std::abs(static_cast<int>(r1[idx]) - static_cast<int>(r2[idx]));
+            diff += std::abs(static_cast<int>(r1[idx + 1]) - static_cast<int>(r2[idx + 1]));
+            diff += std::abs(static_cast<int>(r1[idx + 2]) - static_cast<int>(r2[idx + 2]));
+            ++count;
+        }
+    }
+
+    const double avg_diff = static_cast<double>(diff) / (count * 3.0);
+    return avg_diff < 1.0;
+}
+
+int find_best_template_y(const Bitmap& frame, int direction) {
+    const int W = frame.width;
+    const int H = frame.height;
+    const int th = 24;
+
+    int start_y = H / 4;
+    int end_y = 3 * H / 4 - th;
+
+    const int edge_margin = std::max(40, H / 8);
+
+    if (direction == 1) { // Downscroll (content moves up, so we want template from bottom, avoiding bottom edge)
+        start_y = H / 2;
+        end_y = H - th - edge_margin;
+    } else if (direction == -1) { // Upscroll (content moves down, so we want template from top, avoiding top edge)
+        start_y = edge_margin;
+        end_y = H / 2 - th;
+    }
+
+    if (start_y > end_y) {
+        start_y = H / 4;
+        end_y = 3 * H / 4 - th;
+    }
+
+    int best_y = (start_y + end_y) / 2;
+    uint64_t max_variance = 0;
+
+    const int col_step = 8;
+
+    for (int y = start_y; y <= end_y; y += 4) {
+        uint64_t variance = 0;
+        for (int row = 0; row < th - 1; ++row) {
+            const auto* r1 = frame.row(y + row).data();
+            const auto* r2 = frame.row(y + row + 1).data();
+            for (int col = 0; col < W; col += col_step) {
+                const int idx = col * 4;
+                variance += std::abs(static_cast<int>(r1[idx]) - static_cast<int>(r2[idx]));
+                variance += std::abs(static_cast<int>(r1[idx + 1]) - static_cast<int>(r2[idx + 1]));
+                variance += std::abs(static_cast<int>(r1[idx + 2]) - static_cast<int>(r2[idx + 2]));
+            }
+        }
+        if (variance > max_variance) {
+            max_variance = variance;
+            best_y = y;
+        }
+    }
+
+    return best_y;
+}
+
 class OverlaySession {
 public:
     explicit OverlaySession(RegionRequest request) : request_(std::move(request)) {
@@ -698,6 +1115,7 @@ public:
         }
         if (selection_complete_) {
             for (const auto& button : toolbar_) {
+                if (button.id == L"|") continue;
                 if (button.bounds.contains(point)) {
                     invoke(button.id, source);
                     return;
@@ -839,6 +1257,7 @@ public:
         if (selection_complete_) {
             std::wstring current_hovered;
             for (const auto& button : toolbar_) {
+                if (button.id == L"|") continue;
                 if (button.bounds.contains(point)) {
                     current_hovered = button.id;
                     break;
@@ -1102,20 +1521,32 @@ private:
         toolbar_.clear();
         std::vector<std::pair<std::wstring, std::wstring>> items;
         if (request_.config.annotation_enabled) {
-            items = {{L"rect", std::wstring(strings::toolbar_rectangle)},
-                     {L"arrow", std::wstring(strings::toolbar_arrow)},
-                     {L"mosaic", std::wstring(strings::toolbar_mosaic)},
-                     {L"text", std::wstring(strings::toolbar_text)},
-                     {L"undo", std::wstring(strings::toolbar_undo)},
-                     {L"redo", std::wstring(strings::toolbar_redo)}};
+            items.push_back({L"rect", std::wstring(strings::toolbar_rectangle)});
+            items.push_back({L"arrow", std::wstring(strings::toolbar_arrow)});
+            items.push_back({L"mosaic", std::wstring(strings::toolbar_mosaic)});
+            items.push_back({L"text", std::wstring(strings::toolbar_text)});
+            bool show_undo = !annotations_.empty();
+            bool show_redo = !redo_.empty();
+            if (show_undo || show_redo) {
+                items.push_back({L"|", L""});
+                if (show_undo) {
+                    items.push_back({L"undo", std::wstring(strings::toolbar_undo)});
+                }
+                if (show_redo) {
+                    items.push_back({L"redo", std::wstring(strings::toolbar_redo)});
+                }
+            }
+            items.push_back({L"|", L""});
         }
         if (request_.config.ocr_enabled) {
-            items.emplace_back(L"ocr", strings::toolbar_ocr);
+            items.push_back({L"ocr", std::wstring(strings::toolbar_ocr)});
         }
-        items.emplace_back(L"copy", strings::toolbar_copy);
-        items.emplace_back(L"save", strings::toolbar_save);
-        items.emplace_back(L"pin", L"钉");
-        items.emplace_back(L"close", strings::toolbar_close);
+        items.push_back({L"scroll", L"长"});
+        items.push_back({L"pin", L"钉"});
+        items.push_back({L"|", L""});
+        items.push_back({L"copy", std::wstring(strings::toolbar_copy)});
+        items.push_back({L"save", std::wstring(strings::toolbar_save)});
+        items.push_back({L"close", std::wstring(strings::toolbar_close)});
 
         constexpr int button_width = 36;
         constexpr int button_height = 32;
@@ -1123,8 +1554,15 @@ private:
         constexpr int padding = 6;
         constexpr int toolbar_height = button_height + 2 * padding;
 
-        const int total_width = 2 * padding + static_cast<int>(items.size()) * button_width +
-                                (static_cast<int>(items.size()) - 1) * spacing;
+        int total_width = 2 * padding;
+        for (std::size_t index = 0; index < items.size(); ++index) {
+            int w = (items[index].first == L"|") ? 12 : button_width;
+            total_width += w;
+            if (index > 0) {
+                total_width += spacing;
+            }
+        }
+
         int left = std::min(selection_.right - total_width, virtual_bounds_.right - total_width);
         left = std::max(left, virtual_bounds_.left);
         int top = selection_.bottom + 6;
@@ -1132,10 +1570,13 @@ private:
             top = selection_.top - toolbar_height - 6;
         }
         top = std::max(virtual_bounds_.top, top);
+
+        int current_x = left + padding;
         for (std::size_t index = 0; index < items.size(); ++index) {
-            const int x = left + padding + static_cast<int>(index) * (button_width + spacing);
-            const int y = top + padding;
-            toolbar_.push_back({items[index].first, items[index].second, {x, y, x + button_width, y + button_height}});
+            int w = (items[index].first == L"|") ? 12 : button_width;
+            int y = top + padding;
+            toolbar_.push_back({items[index].first, items[index].second, {current_x, y, current_x + w, y + button_height}});
+            current_x += w + spacing;
         }
         build_sub_toolbar();
     }
@@ -1154,8 +1595,7 @@ private:
             {L"color_white", L"白"},
             {L"width_small", L"细"},
             {L"width_medium", L"中"},
-            {L"width_large", L"粗"},
-            {L"color_custom", L"自"}
+            {L"width_large", L"粗"}
         };
 
         constexpr int button_width = 32;
@@ -1237,6 +1677,8 @@ private:
             complete_clipboard();
         } else if (id == L"save") {
             complete_file({}, source);
+        } else if (id == L"scroll") {
+            complete_scroll(source);
         } else if (id == L"pin") {
             complete_pin();
         } else if (id == L"close") {
@@ -1406,6 +1848,271 @@ private:
         RegionResult result{ExitCode::success, L"贴图已创建。"};
         result.action = RegionAction::pin;
         result.bitmap = rendered_selection();
+        finish(std::move(result));
+    }
+
+    struct ScrollResult {
+        bool matched{false};
+        int direction{0}; // 1 = down (append), -1 = up (prepend), 0 = none/invalid
+        int offset{0};
+    };
+
+    ScrollResult detect_scroll(const Bitmap& last_frame, const Bitmap& new_frame, int locked_direction) {
+        if (last_frame.empty() || new_frame.empty()) return {};
+        if (last_frame.width != new_frame.width || last_frame.height != new_frame.height) return {};
+
+        const int W = last_frame.width;
+        const int H = last_frame.height;
+        const int th = 24;
+
+        const int template_y = find_best_template_y(last_frame, locked_direction);
+        const int col_step = 4;
+
+        uint64_t variance = 0;
+        {
+            for (int row = 0; row < th - 1; ++row) {
+                const auto* r1 = last_frame.row(template_y + row).data();
+                const auto* r2 = last_frame.row(template_y + row + 1).data();
+                for (int col = 0; col < W; col += col_step) {
+                    const int idx = col * 4;
+                    variance += std::abs(static_cast<int>(r1[idx]) - static_cast<int>(r2[idx]));
+                    variance += std::abs(static_cast<int>(r1[idx + 1]) - static_cast<int>(r2[idx + 1]));
+                    variance += std::abs(static_cast<int>(r1[idx + 2]) - static_cast<int>(r2[idx + 2]));
+                }
+            }
+        }
+        const double min_required_variance = (W / col_step) * th * 0.5;
+        if (variance < min_required_variance) {
+            return {false, 0, 0};
+        }
+
+        auto search_range = [&](int start_y, int end_y, int& out_best_y, double& out_avg_diff) -> bool {
+            int best_y = -1;
+            uint64_t min_sad = 0xFFFFFFFFFFFFFFFFULL;
+            for (int y = start_y; y <= end_y; ++y) {
+                uint64_t sad = 0;
+                for (int row = 0; row < th; ++row) {
+                    const auto* last_row = last_frame.row(template_y + row).data();
+                    const auto* new_row = new_frame.row(y + row).data();
+                    for (int col = 0; col < W; col += col_step) {
+                        const int idx = col * 4;
+                        sad += std::abs(static_cast<int>(last_row[idx]) - static_cast<int>(new_row[idx]));
+                        sad += std::abs(static_cast<int>(last_row[idx + 1]) - static_cast<int>(new_row[idx + 1]));
+                        sad += std::abs(static_cast<int>(last_row[idx + 2]) - static_cast<int>(new_row[idx + 2]));
+                    }
+                }
+                if (sad < min_sad) {
+                    min_sad = sad;
+                    best_y = y;
+                }
+            }
+            if (best_y == -1) return false;
+            const double num_pixels = th * (W / col_step);
+            out_avg_diff = static_cast<double>(min_sad) / (num_pixels * 3.0);
+            out_best_y = best_y;
+            return true;
+        };
+
+        const int max_disp = std::min(240, H / 2);
+        int start_narrow = std::max(0, template_y - max_disp);
+        int end_narrow = std::min(H - th, template_y + max_disp);
+
+        int best_y = -1;
+        double avg_diff = 100.0;
+
+        // Stage 1: Narrow search
+        if (search_range(start_narrow, end_narrow, best_y, avg_diff)) {
+            if (avg_diff < 15.0) {
+                const int diff = template_y - best_y;
+                if (std::abs(diff) >= 2) {
+                    if (diff > 0 && diff < H - 20) {
+                        return {true, 1, diff};
+                    } else if (diff < 0 && -diff < H - 20) {
+                        return {true, -1, -diff};
+                    }
+                } else {
+                    return {true, 0, 0}; // matched but no significant movement
+                }
+            }
+        }
+
+        // Stage 2: Fallback full search
+        if (search_range(0, H - th, best_y, avg_diff)) {
+            if (avg_diff < 15.0) {
+                const int diff = template_y - best_y;
+                if (std::abs(diff) >= 2) {
+                    if (diff > 0 && diff < H - 20) {
+                        return {true, 1, diff};
+                    } else if (diff < 0 && -diff < H - 20) {
+                        return {true, -1, -diff};
+                    }
+                } else {
+                    return {true, 0, 0}; // matched but no significant movement
+                }
+            }
+        }
+
+        return {false, 0, 0};
+    }
+
+    void append_to_stitched(Bitmap& stitched, const Bitmap& new_frame, int d) {
+        if (new_frame.empty() || d <= 0) return;
+
+        const int W = new_frame.width;
+        const int H = new_frame.height;
+        const int old_h = stitched.height;
+        const int new_h = old_h + d;
+
+        stitched.pixels.resize(static_cast<std::size_t>(W) * new_h * 4U);
+        stitched.height = new_h;
+
+        for (int row = 0; row < d; ++row) {
+            const int src_y = H - d + row;
+            const int dest_y = old_h + row;
+            const auto* src_row = new_frame.row(src_y).data();
+            auto* dest_row = stitched.row(dest_y).data();
+            std::memcpy(dest_row, src_row, static_cast<std::size_t>(W) * 4U);
+        }
+    }
+
+    void prepend_to_stitched(Bitmap& stitched, const Bitmap& new_frame, int d) {
+        if (new_frame.empty() || d <= 0) return;
+
+        const int W = new_frame.width;
+        const int old_h = stitched.height;
+        const int new_h = old_h + d;
+
+        stitched.pixels.resize(static_cast<std::size_t>(W) * new_h * 4U);
+        stitched.height = new_h;
+
+        std::memmove(
+            stitched.pixels.data() + static_cast<std::size_t>(W) * d * 4U,
+            stitched.pixels.data(),
+            static_cast<std::size_t>(W) * old_h * 4U
+        );
+
+        for (int row = 0; row < d; ++row) {
+            const auto* src_row = new_frame.row(row).data();
+            auto* dest_row = stitched.row(row).data();
+            std::memcpy(dest_row, src_row, static_cast<std::size_t>(W) * 4U);
+        }
+    }
+
+    void complete_scroll(HWND source) {
+        for (const auto& window : windows_) {
+            ShowWindow(window->hwnd(), SW_HIDE);
+        }
+        run_scroll_capture(source);
+    }
+
+    void run_scroll_capture(HWND source) {
+        Bitmap stitched = compose_selection(monitors_, selection_);
+        if (stitched.empty()) {
+            finish({ExitCode::operation_failed, L"长截图初始化失败。"});
+            return;
+        }
+        Bitmap last_stitched_frame = stitched;
+        Bitmap last_cap = stitched;
+
+        HINSTANCE instance = GetModuleHandleW(nullptr);
+        HWND border_wnd = ScrollBorderWindow::create(instance, source, selection_);
+        ScrollControlState control_state;
+        HWND control_wnd = ScrollControlWindow::create(instance, source, selection_, &control_state);
+        if (control_wnd) {
+            std::wstring progress = std::format(L"{} px", stitched.height);
+            SetWindowTextW(control_wnd, progress.c_str());
+        }
+
+        UINT_PTR timer_id = SetTimer(source, 999, 80, nullptr);
+        int locked_direction = 0; // 0 = undecided, 1 = down, -1 = up
+        int consecutive_failures = 0;
+
+        MSG msg{};
+        while (IsWindow(control_wnd) && !control_state.finished && !control_state.cancelled) {
+            if (GetAsyncKeyState(VK_RETURN) & 0x8000) {
+                control_state.finished = true;
+                break;
+            }
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+                control_state.cancelled = true;
+                break;
+            }
+            if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_TIMER && msg.wParam == 999) {
+                    Bitmap new_frame = capture_rect(selection_);
+                    if (!new_frame.empty()) {
+                        ScrollResult res = detect_scroll(last_stitched_frame, new_frame, locked_direction);
+                        if (res.matched) {
+                            consecutive_failures = 0;
+                            if (res.direction != 0 && res.offset > 0) {
+                                if (locked_direction == 0) {
+                                    locked_direction = res.direction;
+                                }
+                                if (res.direction == locked_direction) {
+                                    if (locked_direction == 1) {
+                                        append_to_stitched(stitched, new_frame, res.offset);
+                                    } else {
+                                        prepend_to_stitched(stitched, new_frame, res.offset);
+                                    }
+                                    last_stitched_frame = new_frame;
+                                }
+                            }
+                        } else {
+                            if (locked_direction != 0) {
+                                consecutive_failures++;
+                                if (consecutive_failures >= 4) {
+                                    // Lost matching anchor. Re-anchor to current frame.
+                                    last_stitched_frame = new_frame;
+                                    consecutive_failures = 0;
+                                }
+                            }
+                        }
+
+                        std::wstring progress = std::format(L"{} px", stitched.height);
+                        SetWindowTextW(control_wnd, progress.c_str());
+                        last_cap = new_frame;
+                    }
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            } else {
+                Sleep(10);
+            }
+        }
+
+        KillTimer(source, timer_id);
+        if (border_wnd) DestroyWindow(border_wnd);
+        if (control_wnd) DestroyWindow(control_wnd);
+
+        if (control_state.cancelled) {
+            finish({ExitCode::user_cancelled, L"长截图已取消。"});
+            return;
+        }
+
+        std::wstring error;
+        bool saved = false;
+        std::wstring path_msg;
+        if (request_.action == RegionAction::file || request_.config.default_output == L"file") {
+            auto path = prompt_png_path(source);
+            if (path) {
+                if (save_png(stitched, *path, &error)) {
+                    saved = true;
+                    path_msg = path->wstring();
+                }
+            }
+        }
+        if (!saved) {
+            if (!copy_bitmap_to_clipboard(stitched, &error)) {
+                finish({ExitCode::operation_failed, std::move(error)});
+                return;
+            }
+        }
+
+        RegionResult result{ExitCode::success, saved ? L"长截图已保存。" : L"长截图已复制到剪贴板。"};
+        if (saved) {
+            result.path = path_msg;
+        }
+        result.bitmap = stitched;
         finish(std::move(result));
     }
 
@@ -1713,12 +2420,12 @@ void OverlayWindow::paint() {
         };
 
         ComPtr<IDWriteTextFormat> format;
-        dwrite_factory()->CreateTextFormat(L"Microsoft YaHei",
+        dwrite_factory()->CreateTextFormat(L"Consolas",
                                            nullptr,
                                            DWRITE_FONT_WEIGHT_NORMAL,
                                            DWRITE_FONT_STYLE_NORMAL,
                                            DWRITE_FONT_STRETCH_NORMAL,
-                                           15.0F,
+                                           12.0F,
                                            L"zh-CN",
                                            format.GetAddressOf());
         format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -1740,6 +2447,20 @@ void OverlayWindow::paint() {
                     continue;
                 }
                 const D2D1_RECT_F bounds = local_rect(button.bounds);
+
+                if (button.id == L"|") {
+                    float cx = bounds.left + (bounds.right - bounds.left) / 2.0F;
+                    ComPtr<ID2D1SolidColorBrush> sep_brush;
+                    render_target_->CreateSolidColorBrush(D2D1::ColorF(0.35f, 0.38f, 0.43f, 0.6f), sep_brush.GetAddressOf());
+                    render_target_->DrawLine(
+                        D2D1::Point2F(cx, bounds.top + 6.0F),
+                        D2D1::Point2F(cx, bounds.bottom - 6.0F),
+                        sep_brush.Get(),
+                        1.0F
+                    );
+                    continue;
+                }
+
                 bool is_active = (session_.active_tool() != Tool::none &&
                                  ((button.id == L"rect" && session_.active_tool() == Tool::rectangle) ||
                                   (button.id == L"arrow" && session_.active_tool() == Tool::arrow) ||
@@ -1758,62 +2479,108 @@ void OverlayWindow::paint() {
                 const float cy = bounds.top + (bounds.bottom - bounds.top) / 2.0F;
 
                 if (button.id == L"rect") {
-                    render_target_->DrawRectangle(D2D1::RectF(cx - 8.0F, cy - 7.0F, cx + 8.0F, cy + 7.0F), white_brush_.Get(), 2.0F);
+                    render_target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 7.5F, cy - 6.5F, cx + 7.5F, cy + 6.5F), 1.5F, 1.5F), white_brush_.Get(), 1.5F);
                 } else if (button.id == L"arrow") {
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy + 7.0F), D2D1::Point2F(cx + 7.0F, cy - 7.0F), white_brush_.Get(), 2.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy - 7.0F), D2D1::Point2F(cx + 1.0F, cy - 7.0F), white_brush_.Get(), 2.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy - 7.0F), D2D1::Point2F(cx + 7.0F, cy - 1.0F), white_brush_.Get(), 2.0F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 4.0F, cy + 4.0F), D2D1::Point2F(cx + 5.0F, cy - 5.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 5.0F, cy - 5.0F), D2D1::Point2F(cx - 1.0F, cy - 5.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 5.0F, cy - 5.0F), D2D1::Point2F(cx + 5.0F, cy - 1.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx - 6.0F, cy + 6.0F), 1.8F, 1.8F), white_brush_.Get(), 1.5F);
                 } else if (button.id == L"mosaic") {
-                    render_target_->FillRectangle(D2D1::RectF(cx - 7.0F, cy - 7.0F, cx, cy), white_brush_.Get());
-                    render_target_->FillRectangle(D2D1::RectF(cx, cy, cx + 7.0F, cy + 7.0F), white_brush_.Get());
+                    float step = 3.5F;
+                    // Row 0
+                    render_target_->FillRectangle(D2D1::RectF(cx - 7.0F, cy - 7.0F, cx - 7.0F + step, cy - 7.0F + step), white_brush_.Get());
+                    render_target_->FillRectangle(D2D1::RectF(cx, cy - 7.0F, cx + step, cy - 7.0F + step), white_brush_.Get());
+                    // Row 1
+                    render_target_->FillRectangle(D2D1::RectF(cx - 7.0F + step, cy - 7.0F + step, cx, cy), white_brush_.Get());
+                    render_target_->FillRectangle(D2D1::RectF(cx + step, cy - 7.0F + step, cx + 7.0F, cy), white_brush_.Get());
+                    // Row 2
+                    render_target_->FillRectangle(D2D1::RectF(cx - 7.0F, cy, cx - 7.0F + step, cy + step), white_brush_.Get());
+                    render_target_->FillRectangle(D2D1::RectF(cx, cy, cx + step, cy + step), white_brush_.Get());
+                    // Row 3
+                    render_target_->FillRectangle(D2D1::RectF(cx - 7.0F + step, cy + step, cx, cy + 7.0F), white_brush_.Get());
+                    render_target_->FillRectangle(D2D1::RectF(cx + step, cy + step, cx + 7.0F, cy + 7.0F), white_brush_.Get());
+
                     render_target_->DrawRectangle(D2D1::RectF(cx - 7.0F, cy - 7.0F, cx + 7.0F, cy + 7.0F), white_brush_.Get(), 1.5F);
                 } else if (button.id == L"text") {
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy - 7.0F), D2D1::Point2F(cx + 7.0F, cy - 7.0F), white_brush_.Get(), 2.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 7.0F), D2D1::Point2F(cx, cy + 7.0F), white_brush_.Get(), 2.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 3.0F, cy + 7.0F), D2D1::Point2F(cx + 3.0F, cy + 7.0F), white_brush_.Get(), 2.0F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 3.0F, cy - 5.0F), D2D1::Point2F(cx + 3.0F, cy - 5.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 5.0F), D2D1::Point2F(cx, cy + 5.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 1.5F, cy + 5.0F), D2D1::Point2F(cx + 1.5F, cy + 5.0F), white_brush_.Get(), 1.5F);
+
+                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy - 7.0F), D2D1::Point2F(cx - 7.0F, cy + 7.0F), white_brush_.Get(), 1.0F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy - 7.0F), D2D1::Point2F(cx - 5.0F, cy - 7.0F), white_brush_.Get(), 1.0F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy + 7.0F), D2D1::Point2F(cx - 5.0F, cy + 7.0F), white_brush_.Get(), 1.0F);
+
+                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy - 7.0F), D2D1::Point2F(cx + 7.0F, cy + 7.0F), white_brush_.Get(), 1.0F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy - 7.0F), D2D1::Point2F(cx + 5.0F, cy - 7.0F), white_brush_.Get(), 1.0F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy + 7.0F), D2D1::Point2F(cx + 5.0F, cy + 7.0F), white_brush_.Get(), 1.0F);
                 } else if (button.id == L"undo") {
-                    render_target_->DrawLine(D2D1::Point2F(cx + 5.0F, cy + 4.0F), D2D1::Point2F(cx + 5.0F, cy - 4.0F), white_brush_.Get(), 2.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 5.0F, cy - 4.0F), D2D1::Point2F(cx - 4.0F, cy - 4.0F), white_brush_.Get(), 2.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 4.0F, cy - 4.0F), D2D1::Point2F(cx - 1.0F, cy - 7.0F), white_brush_.Get(), 2.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 4.0F, cy - 4.0F), D2D1::Point2F(cx - 1.0F, cy - 1.0F), white_brush_.Get(), 2.0F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 5.0F, cy + 4.0F), D2D1::Point2F(cx + 5.0F, cy), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 5.0F, cy), D2D1::Point2F(cx + 4.0F, cy - 3.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 4.0F, cy - 3.0F), D2D1::Point2F(cx + 1.0F, cy - 5.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 1.0F, cy - 5.0F), D2D1::Point2F(cx - 4.0F, cy - 4.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 4.0F, cy - 4.0F), D2D1::Point2F(cx - 4.0F, cy), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 4.0F, cy - 4.0F), D2D1::Point2F(cx, cy - 4.0F), white_brush_.Get(), 1.5F);
                 } else if (button.id == L"redo") {
-                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy + 4.0F), D2D1::Point2F(cx - 5.0F, cy - 4.0F), white_brush_.Get(), 2.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy - 4.0F), D2D1::Point2F(cx + 4.0F, cy - 4.0F), white_brush_.Get(), 2.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 4.0F, cy - 4.0F), D2D1::Point2F(cx + 1.0F, cy - 7.0F), white_brush_.Get(), 2.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 4.0F, cy - 4.0F), D2D1::Point2F(cx + 1.0F, cy - 1.0F), white_brush_.Get(), 2.0F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy + 4.0F), D2D1::Point2F(cx - 5.0F, cy), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy), D2D1::Point2F(cx - 4.0F, cy - 3.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 4.0F, cy - 3.0F), D2D1::Point2F(cx - 1.0F, cy - 5.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 1.0F, cy - 5.0F), D2D1::Point2F(cx + 4.0F, cy - 4.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 4.0F, cy - 4.0F), D2D1::Point2F(cx + 4.0F, cy), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 4.0F, cy - 4.0F), D2D1::Point2F(cx, cy - 4.0F), white_brush_.Get(), 1.5F);
                 } else if (button.id == L"ocr") {
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy - 3.0F), D2D1::Point2F(cx - 7.0F, cy - 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy - 7.0F), D2D1::Point2F(cx - 3.0F, cy - 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy - 3.0F), D2D1::Point2F(cx + 7.0F, cy - 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy - 7.0F), D2D1::Point2F(cx + 3.0F, cy - 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy + 3.0F), D2D1::Point2F(cx - 7.0F, cy + 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy + 7.0F), D2D1::Point2F(cx - 3.0F, cy + 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy + 3.0F), D2D1::Point2F(cx + 7.0F, cy + 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy + 7.0F), D2D1::Point2F(cx + 3.0F, cy + 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 3.0F, cy + 3.0F), D2D1::Point2F(cx, cy - 3.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 3.0F), D2D1::Point2F(cx + 3.0F, cy + 3.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 1.5F, cy + 1.0F), D2D1::Point2F(cx + 1.5F, cy + 1.0F), white_brush_.Get(), 1.5F);
+                    ComPtr<IDWriteTextFormat> ocr_format;
+                    dwrite_factory()->CreateTextFormat(L"Consolas",
+                                                       nullptr,
+                                                       DWRITE_FONT_WEIGHT_BOLD,
+                                                       DWRITE_FONT_STYLE_NORMAL,
+                                                       DWRITE_FONT_STRETCH_NORMAL,
+                                                       8.0F,
+                                                       L"zh-CN",
+                                                       ocr_format.GetAddressOf());
+                    ocr_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    ocr_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+                    constexpr float len = 3.5F;
+                    constexpr float r = 7.0F;
+                    render_target_->DrawLine(D2D1::Point2F(cx - r, cy - r), D2D1::Point2F(cx - r + len, cy - r), white_brush_.Get(), 1.2F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - r, cy - r), D2D1::Point2F(cx - r, cy - r + len), white_brush_.Get(), 1.2F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + r, cy - r), D2D1::Point2F(cx + r - len, cy - r), white_brush_.Get(), 1.2F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + r, cy - r), D2D1::Point2F(cx + r, cy - r + len), white_brush_.Get(), 1.2F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - r, cy + r), D2D1::Point2F(cx - r + len, cy + r), white_brush_.Get(), 1.2F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - r, cy + r), D2D1::Point2F(cx - r, cy + r - len), white_brush_.Get(), 1.2F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + r, cy + r), D2D1::Point2F(cx + r - len, cy + r), white_brush_.Get(), 1.2F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + r, cy + r), D2D1::Point2F(cx + r, cy + r - len), white_brush_.Get(), 1.2F);
+
+                    render_target_->DrawTextW(L"OCR", 3, ocr_format.Get(), D2D1::RectF(cx - 8.0F, cy - 8.0F, cx + 8.0F, cy + 8.0F), white_brush_.Get());
                 } else if (button.id == L"copy") {
-                    render_target_->DrawRectangle(D2D1::RectF(cx - 3.0F, cy - 7.0F, cx + 7.0F, cy + 3.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawRectangle(D2D1::RectF(cx - 3.0F, cy - 7.0F, cx + 7.0F, cy + 3.0F), blue_brush_.Get(), 1.5F);
                     render_target_->FillRectangle(D2D1::RectF(cx - 7.0F, cy - 3.0F, cx + 3.0F, cy + 7.0F), is_active ? active_bg_brush_.Get() : (is_hovered ? hover_bg_brush_.Get() : toolbar_bg_brush_.Get()));
-                    render_target_->DrawRectangle(D2D1::RectF(cx - 7.0F, cy - 3.0F, cx + 3.0F, cy + 7.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawRectangle(D2D1::RectF(cx - 7.0F, cy - 3.0F, cx + 3.0F, cy + 7.0F), blue_brush_.Get(), 1.5F);
                 } else if (button.id == L"save") {
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy - 7.0F), D2D1::Point2F(cx + 4.0F, cy - 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 4.0F, cy - 7.0F), D2D1::Point2F(cx + 7.0F, cy - 4.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy - 4.0F), D2D1::Point2F(cx + 7.0F, cy + 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy + 7.0F), D2D1::Point2F(cx - 7.0F, cy + 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy + 7.0F), D2D1::Point2F(cx - 7.0F, cy - 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawRectangle(D2D1::RectF(cx - 4.0F, cy + 1.0F, cx + 4.0F, cy + 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->FillRectangle(D2D1::RectF(cx - 2.0F, cy - 7.0F, cx + 1.0F, cy - 4.0F), white_brush_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy - 6.0F), D2D1::Point2F(cx + 3.0F, cy - 6.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 3.0F, cy - 6.0F), D2D1::Point2F(cx + 6.0F, cy - 3.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 6.0F, cy - 3.0F), D2D1::Point2F(cx + 6.0F, cy + 6.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 6.0F, cy + 6.0F), D2D1::Point2F(cx - 6.0F, cy + 6.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy + 6.0F), D2D1::Point2F(cx - 6.0F, cy - 6.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawRectangle(D2D1::RectF(cx - 3.0F, cy + 1.0F, cx + 3.0F, cy + 6.0F), white_brush_.Get(), 1.5F);
+                    render_target_->FillRectangle(D2D1::RectF(cx - 2.0F, cy - 6.0F, cx + 1.0F, cy - 3.0F), white_brush_.Get());
+                } else if (button.id == L"scroll") {
+                    render_target_->DrawRectangle(D2D1::RectF(cx - 6.0F, cy - 7.0F, cx + 6.0F, cy + 7.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy - 3.0F), D2D1::Point2F(cx + 6.0F, cy - 3.0F), white_brush_.Get(), 1.2F);
+                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 1.0F), D2D1::Point2F(cx, cy + 4.5F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx, cy + 4.5F), D2D1::Point2F(cx - 2.5F, cy + 2.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx, cy + 4.5F), D2D1::Point2F(cx + 2.5F, cy + 2.0F), white_brush_.Get(), 1.5F);
                 } else if (button.id == L"pin") {
-                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 2.0F), D2D1::Point2F(cx, cy + 8.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 1.0F), D2D1::Point2F(cx, cy + 7.0F), white_brush_.Get(), 1.5F);
                     render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy - 6.0F), D2D1::Point2F(cx + 5.0F, cy - 6.0F), white_brush_.Get(), 2.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 4.0F, cy - 6.0F), D2D1::Point2F(cx - 4.0F, cy - 2.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 4.0F, cy - 6.0F), D2D1::Point2F(cx + 4.0F, cy - 2.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 4.0F, cy - 2.0F), D2D1::Point2F(cx + 4.0F, cy - 2.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 3.5F, cy - 6.0F), D2D1::Point2F(cx - 3.5F, cy - 1.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx + 3.5F, cy - 6.0F), D2D1::Point2F(cx + 3.5F, cy - 1.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 3.5F, cy - 1.0F), D2D1::Point2F(cx + 3.5F, cy - 1.0F), white_brush_.Get(), 1.5F);
                 } else if (button.id == L"close") {
-                    render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy - 6.0F), D2D1::Point2F(cx + 6.0F, cy + 6.0F), white_brush_.Get(), 2.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy + 6.0F), D2D1::Point2F(cx + 6.0F, cy - 6.0F), white_brush_.Get(), 2.0F);
+                    ComPtr<ID2D1SolidColorBrush> red_brush;
+                    render_target_->CreateSolidColorBrush(D2D1::ColorF(0xFF4D4F), red_brush.GetAddressOf());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy - 5.0F), D2D1::Point2F(cx + 5.0F, cy + 5.0F), red_brush.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy + 5.0F), D2D1::Point2F(cx + 5.0F, cy - 5.0F), red_brush.Get(), 1.5F);
                 }
             }
         }
@@ -1907,13 +2674,13 @@ void OverlayWindow::paint() {
 
         // Draw 8-point handles
         for (const auto& pt : handles) {
-            D2D1_RECT_F r = D2D1::RectF(pt.x - 3.0F, pt.y - 3.0F, pt.x + 3.0F, pt.y + 3.0F);
-            render_target_->FillRectangle(r, white_brush_.Get());
-            render_target_->DrawRectangle(r, blue_brush_.Get(), 1.5F);
+            D2D1_RECT_F r = D2D1::RectF(pt.x - 3.5F, pt.y - 3.5F, pt.x + 3.5F, pt.y + 3.5F);
+            render_target_->FillRectangle(r, blue_brush_.Get());
+            render_target_->DrawRectangle(r, white_brush_.Get(), 1.0F);
         }
 
         const std::wstring dimensions =
-            std::format(L"{} × {}", session_.selection().width(), session_.selection().height());
+            std::format(L" {} × {} ", session_.selection().width(), session_.selection().height());
         RectI text_bounds{session_.selection().left,
                           session_.selection().top - 28,
                           session_.selection().left + 130,
@@ -1924,8 +2691,8 @@ void OverlayWindow::paint() {
         }
         if (intersect(text_bounds, monitor_.bounds)) {
             const auto bounds = local_rect(text_bounds);
-            render_target_->FillRoundedRectangle(D2D1::RoundedRect(bounds, 4.f, 4.f), toolbar_bg_brush_.Get());
-            render_target_->DrawRoundedRectangle(D2D1::RoundedRect(bounds, 4.f, 4.f), toolbar_border_brush_.Get(), 1.0f);
+            render_target_->FillRoundedRectangle(D2D1::RoundedRect(bounds, 12.f, 12.f), toolbar_bg_brush_.Get());
+            render_target_->DrawRoundedRectangle(D2D1::RoundedRect(bounds, 12.f, 12.f), toolbar_border_brush_.Get(), 1.0f);
             render_target_->DrawTextW(dimensions.c_str(),
                                       static_cast<UINT32>(dimensions.size()),
                                       format.Get(),
@@ -1942,9 +2709,9 @@ void OverlayWindow::paint() {
             int cy = cursor_pos.y - monitor_.bounds.top;
 
             constexpr int grid_cells = 15;
-            constexpr int cell_size = 8;
+            constexpr int cell_size = 10;
             constexpr int grid_size = grid_cells * cell_size;
-            constexpr int text_height = 56;
+            constexpr int text_height = 72;
             constexpr int mag_width = grid_size;
             constexpr int mag_height = grid_size + text_height;
 
@@ -2038,7 +2805,7 @@ void OverlayWindow::paint() {
                                                DWRITE_FONT_WEIGHT_NORMAL,
                                                DWRITE_FONT_STYLE_NORMAL,
                                                DWRITE_FONT_STRETCH_NORMAL,
-                                               10.0F,
+                                               12.0F,
                                                L"zh-CN",
                                                mag_format.GetAddressOf());
             mag_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -2047,18 +2814,18 @@ void OverlayWindow::paint() {
             // Line 1: coordinates
             D2D1_RECT_F coord_rect = D2D1::RectF(
                 static_cast<float>(mx),
-                static_cast<float>(my + grid_size + 2),
+                static_cast<float>(my + grid_size + 4),
                 static_cast<float>(mx + mag_width),
-                static_cast<float>(my + grid_size + 18)
+                static_cast<float>(my + grid_size + 24)
             );
             render_target_->DrawTextW(coord_text.c_str(), static_cast<UINT32>(coord_text.size()), mag_format.Get(), coord_rect, white_brush_.Get());
 
             // Line 2: color value (Hex or RGB)
             D2D1_RECT_F color_rect = D2D1::RectF(
                 static_cast<float>(mx),
-                static_cast<float>(my + grid_size + 18),
+                static_cast<float>(my + grid_size + 24),
                 static_cast<float>(mx + mag_width),
-                static_cast<float>(my + grid_size + 34)
+                static_cast<float>(my + grid_size + 44)
             );
             render_target_->DrawTextW(primary_color.c_str(), static_cast<UINT32>(primary_color.size()), mag_format.Get(), color_rect, white_brush_.Get());
 
@@ -2069,7 +2836,7 @@ void OverlayWindow::paint() {
                                                DWRITE_FONT_WEIGHT_NORMAL,
                                                DWRITE_FONT_STYLE_NORMAL,
                                                DWRITE_FONT_STRETCH_NORMAL,
-                                               9.0F,
+                                               10.5F,
                                                L"zh-CN",
                                                hint_format.GetAddressOf());
             hint_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -2080,9 +2847,9 @@ void OverlayWindow::paint() {
 
             D2D1_RECT_F hint_rect = D2D1::RectF(
                 static_cast<float>(mx),
-                static_cast<float>(my + grid_size + 34),
+                static_cast<float>(my + grid_size + 44),
                 static_cast<float>(mx + mag_width),
-                static_cast<float>(my + mag_height)
+                static_cast<float>(my + mag_height - 4)
             );
             render_target_->DrawTextW(hint_text.c_str(), static_cast<UINT32>(hint_text.size()), hint_format.Get(), hint_rect, hint_brush.Get());
 

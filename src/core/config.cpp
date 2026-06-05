@@ -377,7 +377,8 @@ std::wstring config_to_json(const AppConfig& config) {
     result += L",\"annotation\":{\"enabled\":" + std::wstring(json_boolean(config.annotation_enabled)) + L"}";
     result += L",\"ocr\":{\"enabled\":" + std::wstring(json_boolean(config.ocr_enabled)) + L"}";
     result += L",\"shell\":{\"enabled\":" + std::wstring(json_boolean(config.shell_enabled));
-    result += L",\"startAtLogin\":" + std::wstring(json_boolean(config.start_at_login)) + L"}";
+    result += L",\"startAtLogin\":" + std::wstring(json_boolean(config.start_at_login));
+    result += L",\"notificationsEnabled\":" + std::wstring(json_boolean(config.notifications_enabled)) + L"}";
     result += L",\"hotkey\":{\"capture\":" + quote_json(config.capture_hotkey);
     result += L",\"globalOcrEnabled\":" + std::wstring(json_boolean(config.global_ocr_enabled));
     result += L",\"globalOcr\":" + quote_json(config.global_ocr_hotkey) + L"}";
@@ -404,6 +405,7 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text) {
     if (const auto* shell = member(*root, L"shell")) {
         config.shell_enabled = named_boolean(*shell, L"enabled", true);
         config.start_at_login = named_boolean(*shell, L"startAtLogin", true);
+        config.notifications_enabled = named_boolean(*shell, L"notificationsEnabled", false);
     }
     if (const auto* hotkey = member(*root, L"hotkey")) {
         config.capture_hotkey = named_string(*hotkey, L"capture", L"Ctrl+Alt+A");

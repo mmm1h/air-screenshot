@@ -23,13 +23,14 @@ enum ControlId : int {
     static_note = 108,
     static_label_capture = 109,
     static_label_ocr = 110,
+    notifications = 111,
 };
 
 struct SettingsState {
     AppConfig config;
     bool accepted{};
     HWND window{};
-    std::array<HWND, 7> controls{};
+    std::array<HWND, 8> controls{};
     HWND focused_control{};
 };
 
@@ -262,18 +263,20 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
         state->controls[3] =
             add_checkbox(window, startup, strings::settings_startup.data(), 40, 190, state->config.start_at_login);
         state->controls[4] =
-            add_checkbox(window, global_ocr, strings::settings_global_ocr.data(), 40, 300, state->config.global_ocr_enabled);
+            add_checkbox(window, notifications, L"启用截图与 OCR 成功提示", 40, 230, state->config.notifications_enabled);
         state->controls[5] =
-            add_edit(window, capture_hotkey, static_label_capture, strings::settings_capture_hotkey.data(), 40, 340, 150, 280, state->config.capture_hotkey);
+            add_checkbox(window, global_ocr, strings::settings_global_ocr.data(), 40, 340, state->config.global_ocr_enabled);
         state->controls[6] =
-            add_edit(window, global_ocr_hotkey, static_label_ocr, strings::settings_global_ocr_hotkey.data(), 40, 378, 150, 280, state->config.global_ocr_hotkey);
+            add_edit(window, capture_hotkey, static_label_capture, strings::settings_capture_hotkey.data(), 40, 380, 150, 280, state->config.capture_hotkey);
+        state->controls[7] =
+            add_edit(window, global_ocr_hotkey, static_label_ocr, strings::settings_global_ocr_hotkey.data(), 40, 418, 150, 280, state->config.global_ocr_hotkey);
 
         HWND note = CreateWindowExW(0,
                                     L"STATIC",
                                     strings::settings_note.data(),
                                     WS_CHILD | WS_VISIBLE,
                                     20,
-                                    440,
+                                    480,
                                     480,
                                     40,
                                     window,
@@ -287,7 +290,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                                     strings::settings_save.data(),
                                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                                     300,
-                                    505,
+                                    545,
                                     90,
                                     34,
                                     window,
@@ -299,7 +302,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                                       strings::settings_cancel.data(),
                                       WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                                       410,
-                                      505,
+                                      545,
                                       90,
                                       34,
                                       window,
@@ -322,12 +325,13 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
         RECT rect = dis->rcItem;
         int id = dis->CtlID;
 
-        if (id == annotation || id == ocr || id == shell || id == startup || id == global_ocr) {
+        if (id == annotation || id == ocr || id == shell || id == startup || id == global_ocr || id == notifications) {
             bool is_checked = false;
             if (id == annotation) is_checked = state->config.annotation_enabled;
             else if (id == ocr) is_checked = state->config.ocr_enabled;
             else if (id == shell) is_checked = state->config.shell_enabled;
             else if (id == startup) is_checked = state->config.start_at_login;
+            else if (id == notifications) is_checked = state->config.notifications_enabled;
             else if (id == global_ocr) is_checked = state->config.global_ocr_enabled;
 
             HBRUSH bg_brush = CreateSolidBrush(RGB(30, 32, 36));
@@ -450,19 +454,19 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
         HFONT title_font = create_ui_title_font();
 
         // Draw Card 1: 常规设置
-        RECT card1_rect{ 20, 20, 500, 230 };
+        RECT card1_rect{ 20, 20, 500, 270 };
         draw_card(hdc, card1_rect, L"常规设置", title_font);
 
         // Draw Card 2: 快捷键配置
-        RECT card2_rect{ 20, 250, 500, 420 };
+        RECT card2_rect{ 20, 290, 500, 460 };
         draw_card(hdc, card2_rect, L"快捷键配置", title_font);
 
         // Draw Edit Borders dynamically
-        if (state->controls[5]) {
-            draw_edit_border(window, state->controls[5], hdc, state->focused_control == state->controls[5]);
-        }
         if (state->controls[6]) {
             draw_edit_border(window, state->controls[6], hdc, state->focused_control == state->controls[6]);
+        }
+        if (state->controls[7]) {
+            draw_edit_border(window, state->controls[7], hdc, state->focused_control == state->controls[7]);
         }
 
         EndPaint(window, &ps);
@@ -533,15 +537,19 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
             state->config.start_at_login = !state->config.start_at_login;
             InvalidateRect(state->controls[3], nullptr, TRUE);
             return 0;
+        } else if (id == notifications) {
+            state->config.notifications_enabled = !state->config.notifications_enabled;
+            InvalidateRect(state->controls[4], nullptr, TRUE);
+            return 0;
         } else if (id == global_ocr) {
             state->config.global_ocr_enabled = !state->config.global_ocr_enabled;
-            InvalidateRect(state->controls[4], nullptr, TRUE);
+            InvalidateRect(state->controls[5], nullptr, TRUE);
             return 0;
         }
 
         if (id == IDOK) {
-            const std::wstring capture = control_text(state->controls[5]);
-            const std::wstring global_ocr_value = control_text(state->controls[6]);
+            const std::wstring capture = control_text(state->controls[6]);
+            const std::wstring global_ocr_value = control_text(state->controls[7]);
             if (!parse_hotkey(capture) || !parse_hotkey(global_ocr_value)) {
                 MessageBoxW(window, strings::settings_invalid_hotkey.data(), kAppName, MB_OK | MB_ICONWARNING);
                 return 0;
@@ -591,7 +599,7 @@ bool show_settings_window(HWND owner, AppConfig& config) {
                                   x,
                                   y,
                                   536,
-                                  640,
+                                  680,
                                   owner,
                                   nullptr,
                                   GetModuleHandleW(nullptr),

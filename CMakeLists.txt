@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(AirScreenshot VERSION 0.2.0 LANGUAGES CXX)
+project(AirScreenshot VERSION 0.2.1 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "Air Screenshot only supports Windows.")

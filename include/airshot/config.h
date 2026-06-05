@@ -11,6 +11,7 @@ struct AppConfig {
     bool shell_enabled{true};
     bool start_at_login{true};
     bool global_ocr_enabled{false};
+    bool notifications_enabled{false};
     std::wstring capture_hotkey{L"Ctrl+Alt+A"};
     std::wstring global_ocr_hotkey{L"Ctrl+Alt+O"};
     std::wstring capture_ocr_shortcut{L"Shift+C"};

@@ -1,5 +1,6 @@
 #include "airshot/output.h"
 
+#include "airshot/common.h"
 #include "airshot/config.h"
 
 #include <shlobj.h>
@@ -108,6 +109,7 @@ HGLOBAL encode_png_to_hglobal(const Bitmap& bitmap) {
 }  // namespace
 
 bool copy_bitmap_to_clipboard(const Bitmap& bitmap, std::wstring* error) {
+    const ScopedWinrtApartment apartment(true);
     if (bitmap.empty()) {
         if (error) {
             *error = L"图像为空。";
@@ -115,13 +117,41 @@ bool copy_bitmap_to_clipboard(const Bitmap& bitmap, std::wstring* error) {
         return false;
     }
 
+    const int W = bitmap.width;
+    const int H = bitmap.height;
+
+    // Force alpha channel to 255 (fully opaque) to prevent Electron-based apps (like Feishu, Slack)
+    // or standard apps (like WeChat) from pasting the image as fully transparent/black/blank.
+    Bitmap opaque_bitmap = bitmap;
+    for (std::size_t i = 3; i < opaque_bitmap.pixels.size(); i += 4) {
+        opaque_bitmap.pixels[i] = 255;
+    }
+
     // Encode PNG first before opening clipboard to minimize open time
-    HGLOBAL png_memory = encode_png_to_hglobal(bitmap);
+    HGLOBAL png_memory = encode_png_to_hglobal(opaque_bitmap);
+    HGLOBAL png_memory_alt = nullptr;
+    if (png_memory) {
+        SIZE_T png_size = GlobalSize(png_memory);
+        png_memory_alt = GlobalAlloc(GMEM_MOVEABLE, png_size);
+        if (png_memory_alt) {
+            void* src = GlobalLock(png_memory);
+            void* dst = GlobalLock(png_memory_alt);
+            if (src && dst) {
+                std::memcpy(dst, src, png_size);
+            }
+            if (src) GlobalUnlock(png_memory);
+            if (dst) GlobalUnlock(png_memory_alt);
+        }
+    }
     UINT png_format = RegisterClipboardFormatW(L"PNG");
+    UINT png_format_alt = RegisterClipboardFormatW(L"image/png");
 
     if (!open_clipboard_with_retry(nullptr)) {
         if (png_memory) {
             GlobalFree(png_memory);
+        }
+        if (png_memory_alt) {
+            GlobalFree(png_memory_alt);
         }
         if (error) {
             *error = L"剪贴板正被其他程序占用。";
@@ -131,73 +161,102 @@ bool copy_bitmap_to_clipboard(const Bitmap& bitmap, std::wstring* error) {
 
     EmptyClipboard();
 
-    // 1. Set registered "PNG" clipboard format (for Electron/Chromium applications)
+    // 1. Set registered "PNG" and "image/png" clipboard formats (for Electron/Chromium applications)
     if (png_memory) {
         if (!SetClipboardData(png_format, png_memory)) {
             GlobalFree(png_memory);
         }
     }
+    if (png_memory_alt) {
+        if (!SetClipboardData(png_format_alt, png_memory_alt)) {
+            GlobalFree(png_memory_alt);
+        }
+    }
 
-    // 2. Set CF_DIBV5 (Device-Independent Bitmap V5 - supports alpha channel)
-    const SIZE_T total_size = sizeof(BITMAPV5HEADER) + bitmap.pixels.size();
+    // 2. Set CF_DIBV5 (Device-Independent Bitmap V5 - supports alpha channel, bottom-up format)
+    const SIZE_T total_size = sizeof(BITMAPV5HEADER) + opaque_bitmap.pixels.size();
     HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, total_size);
     if (memory) {
         auto* data = static_cast<std::uint8_t*>(GlobalLock(memory));
         BITMAPV5HEADER header{};
         header.bV5Size = sizeof(header);
-        header.bV5Width = bitmap.width;
-        header.bV5Height = -bitmap.height;
+        header.bV5Width = W;
+        header.bV5Height = H; // Positive height = bottom-up DIB
         header.bV5Planes = 1;
         header.bV5BitCount = 32;
         header.bV5Compression = BI_BITFIELDS;
-        header.bV5SizeImage = static_cast<DWORD>(bitmap.pixels.size());
+        header.bV5SizeImage = static_cast<DWORD>(opaque_bitmap.pixels.size());
         header.bV5RedMask = 0x00FF0000;
         header.bV5GreenMask = 0x0000FF00;
         header.bV5BlueMask = 0x000000FF;
         header.bV5AlphaMask = 0xFF000000;
         header.bV5CSType = LCS_sRGB;
         std::memcpy(data, &header, sizeof(header));
-        std::memcpy(data + sizeof(header), bitmap.pixels.data(), bitmap.pixels.size());
+
+        auto* dest = data + sizeof(header);
+        for (int row = H - 1; row >= 0; --row) { // Bottom-up copy
+            const auto* src_row = opaque_bitmap.row(row).data();
+            auto* dest_row = dest + static_cast<std::size_t>(H - 1 - row) * W * 4U;
+            std::memcpy(dest_row, src_row, static_cast<std::size_t>(W) * 4U);
+        }
         GlobalUnlock(memory);
         if (!SetClipboardData(CF_DIBV5, memory)) {
             GlobalFree(memory);
         }
     }
 
-    // 3. Set CF_DIB (standard Device-Independent Bitmap - widely supported by Slack, WeChat, browser, etc.)
-    const SIZE_T dib_size = sizeof(BITMAPINFOHEADER) + bitmap.pixels.size();
+    // 3. Set CF_DIB (standard Device-Independent Bitmap, converted to 24-bit BGR bottom-up format for maximum compatibility)
+    const int stride24 = ((W * 24 + 31) / 32) * 4;
+    const SIZE_T dib_size = sizeof(BITMAPINFOHEADER) + static_cast<SIZE_T>(stride24) * H;
     HGLOBAL dib_memory = GlobalAlloc(GMEM_MOVEABLE, dib_size);
     if (dib_memory) {
         auto* dib_data = static_cast<std::uint8_t*>(GlobalLock(dib_memory));
         BITMAPINFOHEADER dib_header{};
         dib_header.biSize = sizeof(dib_header);
-        dib_header.biWidth = bitmap.width;
-        dib_header.biHeight = -bitmap.height;
+        dib_header.biWidth = W;
+        dib_header.biHeight = H; // Positive height = bottom-up DIB
         dib_header.biPlanes = 1;
-        dib_header.biBitCount = 32;
+        dib_header.biBitCount = 24; // 24-bit BGR is universally supported
         dib_header.biCompression = BI_RGB;
-        dib_header.biSizeImage = static_cast<DWORD>(bitmap.pixels.size());
+        dib_header.biSizeImage = static_cast<DWORD>(stride24 * H);
         std::memcpy(dib_data, &dib_header, sizeof(dib_header));
-        std::memcpy(dib_data + sizeof(dib_header), bitmap.pixels.data(), bitmap.pixels.size());
+
+        auto* dest = dib_data + sizeof(dib_header);
+        for (int row = H - 1; row >= 0; --row) { // Bottom-up 32-to-24 bit copy
+            const auto* src_row = opaque_bitmap.row(row).data();
+            auto* dest_row = dest + static_cast<std::size_t>(H - 1 - row) * stride24;
+            for (int col = 0; col < W; ++col) {
+                const int src_idx = col * 4;
+                const int dest_idx = col * 3;
+                dest_row[dest_idx] = src_row[src_idx];       // Blue
+                dest_row[dest_idx + 1] = src_row[src_idx + 1]; // Green
+                dest_row[dest_idx + 2] = src_row[src_idx + 2]; // Red
+            }
+        }
         GlobalUnlock(dib_memory);
         if (!SetClipboardData(CF_DIB, dib_memory)) {
             GlobalFree(dib_memory);
         }
     }
 
-    // 4. Set CF_BITMAP (Device-Dependent Bitmap - classic format)
+    // 4. Set CF_BITMAP (Device-Dependent Bitmap - classic bottom-up format)
     HDC screen = GetDC(nullptr);
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = bitmap.width;
-    info.bmiHeader.biHeight = -bitmap.height;
+    info.bmiHeader.biWidth = W;
+    info.bmiHeader.biHeight = H; // Positive height = bottom-up DIB
     info.bmiHeader.biPlanes = 1;
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
     void* bits = nullptr;
     HBITMAP hbitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (hbitmap && bits) {
-        std::memcpy(bits, bitmap.pixels.data(), bitmap.pixels.size());
+        auto* dest = static_cast<std::uint8_t*>(bits);
+        for (int row = H - 1; row >= 0; --row) { // Bottom-up copy
+            const auto* src_row = opaque_bitmap.row(row).data();
+            auto* dest_row = dest + static_cast<std::size_t>(H - 1 - row) * W * 4U;
+            std::memcpy(dest_row, src_row, static_cast<std::size_t>(W) * 4U);
+        }
         if (!SetClipboardData(CF_BITMAP, hbitmap)) {
             DeleteObject(hbitmap);
         }
@@ -243,6 +302,7 @@ bool copy_text_to_clipboard(std::wstring_view text, std::wstring* error) {
 }
 
 bool save_png(const Bitmap& bitmap, const std::filesystem::path& path, std::wstring* error) {
+    const ScopedWinrtApartment apartment(true);
     if (bitmap.empty()) {
         if (error) {
             *error = L"图像为空。";
