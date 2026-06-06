@@ -15,8 +15,9 @@ $executable = Join-Path $site "AirScreenshot.exe"
 $ocrHelper = Join-Path $site "airshot_ocr.exe"
 $latestPath = Join-Path $site "latest.json"
 $indexPath = Join-Path $site "index.html"
+$ocrManifestPath = Join-Path $site "ocr-dependencies.json"
 
-foreach ($path in @($executable, $ocrHelper, $latestPath, $indexPath)) {
+foreach ($path in @($executable, $ocrHelper, $latestPath, $indexPath, $ocrManifestPath)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "缺少发布文件：$path"
     }
@@ -86,6 +87,59 @@ $runtimeVerification = Start-Process -FilePath $executable `
 if ($runtimeVerification.ExitCode -ne 0) {
     throw "AirScreenshot.exe 自身未通过更新哈希与签名校验。"
 }
+
+$ocrPackageId = "rapidocr-onnx"
+$requiredOcrFiles = @(
+    "rapidocr_api.dll",
+    "onnxruntime.dll",
+    "rapidocr_runner.exe",
+    "models/rapidocr-v5-fast/det.onnx",
+    "models/rapidocr-v5-fast/rec.onnx",
+    "models/rapidocr-v5-fast/cls.onnx",
+    "models/rapidocr-v5-fast/dict.txt",
+    "models/rapidocr-v5-accurate/det.onnx",
+    "models/rapidocr-v5-accurate/rec.onnx",
+    "models/rapidocr-v5-accurate/cls.onnx",
+    "models/rapidocr-v5-accurate/dict.txt",
+    "models/rapidocr-v4-compat/det.onnx",
+    "models/rapidocr-v4-compat/rec.onnx",
+    "models/rapidocr-v4-compat/cls.onnx",
+    "models/rapidocr-v4-compat/dict.txt"
+)
+$ocrManifest = Get-Content -LiteralPath $ocrManifestPath -Raw | ConvertFrom-Json
+if ($ocrManifest.packageId -ne $ocrPackageId) {
+    throw "OCR 依赖清单 packageId 错误：$($ocrManifest.packageId)"
+}
+$manifestPaths = @($ocrManifest.files | ForEach-Object { $_.path })
+foreach ($relative in $requiredOcrFiles) {
+    if ($manifestPaths -notcontains $relative) {
+        throw "OCR 依赖清单缺少文件：$relative"
+    }
+}
+foreach ($entry in $ocrManifest.files) {
+    if (-not $entry.path -or $entry.path -match "(^/|^\\|:|(^|/)\.\.($|/)|(^|/)\.($|/))") {
+        throw "OCR 依赖清单包含不安全路径：$($entry.path)"
+    }
+    if ($entry.url -ne "https://mmm1h.github.io/air-screenshot/ocr/$ocrPackageId/$($entry.path)") {
+        throw "OCR 依赖清单 URL 错误：$($entry.url)"
+    }
+    if ($entry.sha256 -notmatch "^[A-Fa-f0-9]{64}$" -or $entry.sha256 -match "^0{64}$") {
+        throw "OCR 依赖清单 SHA256 无效：$($entry.path)"
+    }
+    $localPath = Join-Path (Join-Path $site "ocr\$ocrPackageId") ($entry.path -replace "/", "\")
+    if (-not (Test-Path -LiteralPath $localPath)) {
+        throw "OCR 发布目录缺少文件：$localPath"
+    }
+    $localFile = Get-Item -LiteralPath $localPath
+    if ($entry.size -le 0 -or $entry.size -ne $localFile.Length) {
+        throw "OCR 依赖文件大小不匹配：$($entry.path)"
+    }
+    $actualOcrHash = (Get-FileHash -LiteralPath $localPath -Algorithm SHA256).Hash
+    if ($entry.sha256.ToUpperInvariant() -ne $actualOcrHash) {
+        throw "OCR 依赖文件 SHA256 不匹配：$($entry.path)"
+    }
+}
+
 $mismatchedLatestPath = Join-Path ([IO.Path]::GetTempPath()) "airshot-version-mismatch-$PID.json"
 try {
     [ordered]@{

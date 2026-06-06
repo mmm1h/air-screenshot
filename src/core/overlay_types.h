@@ -21,6 +21,13 @@ enum class Tool {
     serial,
     eraser,
     blur,
+    watermark,
+};
+
+enum class TextStyle {
+    normal,
+    dark,
+    outline,
 };
 
 enum class DragMode {
@@ -43,10 +50,11 @@ struct Annotation {
     POINT end{};
     std::vector<POINT> points;
     std::wstring text;
-    COLORREF color{RGB(22, 119, 255)};
+    COLORREF color{RGB(0, 102, 255)};
     float width{3.0F};
     int alpha{255};
     int serial{};
+    TextStyle text_style{TextStyle::normal};
 };
 
 struct ToolbarButton {

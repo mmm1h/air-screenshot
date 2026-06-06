@@ -48,9 +48,18 @@ public:
     [[nodiscard]] COLORREF custom_color() const noexcept { return custom_color_; }
     [[nodiscard]] float active_width() const noexcept { return active_width_; }
     [[nodiscard]] float active_text_size() const noexcept { return active_text_size_; }
+    [[nodiscard]] TextStyle active_text_style() const noexcept { return active_text_style_; }
     [[nodiscard]] int active_highlight_alpha() const noexcept { return active_highlight_alpha_; }
+    [[nodiscard]] int mosaic_strength() const noexcept { return mosaic_strength_; }
+    [[nodiscard]] int watermark_opacity() const noexcept { return watermark_opacity_; }
+    [[nodiscard]] const std::wstring& watermark_text() const noexcept { return watermark_text_; }
     [[nodiscard]] Tool active_tool() const noexcept { return active_tool_; }
     [[nodiscard]] bool annotation_locked_tool() const noexcept { return request_.config.annotation_locked_tool; }
+    [[nodiscard]] bool mosaic_is_blur() const noexcept { return mosaic_is_blur_; }
+    [[nodiscard]] bool mosaic_is_rect() const noexcept { return mosaic_is_rect_; }
+    [[nodiscard]] bool text_size_dropdown_open() const noexcept { return text_size_dropdown_open_; }
+    [[nodiscard]] int text_size_hovered_idx() const noexcept { return text_size_hovered_idx_; }
+    [[nodiscard]] RectI get_text_size_dropdown_bounds() const noexcept;
     [[nodiscard]] std::wstring hovered_button_id() const noexcept { return hovered_button_id_; }
     [[nodiscard]] bool dragging_selection() const noexcept { return dragging_selection_; }
     [[nodiscard]] POINT cursor_pos() const noexcept { return cursor_pos_; }
@@ -65,6 +74,7 @@ private:
     void build_sub_toolbar();
     void invoke_sub(std::wstring_view id, HWND source);
     void invoke(std::wstring_view id, HWND source);
+    void apply_watermark();
     void finish_annotation();
     bool erase_annotation_at(POINT relative);
     void undo();
@@ -106,13 +116,21 @@ private:
     COLORREF active_color_{RGB(245, 34, 45)};
     COLORREF custom_color_{RGB(128, 0, 255)};
     float active_width_{4.0F};
-    float active_text_size_{22.0F};
+    float active_text_size_{18.0F};
+    TextStyle active_text_style_{TextStyle::normal};
     int active_highlight_alpha_{96};
+    int mosaic_strength_{50};
+    int watermark_opacity_{42};
+    std::wstring watermark_text_{L"Air Screenshot"};
     std::wstring hovered_button_id_;
     POINT cursor_pos_{};
     bool color_format_hex_{true};
     int selected_annotation_idx_{-1};
     Annotation original_annotation_;
+    bool mosaic_is_blur_{};
+    bool mosaic_is_rect_{};
+    bool text_size_dropdown_open_{};
+    int text_size_hovered_idx_{-1};
 
     friend class OverlayWindow;
 };

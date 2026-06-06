@@ -41,7 +41,7 @@ HWND create_scroll_border_window(HINSTANCE instance, HWND parent, const RectI& b
                     GetClientRect(hwnd, &r);
 
                     // 1. Draw selection border (Blue, 2px)
-                    HPEN pen = CreatePen(PS_SOLID, 2, RGB(22, 119, 255));
+                    HPEN pen = CreatePen(PS_SOLID, 2, RGB(0, 102, 255));
                     HGDIOBJ old_pen = SelectObject(hdc, pen);
                     HGDIOBJ old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
                     Rectangle(hdc, r.left, r.top, r.right, r.bottom);
@@ -281,9 +281,9 @@ LRESULT CALLBACK scroll_control_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 DrawTextW(mem_dc, text_buf, -1, &text_rc, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
 
                 RECT ok_rc{110, 10, 170, 40};
-                COLORREF ok_bg = RGB(22, 119, 255);
-                if (pressed_btn == 1) ok_bg = RGB(9, 88, 217);
-                else if (hover_btn == 1) ok_bg = RGB(64, 150, 255);
+                COLORREF ok_bg = RGB(0, 102, 255);
+                if (pressed_btn == 1) ok_bg = RGB(0, 77, 204);
+                else if (hover_btn == 1) ok_bg = RGB(51, 136, 255);
 
                 HBRUSH ok_brush = CreateSolidBrush(ok_bg);
                 HPEN ok_pen = CreatePen(PS_SOLID, 1, ok_bg);

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <mutex>
+#include <commctrl.h>
+#include <imm.h>
 
 namespace airshot::overlay_detail {
 
@@ -12,7 +14,38 @@ struct PromptState {
     HWND edit{};
     bool accepted{};
     std::wstring text;
+    COLORREF color{RGB(255, 255, 255)};
+    float text_size{16.0f};
+    HFONT font{};
+    HBRUSH bg_brush{};
+    bool is_light_theme{};
 };
+
+LRESULT CALLBACK edit_subclass_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_param, UINT_PTR subclass_id, DWORD_PTR ref_data) {
+    (void)subclass_id;
+    (void)ref_data;
+    if (message == WM_KEYDOWN) {
+        if (w_param == VK_RETURN) {
+            bool composing = false;
+            if (HIMC himc = ImmGetContext(window)) {
+                LONG size = ImmGetCompositionStringW(himc, GCS_COMPSTR, nullptr, 0);
+                ImmReleaseContext(window, himc);
+                if (size > 0) {
+                    composing = true;
+                }
+            }
+            if (!composing) {
+                PostMessageW(GetParent(window), WM_COMMAND, MAKEWPARAM(IDOK, 0), reinterpret_cast<LPARAM>(window));
+                return 0;
+            }
+        }
+        if (w_param == VK_ESCAPE) {
+            PostMessageW(GetParent(window), WM_COMMAND, MAKEWPARAM(IDCANCEL, 0), reinterpret_cast<LPARAM>(window));
+            return 0;
+        }
+    }
+    return DefSubclassProc(window, message, w_param, l_param);
+}
 
 LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_param) {
     auto* state = reinterpret_cast<PromptState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
@@ -26,45 +59,73 @@ LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPA
         return DefWindowProcW(window, message, w_param, l_param);
     }
     if (message == WM_CREATE) {
-        state->edit = CreateWindowExW(WS_EX_CLIENTEDGE,
+        int text_height = static_cast<int>(state->text_size);
+        int window_height = text_height + 14;
+        int window_width = 300;
+
+        state->edit = CreateWindowExW(0,
                                       L"EDIT",
                                       L"",
                                       WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                      12,
-                                      12,
-                                      380,
-                                      26,
+                                      6,
+                                      6,
+                                      window_width - 12,
+                                      window_height - 12,
                                       window,
                                       reinterpret_cast<HMENU>(100),
                                       nullptr,
                                       nullptr);
-        CreateWindowExW(0,
-                        L"BUTTON",
-                        strings::common_confirm.data(),
-                        WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                        226,
-                        54,
-                        80,
-                        28,
-                        window,
-                        reinterpret_cast<HMENU>(IDOK),
-                        nullptr,
-                        nullptr);
-        CreateWindowExW(0,
-                        L"BUTTON",
-                        strings::common_cancel.data(),
-                        WS_CHILD | WS_VISIBLE,
-                        312,
-                        54,
-                        80,
-                        28,
-                        window,
-                        reinterpret_cast<HMENU>(IDCANCEL),
-                        nullptr,
-                        nullptr);
-        SendMessageW(state->edit, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+
+        SetWindowSubclass(state->edit, edit_subclass_proc, 1, 0);
+
+        state->font = CreateFontW(
+            -text_height,
+            0, 0, 0,
+            FW_NORMAL,
+            FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            DEFAULT_PITCH | FF_DONTCARE,
+            L"Microsoft YaHei"
+        );
+        SendMessageW(state->edit, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), TRUE);
+
+        state->bg_brush = CreateSolidBrush(state->is_light_theme ? RGB(255, 255, 255) : RGB(0x1c, 0x1e, 0x22));
+
         SetFocus(state->edit);
         return 0;
+    }
+    if (message == WM_CTLCOLOREDIT) {
+        HDC hdc = reinterpret_cast<HDC>(w_param);
+        SetTextColor(hdc, state->color);
+        SetBkColor(hdc, state->is_light_theme ? RGB(255, 255, 255) : RGB(0x1c, 0x1e, 0x22));
+        return reinterpret_cast<INT_PTR>(state->bg_brush);
+    }
+    if (message == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(window, &ps);
+        RECT rect;
+        GetClientRect(window, &rect);
+        FillRect(hdc, &rect, state->bg_brush);
+
+        HPEN border_pen = CreatePen(PS_SOLID, 1, RGB(0x00, 0x66, 0xFF));
+        HGDIOBJ old_pen = SelectObject(hdc, border_pen);
+        HGDIOBJ old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        DeleteObject(border_pen);
+
+        EndPaint(window, &ps);
+        return 0;
+    }
+    if (message == WM_ACTIVATE) {
+        if (LOWORD(w_param) == WA_INACTIVE) {
+            PostMessageW(window, WM_COMMAND, MAKEWPARAM(IDOK, 0), 0);
+            return 0;
+        }
     }
     if (message == WM_COMMAND) {
         if (LOWORD(w_param) == IDOK) {
@@ -83,6 +144,13 @@ LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPA
             return 0;
         }
     }
+    if (message == WM_DESTROY) {
+        if (state->edit) {
+            RemoveWindowSubclass(state->edit, edit_subclass_proc, 1);
+        }
+        if (state->font) DeleteObject(state->font);
+        if (state->bg_brush) DeleteObject(state->bg_brush);
+    }
     if (message == WM_CLOSE) {
         DestroyWindow(window);
         return 0;
@@ -90,29 +158,54 @@ LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPA
     return DefWindowProcW(window, message, w_param, l_param);
 }
 
-std::optional<std::wstring> prompt_text(HWND owner, POINT position) {
+std::optional<std::wstring> prompt_text(HWND owner, POINT position, COLORREF color, float text_size, bool is_light_theme) {
     static std::once_flag class_flag;
     std::call_once(class_flag, [] {
         WNDCLASSEXW window_class{sizeof(window_class)};
         window_class.lpfnWndProc = text_prompt_proc;
         window_class.hInstance = GetModuleHandleW(nullptr);
-        window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        window_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        window_class.hCursor = LoadCursorW(nullptr, IDC_IBEAM);
         window_class.lpszClassName = L"AirScreenshot.TextPrompt";
         RegisterClassExW(&window_class);
     });
 
     PromptState state;
-    const int x = std::max(0, static_cast<int>(position.x) - 200);
-    const int y = std::max(0, static_cast<int>(position.y) - 60);
+    state.color = color;
+    state.text_size = text_size;
+    state.is_light_theme = is_light_theme;
+
+    int text_height = static_cast<int>(text_size);
+    int window_height = text_height + 14;
+    int window_width = 300;
+
+    int x = position.x;
+    int y = position.y;
+    HMONITOR hMonitor = MonitorFromPoint(position, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitorInfo{sizeof(MONITORINFO)};
+    if (GetMonitorInfoW(hMonitor, &monitorInfo)) {
+        const RECT& area = monitorInfo.rcWork;
+        if (x + window_width > area.right) {
+            x = area.right - window_width;
+        }
+        if (x < area.left) {
+            x = area.left;
+        }
+        if (y + window_height > area.bottom) {
+            y = area.bottom - window_height;
+        }
+        if (y < area.top) {
+            y = area.top;
+        }
+    }
+
     HWND window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                                   L"AirScreenshot.TextPrompt",
-                                  strings::prompt_text_title.data(),
-                                  WS_CAPTION | WS_SYSMENU,
+                                  L"",
+                                  WS_POPUP,
                                   x,
                                   y,
-                                  420,
-                                  130,
+                                  window_width,
+                                  window_height,
                                   owner,
                                   nullptr,
                                   GetModuleHandleW(nullptr),
@@ -122,16 +215,13 @@ std::optional<std::wstring> prompt_text(HWND owner, POINT position) {
     }
     ShowWindow(window, SW_SHOW);
     UpdateWindow(window);
+
     MSG message{};
     while (IsWindow(window) && GetMessageW(&message, nullptr, 0, 0) > 0) {
-        if (!IsDialogMessageW(window, &message)) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
     }
     return state.accepted ? std::optional(state.text) : std::nullopt;
 }
-
-
 
 }  // namespace airshot::overlay_detail

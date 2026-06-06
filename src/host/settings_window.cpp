@@ -15,6 +15,7 @@
 #include <windowsx.h>
 #include <thread>
 #include <filesystem>
+#include <dwmapi.h>
 
 namespace airshot {
 namespace {
@@ -42,6 +43,7 @@ struct SettingsState {
     AppConfig config;
     bool accepted{};
     HWND window{};
+    bool is_light_theme{};
     
     // UI state
     int active_tab{0}; // 0: 常规设置, 1: 工具栏, 2: 快捷键
@@ -107,16 +109,16 @@ struct OcrDownloadContext {
 } g_ocr_download;
 
 struct OcrEngineButton {
-    int engine;
+    std::wstring_view engine;
     const wchar_t* label;
     int left;
     int right;
 };
 
 constexpr std::array<OcrEngineButton, 3> kOcrEngineButtons{{
-    {static_cast<int>(OcrEngine::rapid_ocr), L"本地高精度", 230, 360},
-    {static_cast<int>(OcrEngine::wechat), L"微信 OCR", 370, 500},
-    {static_cast<int>(OcrEngine::system), L"系统 OCR", 510, 640},
+    {kOcrEngineRapidV5Fast, L"极速 OCR", 230, 360},
+    {kOcrEngineRapidV5Accurate, L"高精度 OCR", 370, 500},
+    {kOcrEngineRapidV4Compat, L"兼容 OCR", 510, 640},
 }};
 
 const OcrEngineButton* hit_test_ocr_engine_button(POINT pt) {
@@ -129,97 +131,6 @@ const OcrEngineButton* hit_test_ocr_engine_button(POINT pt) {
         }
     }
     return nullptr;
-}
-
-std::wstring get_wechat_install_path() {
-    HKEY hKey;
-    std::wstring install_path;
-    // 1. Check WeChat registry
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Tencent\\WeChat", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        wchar_t buf[512]{};
-        DWORD type = REG_SZ;
-        DWORD size = sizeof(buf);
-        if (RegQueryValueExW(hKey, L"InstallPath", nullptr, &type, reinterpret_cast<BYTE*>(buf), &size) == ERROR_SUCCESS) {
-            install_path = buf;
-        }
-        RegCloseKey(hKey);
-    }
-    // 2. Check Weixin registry
-    if (install_path.empty()) {
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Tencent\\Weixin", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            wchar_t buf[512]{};
-            DWORD type = REG_SZ;
-            DWORD size = sizeof(buf);
-            if (RegQueryValueExW(hKey, L"InstallPath", nullptr, &type, reinterpret_cast<BYTE*>(buf), &size) == ERROR_SUCCESS) {
-                install_path = buf;
-            }
-            RegCloseKey(hKey);
-        }
-    }
-    return install_path;
-}
-
-std::wstring find_wechat_ocr_exe_dir() {
-    const wchar_t* appdata = _wgetenv(L"APPDATA");
-    if (!appdata) return L"";
-
-    // 1. Scan WeChat 4.x (xwechat/XPlugin/Plugins/WeChatOcr)
-    std::filesystem::path ocr_root_4 = std::filesystem::path(appdata) / L"Tencent" / L"xwechat" / L"XPlugin" / L"Plugins" / L"WeChatOcr";
-    if (std::filesystem::exists(ocr_root_4)) {
-        std::filesystem::path best_dir;
-        int best_ver = -1;
-        for (const auto& entry : std::filesystem::directory_iterator(ocr_root_4)) {
-            if (entry.is_directory()) {
-                std::filesystem::path dll_path = entry.path() / L"extracted" / L"wxocr.dll";
-                if (std::filesystem::exists(dll_path)) {
-                    try {
-                        int ver = std::stoi(entry.path().filename().wstring());
-                        if (ver > best_ver) {
-                            best_ver = ver;
-                            best_dir = entry.path() / L"extracted";
-                        }
-                    } catch (...) {
-                        if (best_ver == -1) {
-                            best_dir = entry.path() / L"extracted";
-                        }
-                    }
-                }
-            }
-        }
-        if (!best_dir.empty()) {
-            return best_dir.wstring();
-        }
-    }
-
-    // 2. Scan WeChat 3.x (Tencent/WeChat/XPlugin/Plugins/ocr)
-    std::filesystem::path ocr_root_3 = std::filesystem::path(appdata) / L"Tencent" / L"WeChat" / L"XPlugin" / L"Plugins" / L"ocr";
-    if (std::filesystem::exists(ocr_root_3)) {
-        std::filesystem::path best_dir;
-        int best_ver = -1;
-        for (const auto& entry : std::filesystem::directory_iterator(ocr_root_3)) {
-            if (entry.is_directory()) {
-                std::filesystem::path exe_path = entry.path() / L"WeChatOCR.exe";
-                if (std::filesystem::exists(exe_path)) {
-                    try {
-                        int ver = std::stoi(entry.path().filename().wstring());
-                        if (ver > best_ver) {
-                            best_ver = ver;
-                            best_dir = entry.path();
-                        }
-                    } catch (...) {
-                        if (best_ver == -1) {
-                            best_dir = entry.path();
-                        }
-                    }
-                }
-            }
-        }
-        if (!best_dir.empty()) {
-            return best_dir.wstring();
-        }
-    }
-
-    return L"";
 }
 
 void start_ocr_download(HWND hwnd, std::wstring_view manifest_url) {
@@ -341,6 +252,7 @@ std::wstring get_tool_display_name(std::wstring_view id) {
     if (id == L"mosaic") return L"马赛克工具 (Mosaic Tool)";
     if (id == L"blur") return L"模糊工具 (Blur Tool)";
     if (id == L"highlight") return L"高亮工具 (Highlight Tool)";
+    if (id == L"watermark") return L"水印工具 (Watermark Tool)";
     if (id == L"text") return L"文本工具 (Text Tool)";
     if (id == L"serial") return L"步骤序号 (Step Serial)";
     if (id == L"eraser") return L"橡皮擦 (Eraser)";
@@ -355,10 +267,24 @@ std::wstring get_tool_display_name(std::wstring_view id) {
     return std::wstring(id);
 }
 
+void discard_resources(SettingsState* state);
+
 bool ensure_resources(SettingsState* state) {
+    const bool current_theme_is_light = should_use_light_theme(state->config.theme);
     if (state->render_target) {
-        return true;
+        if (state->is_light_theme == current_theme_is_light) {
+            return true;
+        }
+        discard_resources(state);
     }
+    state->is_light_theme = current_theme_is_light;
+
+    if (state->window) {
+        BOOL use_dark = !state->is_light_theme;
+        DwmSetWindowAttribute(state->window, 20, &use_dark, sizeof(use_dark));
+        DwmSetWindowAttribute(state->window, 19, &use_dark, sizeof(use_dark));
+    }
+
     RECT rect{};
     GetClientRect(state->window, &rect);
     const D2D1_SIZE_U size = D2D1::SizeU(static_cast<UINT32>(rect.right - rect.left),
@@ -384,16 +310,29 @@ bool ensure_resources(SettingsState* state) {
     state->render_target->SetDpi(dpi, dpi);
 
     // Create Brushes
-    state->render_target->CreateSolidColorBrush(D2D1::ColorF(30.0f / 255.0f, 35.0f / 255.0f, 43.0f / 255.0f), state->bg_brush.GetAddressOf());
-    state->render_target->CreateSolidColorBrush(D2D1::ColorF(24.0f / 255.0f, 28.0f / 255.0f, 34.0f / 255.0f), state->sidebar_bg_brush.GetAddressOf());
-    state->render_target->CreateSolidColorBrush(D2D1::ColorF(240.0f / 255.0f, 240.0f / 255.0f, 240.0f / 255.0f), state->text_white_brush.GetAddressOf());
-    state->render_target->CreateSolidColorBrush(D2D1::ColorF(150.0f / 255.0f, 160.0f / 255.0f, 175.0f / 255.0f), state->text_grey_brush.GetAddressOf());
-    state->render_target->CreateSolidColorBrush(D2D1::ColorF(22.0f / 255.0f, 119.0f / 255.0f, 255.0f / 255.0f), state->blue_brush.GetAddressOf());
-    state->render_target->CreateSolidColorBrush(D2D1::ColorF(64.0f / 255.0f, 150.0f / 255.0f, 255.0f / 255.0f), state->hover_blue_brush.GetAddressOf());
-    state->render_target->CreateSolidColorBrush(D2D1::ColorF(45.0f / 255.0f, 52.0f / 255.0f, 64.0f / 255.0f), state->border_brush.GetAddressOf());
-    state->render_target->CreateSolidColorBrush(D2D1::ColorF(36.0f / 255.0f, 42.0f / 255.0f, 51.0f / 255.0f), state->active_tab_brush.GetAddressOf());
-    state->render_target->CreateSolidColorBrush(D2D1::ColorF(38.0f / 255.0f, 44.0f / 255.0f, 54.0f / 255.0f), state->control_bg_brush.GetAddressOf());
-    state->render_target->CreateSolidColorBrush(D2D1::ColorF(76.0f / 255.0f, 82.0f / 255.0f, 93.0f / 255.0f), state->switch_track_off_brush.GetAddressOf());
+    if (state->is_light_theme) {
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xF5F6F7), state->bg_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xEAEBEF), state->sidebar_bg_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x1F2329), state->text_white_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x646A73), state->text_grey_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x0066FF), state->blue_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x3385FF), state->hover_blue_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xDEE0E3), state->border_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xD2D6DC), state->active_tab_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF), state->control_bg_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xD2D6DC), state->switch_track_off_brush.GetAddressOf());
+    } else {
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(18.0f / 255.0f, 19.0f / 255.0f, 22.0f / 255.0f), state->bg_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(24.0f / 255.0f, 25.0f / 255.0f, 29.0f / 255.0f), state->sidebar_bg_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(240.0f / 255.0f, 240.0f / 255.0f, 240.0f / 255.0f), state->text_white_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(150.0f / 255.0f, 160.0f / 255.0f, 175.0f / 255.0f), state->text_grey_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0.0f / 255.0f, 102.0f / 255.0f, 255.0f / 255.0f), state->blue_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(51.0f / 255.0f, 136.0f / 255.0f, 255.0f / 255.0f), state->hover_blue_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(38.0f / 255.0f, 41.0f / 255.0f, 48.0f / 255.0f), state->border_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(30.0f / 255.0f, 32.0f / 255.0f, 38.0f / 255.0f), state->active_tab_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(28.0f / 255.0f, 30.0f / 255.0f, 34.0f / 255.0f), state->control_bg_brush.GetAddressOf());
+        state->render_target->CreateSolidColorBrush(D2D1::ColorF(76.0f / 255.0f, 82.0f / 255.0f, 93.0f / 255.0f), state->switch_track_off_brush.GetAddressOf());
+    }
 
     // Create Text Formats
     state->dwrite_factory->CreateTextFormat(L"Microsoft YaHei", nullptr, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16.0f, L"zh-CN", state->title_format.GetAddressOf());
@@ -446,10 +385,11 @@ void draw_button(SettingsState* state, int x1, int y1, int x2, int y2, const wch
     
     if (is_hovered) {
         state->render_target->FillRoundedRectangle(rounded, state->hover_blue_brush.Get());
+        state->render_target->DrawRoundedRectangle(rounded, state->hover_blue_brush.Get(), 1.0f);
     } else {
         state->render_target->FillRoundedRectangle(rounded, state->blue_brush.Get());
+        state->render_target->DrawRoundedRectangle(rounded, state->border_brush.Get(), 1.0f);
     }
-    state->render_target->DrawRoundedRectangle(rounded, state->border_brush.Get(), 1.0f);
 
     state->render_target->DrawTextW(label, static_cast<UINT32>(wcslen(label)), state->text_format.Get(), rect, state->text_white_brush.Get());
 }
@@ -513,12 +453,16 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                 state->render_target->BeginDraw();
                 
                 // Clear background
-                state->render_target->Clear(D2D1::ColorF(30.0f / 255.0f, 35.0f / 255.0f, 43.0f / 255.0f));
+                if (state->is_light_theme) {
+                    state->render_target->Clear(D2D1::ColorF(0xF5F6F7));
+                } else {
+                    state->render_target->Clear(D2D1::ColorF(18.0f / 255.0f, 19.0f / 255.0f, 22.0f / 255.0f));
+                }
 
                 // 1. Draw Left Sidebar background
-                D2D1_RECT_F sidebar_rect = D2D1::RectF(0.0f, 0.0f, 200.0f, 620.0f);
+                D2D1_RECT_F sidebar_rect = D2D1::RectF(0.0f, 0.0f, 200.0f, 700.0f);
                 state->render_target->FillRectangle(sidebar_rect, state->sidebar_bg_brush.Get());
-                state->render_target->DrawLine(D2D1::Point2F(200.0f, 0.0f), D2D1::Point2F(200.0f, 620.0f), state->border_brush.Get(), 1.0f);
+                state->render_target->DrawLine(D2D1::Point2F(200.0f, 0.0f), D2D1::Point2F(200.0f, 700.0f), state->border_brush.Get(), 1.0f);
 
                 // Sidebar Tab items
                 const wchar_t* tab_labels[] = { L"常规设置", L"工具栏设置", L"全局与工具快捷键" };
@@ -592,8 +536,9 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                     D2D1_RECT_F ocr_label_rect = D2D1::RectF(230.0f, 492.0f, 420.0f, 512.0f);
                     state->render_target->DrawTextW(L"OCR 默认引擎", static_cast<UINT32>(wcslen(L"OCR 默认引擎")), state->small_format.Get(), ocr_label_rect, state->text_grey_brush.Get());
 
+                    const std::wstring current_ocr_engine = normalize_ocr_engine(state->config.ocr_engine);
                     for (const auto& button : kOcrEngineButtons) {
-                        const bool selected = state->config.ocr_engine == button.engine;
+                        const bool selected = current_ocr_engine == button.engine;
                         const bool hovered = state->mouse_pos.x >= button.left && state->mouse_pos.x <= button.right &&
                                              state->mouse_pos.y >= 515 && state->mouse_pos.y <= 545;
                         draw_choice_button(state, button.left, 515, button.right, 545, button.label, selected, hovered);
@@ -642,7 +587,30 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                         state->render_target->DrawTextW(status_text.c_str(), static_cast<UINT32>(status_text.size()), state->small_format.Get(), status_rect, state->text_grey_brush.Get());
                     }
 
-                    D2D1_RECT_F note_rect = D2D1::RectF(230.0f, 590.0f, 700.0f, 615.0f);
+                    // Theme Settings
+                    D2D1_RECT_F theme_label_rect = D2D1::RectF(230.0f, 595.0f, 420.0f, 615.0f);
+                    state->render_target->DrawTextW(L"应用主题", static_cast<UINT32>(wcslen(L"应用主题")), state->small_format.Get(), theme_label_rect, state->text_grey_brush.Get());
+
+                    struct ThemeButton {
+                        std::wstring_view theme;
+                        const wchar_t* label;
+                        int left;
+                        int right;
+                    };
+                    const ThemeButton theme_buttons[] = {
+                        { L"system", L"跟随系统", 230, 360 },
+                        { L"light", L"浅色模式", 370, 500 },
+                        { L"dark", L"深色模式", 510, 640 }
+                    };
+
+                    for (const auto& btn : theme_buttons) {
+                        const bool selected = state->config.theme == btn.theme;
+                        const bool hovered = state->mouse_pos.x >= btn.left && state->mouse_pos.x <= btn.right &&
+                                             state->mouse_pos.y >= 620 && state->mouse_pos.y <= 650;
+                        draw_choice_button(state, btn.left, 620, btn.right, 650, btn.label, selected, hovered);
+                    }
+
+                    D2D1_RECT_F note_rect = D2D1::RectF(230.0f, 660.0f, 700.0f, 695.0f);
                     state->render_target->DrawTextW(strings::settings_note.data(), static_cast<UINT32>(strings::settings_note.size()), state->small_format.Get(), note_rect, state->text_grey_brush.Get());
 
                 } else if (state->active_tab == 1) {
@@ -732,13 +700,13 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                 }
 
                 // 4. Draw Footer (Dividing Line & Save/Cancel buttons)
-                state->render_target->DrawLine(D2D1::Point2F(0.0f, 620.0f), D2D1::Point2F(740.0f, 620.0f), state->border_brush.Get(), 1.0f);
+                state->render_target->DrawLine(D2D1::Point2F(0.0f, 700.0f), D2D1::Point2F(740.0f, 700.0f), state->border_brush.Get(), 1.0f);
 
-                bool save_hovered = (state->mouse_pos.x >= 500 && state->mouse_pos.x <= 600 && state->mouse_pos.y >= 640 && state->mouse_pos.y <= 676);
-                draw_button(state, 500, 640, 600, 676, L"保存", save_hovered);
+                bool save_hovered = (state->mouse_pos.x >= 500 && state->mouse_pos.x <= 600 && state->mouse_pos.y >= 715 && state->mouse_pos.y <= 745);
+                draw_button(state, 500, 715, 600, 745, L"保存", save_hovered);
 
-                bool cancel_hovered = (state->mouse_pos.x >= 615 && state->mouse_pos.x <= 715 && state->mouse_pos.y >= 640 && state->mouse_pos.y <= 676);
-                draw_button(state, 615, 640, 715, 676, L"取消", cancel_hovered);
+                bool cancel_hovered = (state->mouse_pos.x >= 615 && state->mouse_pos.x <= 715 && state->mouse_pos.y >= 715 && state->mouse_pos.y <= 745);
+                draw_button(state, 615, 715, 715, 745, L"取消", cancel_hovered);
 
                 HRESULT end_hr = state->render_target->EndDraw();
                 if (end_hr == D2DERR_RECREATE_TARGET) {
@@ -780,7 +748,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
             }
 
             // Check footer buttons
-            if (pt.y >= 640 && pt.y <= 676) {
+            if (pt.y >= 715 && pt.y <= 745) {
                 if (pt.x >= 500 && pt.x <= 600) {
                     state->accepted = true;
                     PostMessageW(window, WM_CLOSE, 0, 0);
@@ -851,7 +819,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                         is_downloading = g_ocr_download.is_downloading;
                     }
                     if (!is_downloading) {
-                        state->config.ocr_engine = button->engine;
+                        state->config.ocr_engine = std::wstring(button->engine);
                         {
                             std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
                             g_ocr_download.error.clear();
@@ -873,6 +841,24 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                         InvalidateRect(window, nullptr, TRUE);
                     }
                     return 0;
+                }
+                // Theme buttons click handling (y: 620..650)
+                if (pt.y >= 620 && pt.y <= 650) {
+                    if (pt.x >= 230 && pt.x <= 360) {
+                        state->config.theme = L"system";
+                        InvalidateRect(window, nullptr, TRUE);
+                        return 0;
+                    }
+                    if (pt.x >= 370 && pt.x <= 500) {
+                        state->config.theme = L"light";
+                        InvalidateRect(window, nullptr, TRUE);
+                        return 0;
+                    }
+                    if (pt.x >= 510 && pt.x <= 640) {
+                        state->config.theme = L"dark";
+                        InvalidateRect(window, nullptr, TRUE);
+                        return 0;
+                    }
                 }
             } else if (state->active_tab == 1) {
                 std::vector<std::wstring> current_tools = split_by_comma(state->config.toolbar_order);
@@ -1020,7 +1006,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                 }
             }
             // Check footer buttons
-            if (pt.y >= 640 && pt.y <= 676 && ((pt.x >= 500 && pt.x <= 600) || (pt.x >= 615 && pt.x <= 715))) {
+            if (pt.y >= 715 && pt.y <= 745 && ((pt.x >= 500 && pt.x <= 600) || (pt.x >= 615 && pt.x <= 715))) {
                 is_hovering_interactive = true;
             }
             // Check content area elements
@@ -1069,6 +1055,10 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                     if (status.can_download && !is_downloading) {
                         is_hovering_interactive = true;
                     }
+                }
+                // Theme buttons hover check (y: 620..650)
+                if (pt.y >= 620 && pt.y <= 650 && ((pt.x >= 230 && pt.x <= 360) || (pt.x >= 370 && pt.x <= 500) || (pt.x >= 510 && pt.x <= 640))) {
+                    is_hovering_interactive = true;
                 }
             } else if (state->active_tab == 1) {
                 std::vector<std::wstring> current_tools = split_by_comma(state->config.toolbar_order);
@@ -1151,7 +1141,7 @@ bool show_settings_window(HWND owner, AppConfig& config) {
         window_class.lpfnWndProc = settings_proc;
         window_class.hInstance = GetModuleHandleW(nullptr);
         window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        window_class.hbrBackground = CreateSolidBrush(RGB(30, 35, 43));
+        window_class.hbrBackground = CreateSolidBrush(RGB(18, 19, 22));
         window_class.lpszClassName = L"AirScreenshot.Settings";
         RegisterClassExW(&window_class);
     });
@@ -1159,7 +1149,7 @@ bool show_settings_window(HWND owner, AppConfig& config) {
     SettingsState state;
     state.config = config;
     constexpr int window_width = 740;
-    constexpr int window_height = 720;
+    constexpr int window_height = 760;
     UINT dpi = owner ? GetDpiForWindow(owner) : 96;
     if (dpi == 0) {
         dpi = 96;
@@ -1204,6 +1194,12 @@ bool show_settings_window(HWND owner, AppConfig& config) {
     if (!window) {
         return false;
     }
+
+    BOOL use_dark = !should_use_light_theme(config.theme);
+    DwmSetWindowAttribute(window, 20, &use_dark, sizeof(use_dark));
+    DwmSetWindowAttribute(window, 19, &use_dark, sizeof(use_dark));
+    DWORD corner_preference = 2; // DWMWCP_ROUND
+    DwmSetWindowAttribute(window, 33, &corner_preference, sizeof(corner_preference));
     EnableWindow(owner, FALSE);
     ShowWindow(window, SW_SHOW);
     UpdateWindow(window);

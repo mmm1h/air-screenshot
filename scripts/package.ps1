@@ -1,6 +1,6 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
-    [string]$Version = "0.2.1",
+    [string]$Version = "0.2.2",
     [switch]$Sign,
     [string]$CertPath,
     [string]$CertPassword,
@@ -64,7 +64,7 @@ $index = $index.Replace("__SEMVER__", $Version).Replace("__DOWNLOAD_URL__", $Dow
 Set-Content -LiteralPath (Join-Path $site "index.html") -Value $index -Encoding utf8NoBOM
 Set-Content -LiteralPath (Join-Path $site ".nojekyll") -Value "" -Encoding ascii
 
-$ocrPackageId = "rapidocr-ppocrv5-mobile-v1"
+$ocrPackageId = "rapidocr-onnx"
 $ocrSource = Join-Path $root "dist\ocr-dependencies\$ocrPackageId"
 if (Test-Path -LiteralPath $ocrSource) {
     $ocrTarget = Join-Path $site "ocr\$ocrPackageId"

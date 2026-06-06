@@ -4,14 +4,11 @@
 
 namespace airshot {
 
-enum class OcrEngine : int {
-    system = 0,
-    wechat = 1,
-    rapid_ocr = 2,
-};
-
-inline constexpr int kDefaultOcrEngine = static_cast<int>(OcrEngine::rapid_ocr);
-inline constexpr wchar_t kRapidOcrPackageId[] = L"rapidocr-ppocrv5-mobile-v1";
+inline constexpr std::wstring_view kOcrEngineRapidV5Fast = L"rapidocr-v5-fast";
+inline constexpr std::wstring_view kOcrEngineRapidV5Accurate = L"rapidocr-v5-accurate";
+inline constexpr std::wstring_view kOcrEngineRapidV4Compat = L"rapidocr-v4-compat";
+inline constexpr std::wstring_view kDefaultOcrEngine = kOcrEngineRapidV5Fast;
+inline constexpr wchar_t kRapidOcrOnnxPackageId[] = L"rapidocr-onnx";
 inline constexpr wchar_t kDefaultOcrDependencyManifestUrl[] =
     L"https://mmm1h.github.io/air-screenshot/ocr-dependencies.json";
 
@@ -24,7 +21,7 @@ struct AppConfig {
     bool start_at_login{true};
     bool global_ocr_enabled{false};
     bool notifications_enabled{false};
-    int ocr_engine{kDefaultOcrEngine};
+    std::wstring ocr_engine{std::wstring(kDefaultOcrEngine)};
     std::wstring ocr_download_url{kDefaultOcrDependencyManifestUrl};
     std::wstring capture_hotkey{L"Ctrl+Alt+A"};
     std::wstring global_ocr_hotkey{L"Ctrl+Alt+O"};
@@ -32,7 +29,8 @@ struct AppConfig {
     std::wstring default_output{L"clipboard"};
     std::wstring custom_color{L"#8000FF"};
     std::wstring annotation_hidden_tools;
-    std::wstring toolbar_order{L"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,highlight,text,serial,eraser,undo,redo,ocr,scroll,pin,copy,save,close"};
+    std::wstring theme{L"system"};
+    std::wstring toolbar_order{L"rect,ellipse,line,arrow,pen,text,serial,mosaic,highlight,watermark,pin,ocr,select,scroll,eraser,undo,redo,save,close,copy"};
     std::wstring text_font_family{L"Microsoft YaHei"};
     bool text_font_bold{false};
     bool text_font_italic{false};
@@ -57,7 +55,10 @@ struct Hotkey {
     UINT virtual_key{};
 };
 
+[[nodiscard]] bool is_windows_system_light_theme();
+[[nodiscard]] bool should_use_light_theme(std::wstring_view theme_config);
 [[nodiscard]] std::optional<Hotkey> parse_hotkey(std::wstring_view value);
+[[nodiscard]] std::wstring normalize_ocr_engine(std::wstring_view value);
 [[nodiscard]] std::wstring normalize_annotation_hidden_tools(std::wstring_view value);
 [[nodiscard]] bool annotation_tool_hidden(std::wstring_view hidden_tools, std::wstring_view tool_id);
 [[nodiscard]] std::wstring config_to_json(const AppConfig& config);

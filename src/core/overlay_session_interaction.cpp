@@ -1,13 +1,24 @@
 #include "overlay_session.h"
 
+#include <array>
+
 namespace airshot::overlay_detail {
 namespace {
+
+constexpr std::array<float, 13> kTextSizes{12.0F, 14.0F, 16.0F, 18.0F, 20.0F, 24.0F, 28.0F,
+                                           32.0F, 36.0F, 48.0F, 64.0F, 72.0F, 96.0F};
+constexpr int kTextSizeDropdownRowHeight = 32;
 
 bool tool_uses_points(Tool tool) {
     return tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::eraser || tool == Tool::blur;
 }
 
 bool annotation_has_size(const Annotation& annotation) {
+    if (annotation.tool == Tool::mosaic || annotation.tool == Tool::blur) {
+        if (annotation.points.empty()) {
+            return annotation.start.x != annotation.end.x || annotation.start.y != annotation.end.y;
+        }
+    }
     if (tool_uses_points(annotation.tool)) {
         return annotation.points.size() > 1;
     }
@@ -65,6 +76,9 @@ bool hit_annotation(const Annotation& annotation, POINT point) {
         case Tool::mosaic:
         case Tool::highlight:
         case Tool::blur:
+            if ((annotation.tool == Tool::mosaic || annotation.tool == Tool::blur) && annotation.points.empty()) {
+                return bounds.normalized().contains(point);
+            }
             return near_polyline(point, annotation.points, threshold + ((annotation.tool == Tool::mosaic || annotation.tool == Tool::blur) ? 10.0 : 0.0));
         case Tool::text:
             return RectI{annotation.start.x, annotation.start.y, annotation.start.x + 160, annotation.start.y + 32}.contains(point);
@@ -79,6 +93,14 @@ bool tool_supports_width(Tool tool) {
     return tool == Tool::rectangle || tool == Tool::ellipse || tool == Tool::line || tool == Tool::arrow ||
            tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::eraser ||
            tool == Tool::blur;
+}
+
+int slider_value_from_point(const ToolbarButton& button, POINT point) {
+    const int track_left = button.bounds.left + 88;
+    const int track_right = button.bounds.right - 42;
+    const int track_width = std::max(1, track_right - track_left);
+    const int raw = static_cast<int>(std::lround((point.x - track_left) * 100.0 / track_width));
+    return std::clamp(raw, 0, 100);
 }
 
 }  // namespace
@@ -188,6 +210,37 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
         return;
     }
     if (selection_complete_) {
+        if (text_size_dropdown_open_) {
+            RectI dropdown_bounds = get_text_size_dropdown_bounds();
+            if (dropdown_bounds.contains(point)) {
+                int local_y = point.y - dropdown_bounds.top;
+                int idx = local_y / kTextSizeDropdownRowHeight;
+                if (idx >= 0 && idx < static_cast<int>(kTextSizes.size())) {
+                    active_text_size_ = kTextSizes[static_cast<std::size_t>(idx)];
+                }
+                text_size_dropdown_open_ = false;
+                text_size_hovered_idx_ = -1;
+                build_sub_toolbar();
+                invalidate_all();
+                return;
+            } else {
+                text_size_dropdown_open_ = false;
+                text_size_hovered_idx_ = -1;
+                invalidate_all();
+
+                bool clicked_dropdown_btn = false;
+                for (const auto& button : sub_toolbar_) {
+                    if (button.id == L"text_size_btn" && button.bounds.contains(point)) {
+                        clicked_dropdown_btn = true;
+                        break;
+                    }
+                }
+                if (clicked_dropdown_btn) {
+                    return;
+                }
+            }
+        }
+
         for (const auto& button : toolbar_) {
             if (button.id == L"|") continue;
             if (button.bounds.contains(point)) {
@@ -198,6 +251,16 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
         for (const auto& button : sub_toolbar_) {
             if (button.id == L"|") continue;
             if (button.bounds.contains(point)) {
+                if (button.id == L"mosaic_strength_slider") {
+                    mosaic_strength_ = slider_value_from_point(button, point);
+                    invalidate_all();
+                    return;
+                }
+                if (button.id == L"watermark_opacity_slider") {
+                    watermark_opacity_ = slider_value_from_point(button, point);
+                    invalidate_all();
+                    return;
+                }
                 invoke_sub(button.id, source);
                 invalidate_all();
                 return;
@@ -238,11 +301,24 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
                 return;
             }
             if (active_tool_ == Tool::text) {
-                if (auto text = prompt_text(source, point)) {
+                bool is_light = should_use_light_theme(request_.config.theme);
+                if (auto text = prompt_text(source, point, active_color_, active_text_size_, is_light)) {
                     discard_redo();
-                    annotations_.push_back({Tool::text, relative, relative, {}, std::move(*text), active_color_, active_text_size_});
+                    Annotation annotation;
+                    annotation.tool = Tool::text;
+                    annotation.start = relative;
+                    annotation.end = relative;
+                    annotation.text = std::move(*text);
+                    annotation.color = active_color_;
+                    annotation.width = active_text_size_;
+                    annotation.text_style = active_text_style_;
+                    annotations_.push_back(std::move(annotation));
                     finish_annotation();
                 }
+                return;
+            }
+            if (active_tool_ == Tool::watermark) {
+                apply_watermark();
                 return;
             }
             if (active_tool_ == Tool::serial) {
@@ -276,9 +352,12 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
                         {},
                         active_color_,
                         active_width_,
-                        active_tool_ == Tool::highlight ? active_highlight_alpha_ : 255};
+                        active_tool_ == Tool::highlight ? active_highlight_alpha_ :
+                        ((active_tool_ == Tool::mosaic || active_tool_ == Tool::blur) ? mosaic_strength_ : 255)};
             if (tool_uses_points(active_tool_)) {
-                preview_.points.push_back(relative);
+                if (!((active_tool_ == Tool::mosaic || active_tool_ == Tool::blur) && mosaic_is_rect_)) {
+                    preview_.points.push_back(relative);
+                }
             }
             current_drag_mode_ = DragMode::annotate;
             SetCapture(source);
@@ -304,6 +383,30 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
 
 void OverlaySession::on_mouse_move(POINT point) {
     cursor_pos_ = point;
+    if (selection_complete_ && text_size_dropdown_open_) {
+        RectI dropdown_bounds = get_text_size_dropdown_bounds();
+        if (dropdown_bounds.contains(point)) {
+            int local_y = point.y - dropdown_bounds.top;
+            int idx = local_y / kTextSizeDropdownRowHeight;
+            if (idx >= 0 && idx < static_cast<int>(kTextSizes.size())) {
+                if (text_size_hovered_idx_ != idx) {
+                    text_size_hovered_idx_ = idx;
+                    invalidate_all();
+                }
+            }
+            if (!hovered_button_id_.empty()) {
+                hovered_button_id_ = L"";
+                invalidate_all();
+            }
+            return;
+        } else {
+            if (text_size_hovered_idx_ != -1) {
+                text_size_hovered_idx_ = -1;
+                invalidate_all();
+            }
+        }
+    }
+
     if (selection_complete_ && drawing_annotation_) {
         const POINT relative{point.x - selection_.left, point.y - selection_.top};
         preview_.end = relative;
@@ -314,9 +417,11 @@ void OverlaySession::on_mouse_move(POINT point) {
             return;
         }
         if (tool_uses_points(preview_.tool) && selection_.contains(point)) {
-            if (preview_.points.empty() || std::abs(relative.x - preview_.points.back().x) > 2 ||
-                std::abs(relative.y - preview_.points.back().y) > 2) {
-                preview_.points.push_back(relative);
+            if (!((preview_.tool == Tool::mosaic || preview_.tool == Tool::blur) && mosaic_is_rect_)) {
+                if (preview_.points.empty() || std::abs(relative.x - preview_.points.back().x) > 2 ||
+                    std::abs(relative.y - preview_.points.back().y) > 2) {
+                    preview_.points.push_back(relative);
+                }
             }
         }
         invalidate_all();
@@ -546,17 +651,17 @@ void OverlaySession::on_key_down(HWND source, WPARAM key) {
         auto hotkey = parse_hotkey(shortcut_str);
         if (!hotkey) return false;
         if (hotkey->virtual_key != k) return false;
-        
+
         bool ctrl = (hotkey->modifiers & MOD_CONTROL) != 0;
         bool alt = (hotkey->modifiers & MOD_ALT) != 0;
         bool shift = (hotkey->modifiers & MOD_SHIFT) != 0;
         bool win = (hotkey->modifiers & MOD_WIN) != 0;
-        
+
         bool actual_ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         bool actual_alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
         bool actual_shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         bool actual_win = (GetKeyState(VK_LWIN) & 0x8000) != 0 || (GetKeyState(VK_RWIN) & 0x8000) != 0;
-        
+
         return ctrl == actual_ctrl && alt == actual_alt && shift == actual_shift && win == actual_win;
     };
 
@@ -680,12 +785,54 @@ void OverlaySession::invalidate_all() const {
     return hover_;
 }
 
-[[nodiscard]] bool OverlaySession::is_over_toolbar(POINT point) const noexcept {
-    for (const auto& button : toolbar_) {
-        if (button.bounds.contains(point)) return true;
-    }
+RectI OverlaySession::get_text_size_dropdown_bounds() const noexcept {
     for (const auto& button : sub_toolbar_) {
-        if (button.bounds.contains(point)) return true;
+        if (button.id == L"text_size_btn") {
+            const int card_width = 86;
+            const int card_height = static_cast<int>(kTextSizes.size()) * kTextSizeDropdownRowHeight;
+            int x = button.bounds.left;
+            int y = button.bounds.bottom + 4;
+            if (y + card_height > virtual_bounds_.bottom) {
+                y = button.bounds.top - 4 - card_height;
+            }
+            return RectI{x, y, x + card_width, y + card_height};
+        }
+    }
+    return {};
+}
+
+[[nodiscard]] bool OverlaySession::is_over_toolbar(POINT point) const noexcept {
+    if (selection_complete_ && text_size_dropdown_open_) {
+        RectI dropdown_bounds = get_text_size_dropdown_bounds();
+        if (dropdown_bounds.contains(point)) return true;
+    }
+    if (!toolbar_.empty()) {
+        RectI bounds = toolbar_.front().bounds;
+        for (const auto& btn : toolbar_) {
+            bounds.left = std::min(bounds.left, btn.bounds.left);
+            bounds.top = std::min(bounds.top, btn.bounds.top);
+            bounds.right = std::max(bounds.right, btn.bounds.right);
+            bounds.bottom = std::max(bounds.bottom, btn.bounds.bottom);
+        }
+        bounds.left -= 22; // 8px padding + 14px drag handle
+        bounds.right += 8;
+        bounds.top -= 8;
+        bounds.bottom += 8;
+        if (bounds.contains(point)) return true;
+    }
+    if (!sub_toolbar_.empty()) {
+        RectI bounds = sub_toolbar_.front().bounds;
+        for (const auto& btn : sub_toolbar_) {
+            bounds.left = std::min(bounds.left, btn.bounds.left);
+            bounds.top = std::min(bounds.top, btn.bounds.top);
+            bounds.right = std::max(bounds.right, btn.bounds.right);
+            bounds.bottom = std::max(bounds.bottom, btn.bounds.bottom);
+        }
+        bounds.left -= 6;
+        bounds.right += 6;
+        bounds.top -= 6;
+        bounds.bottom += 6;
+        if (bounds.contains(point)) return true;
     }
     return false;
 }
@@ -770,7 +917,7 @@ bool OverlaySession::hit_test_annotation(POINT relative) const {
 void OverlaySession::on_mouse_wheel(short delta) {
     if (active_tool_ == Tool::text) {
         float step = delta > 0 ? 2.0F : -2.0F;
-        active_text_size_ = std::clamp(active_text_size_ + step, 12.0F, 72.0F);
+        active_text_size_ = std::clamp(active_text_size_ + step, 12.0F, 96.0F);
         if (selected_annotation_idx_ != -1 && static_cast<std::size_t>(selected_annotation_idx_) < annotations_.size()) {
             if (annotations_[selected_annotation_idx_].tool == Tool::text) {
                 annotations_[selected_annotation_idx_].width = active_text_size_;
@@ -791,7 +938,7 @@ void OverlaySession::on_mouse_wheel(short delta) {
 
 void OverlaySession::show_quick_menu(HWND hwnd, POINT pt) {
     HMENU menu = CreatePopupMenu();
-    
+
     // Tools Submenu
     HMENU tools_menu = CreatePopupMenu();
     AppendMenuW(tools_menu, MF_STRING, 101, L"选择工具 (Select)\tSelect");
@@ -806,10 +953,11 @@ void OverlaySession::show_quick_menu(HWND hwnd, POINT pt) {
     AppendMenuW(tools_menu, MF_STRING, 110, L"文本 (Text)\tText");
     AppendMenuW(tools_menu, MF_STRING, 111, L"序号 (Serial)\tSerial");
     AppendMenuW(tools_menu, MF_STRING, 112, L"橡皮擦 (Eraser)\tEraser");
-    
+    AppendMenuW(tools_menu, MF_STRING, 113, L"水印 (Watermark)");
+
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(tools_menu), L"工具 (Tools)");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    
+
     AppendMenuW(menu, MF_STRING, 1, L"复制到剪贴板 (Copy)\tCtrl+C / Enter");
     AppendMenuW(menu, MF_STRING, 2, L"保存到文件 (Save)\tCtrl+S");
     AppendMenuW(menu, MF_STRING, 3, L"贴图 (Pin)");
@@ -817,7 +965,7 @@ void OverlaySession::show_quick_menu(HWND hwnd, POINT pt) {
         AppendMenuW(menu, MF_STRING, 4, L"屏幕识字 (OCR)\tShift+C");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    
+
     AppendMenuW(menu, MF_STRING, 5, L"撤销 (Undo)\tCtrl+Z");
     AppendMenuW(menu, MF_STRING, 6, L"重做 (Redo)\tCtrl+Y");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -842,7 +990,7 @@ void OverlaySession::show_quick_menu(HWND hwnd, POINT pt) {
         redo();
     } else if (selection == 7) {
         finish({ExitCode::user_cancelled, L"已取消。"});
-    } else if (selection >= 101 && selection <= 112) {
+    } else if (selection >= 101 && selection <= 113) {
         Tool chosen_tool = Tool::none;
         switch (selection) {
             case 101: chosen_tool = Tool::select; break;
@@ -857,6 +1005,7 @@ void OverlaySession::show_quick_menu(HWND hwnd, POINT pt) {
             case 110: chosen_tool = Tool::text; break;
             case 111: chosen_tool = Tool::serial; break;
             case 112: chosen_tool = Tool::eraser; break;
+            case 113: chosen_tool = Tool::watermark; break;
         }
         active_tool_ = chosen_tool;
         selected_annotation_idx_ = -1;

@@ -235,4 +235,91 @@ void blur_circle(Bitmap& bitmap, POINT center, int radius, int blur_radius) {
     }
 }
 
+void pixelate_rect(Bitmap& bitmap, const RectI& rect, int block_size) {
+    if (bitmap.empty() || block_size <= 1) {
+        return;
+    }
+    const RectI normalized = rect.normalized();
+    const int min_x = std::max(0, normalized.left);
+    const int min_y = std::max(0, normalized.top);
+    const int max_x = std::min(bitmap.width, normalized.right);
+    const int max_y = std::min(bitmap.height, normalized.bottom);
+
+    for (int block_y = min_y; block_y < max_y; block_y += block_size) {
+        for (int block_x = min_x; block_x < max_x; block_x += block_size) {
+            std::uint64_t blue = 0;
+            std::uint64_t green = 0;
+            std::uint64_t red = 0;
+            std::uint64_t alpha = 0;
+            std::uint64_t count = 0;
+            const int end_y = std::min(max_y, block_y + block_size);
+            const int end_x = std::min(max_x, block_x + block_size);
+            for (int y = block_y; y < end_y; ++y) {
+                for (int x = block_x; x < end_x; ++x) {
+                    const auto* pixel = bitmap.row(y).data() + x * 4;
+                    blue += pixel[0];
+                    green += pixel[1];
+                    red += pixel[2];
+                    alpha += pixel[3];
+                    ++count;
+                }
+            }
+            if (count == 0) {
+                continue;
+            }
+            const std::uint8_t values[4] = {
+                static_cast<std::uint8_t>(blue / count),
+                static_cast<std::uint8_t>(green / count),
+                static_cast<std::uint8_t>(red / count),
+                static_cast<std::uint8_t>(alpha / count),
+            };
+            for (int y = block_y; y < end_y; ++y) {
+                for (int x = block_x; x < end_x; ++x) {
+                    auto* pixel = bitmap.row(y).data() + x * 4;
+                    std::copy(std::begin(values), std::end(values), pixel);
+                }
+            }
+        }
+    }
+}
+
+void blur_rect(Bitmap& bitmap, const RectI& rect, int blur_radius) {
+    if (bitmap.empty() || blur_radius <= 0) return;
+    const RectI normalized = rect.normalized();
+    const int min_x = std::max(0, normalized.left);
+    const int min_y = std::max(0, normalized.top);
+    const int max_x = std::min(bitmap.width, normalized.right);
+    const int max_y = std::min(bitmap.height, normalized.bottom);
+    if (min_x >= max_x || min_y >= max_y) return;
+
+    Bitmap temp = crop(bitmap, RectI{min_x, min_y, max_x, max_y});
+    if (temp.empty()) return;
+
+    for (int y = min_y; y < max_y; ++y) {
+        auto* dest_row = bitmap.row(y).data();
+        for (int x = min_x; x < max_x; ++x) {
+            int sum_r = 0, sum_g = 0, sum_b = 0, count = 0;
+            for (int wy = -blur_radius; wy <= blur_radius; ++wy) {
+                const int py = y + wy;
+                if (py < min_y || py >= max_y) continue;
+                const auto* temp_row = temp.row(py - min_y).data();
+                for (int wx = -blur_radius; wx <= blur_radius; ++wx) {
+                    const int px = x + wx;
+                    if (px < min_x || px >= max_x) continue;
+                    const auto* pixel = temp_row + (px - min_x) * 4;
+                    sum_b += pixel[0];
+                    sum_g += pixel[1];
+                    sum_r += pixel[2];
+                    count++;
+                }
+            }
+            if (count > 0) {
+                dest_row[x * 4] = static_cast<uint8_t>(sum_b / count);
+                dest_row[x * 4 + 1] = static_cast<uint8_t>(sum_g / count);
+                dest_row[x * 4 + 2] = static_cast<uint8_t>(sum_r / count);
+            }
+        }
+    }
+}
+
 }  // namespace airshot

@@ -316,6 +316,20 @@ int named_clamped_integer(const JsonNode& object, std::wstring_view name, int fa
     return std::clamp(named_integer(object, name, fallback), minimum, maximum);
 }
 
+std::wstring named_ocr_engine(const JsonNode& object, std::wstring_view name) {
+    const auto* value = member(object, name);
+    if (!value) {
+        return std::wstring(kDefaultOcrEngine);
+    }
+    if (value->kind == JsonKind::string) {
+        return normalize_ocr_engine(value->string);
+    }
+    if (value->kind == JsonKind::number) {
+        return std::wstring(kDefaultOcrEngine);
+    }
+    return std::wstring(kDefaultOcrEngine);
+}
+
 std::wstring quote_json(std::wstring_view value) {
     std::wstring result{L"\""};
     for (const wchar_t current : value) {
@@ -343,15 +357,18 @@ std::wstring_view json_boolean(bool value) {
     return value ? L"true" : L"false";
 }
 
-constexpr std::array<std::wstring_view, 19> kAnnotationToolbarTools{
+constexpr std::array<std::wstring_view, 22> kAnnotationToolbarTools{
     L"lock",
+    L"select",
     L"rect",
     L"ellipse",
     L"line",
     L"arrow",
     L"pen",
     L"mosaic",
+    L"blur",
     L"highlight",
+    L"watermark",
     L"text",
     L"serial",
     L"eraser",
@@ -466,6 +483,25 @@ std::optional<Hotkey> parse_hotkey(std::wstring_view value) {
     return hotkey;
 }
 
+std::wstring normalize_ocr_engine(std::wstring_view value) {
+    const std::wstring normalized = lower(value);
+    if (normalized == kOcrEngineRapidV5Fast ||
+        normalized == L"rapid_ocr" ||
+        normalized == L"rapidocr" ||
+        normalized == L"rapidocr-v5" ||
+        normalized == L"wechat" ||
+        normalized == L"system") {
+        return std::wstring(kOcrEngineRapidV5Fast);
+    }
+    if (normalized == kOcrEngineRapidV5Accurate) {
+        return std::wstring(kOcrEngineRapidV5Accurate);
+    }
+    if (normalized == kOcrEngineRapidV4Compat) {
+        return std::wstring(kOcrEngineRapidV4Compat);
+    }
+    return std::wstring(kDefaultOcrEngine);
+}
+
 std::wstring normalize_annotation_hidden_tools(std::wstring_view value) {
     std::wstring result;
     for (const auto tool_id : kAnnotationToolbarTools) {
@@ -506,7 +542,7 @@ std::wstring config_to_json(const AppConfig& config) {
     result += L",\"highlightAlpha\":" + std::to_wstring(std::clamp(config.annotation_highlight_alpha, 24, 192));
     result += L",\"nextSerial\":" + std::to_wstring(std::max(1, config.annotation_next_serial)) + L"}";
     result += L",\"ocr\":{\"enabled\":" + std::wstring(json_boolean(config.ocr_enabled));
-    result += L",\"engine\":" + std::to_wstring(config.ocr_engine);
+    result += L",\"engine\":" + quote_json(normalize_ocr_engine(config.ocr_engine));
     result += L",\"downloadUrl\":" + quote_json(config.ocr_download_url) + L"}";
     result += L",\"shell\":{\"enabled\":" + std::wstring(json_boolean(config.shell_enabled));
     result += L",\"startAtLogin\":" + std::wstring(json_boolean(config.start_at_login));
@@ -528,7 +564,8 @@ std::wstring config_to_json(const AppConfig& config) {
     result += L",\"toolSerial\":" + quote_json(config.tool_shortcut_serial);
     result += L",\"toolEraser\":" + quote_json(config.tool_shortcut_eraser) + L"}";
     result += L",\"capture\":{\"defaultOutput\":" + quote_json(config.default_output);
-    result += L",\"customColor\":" + quote_json(config.custom_color) + L"}}";
+    result += L",\"customColor\":" + quote_json(config.custom_color);
+    result += L",\"theme\":" + quote_json(config.theme) + L"}}";
     return result;
 }
 
@@ -546,7 +583,14 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text) {
         if (const auto* hidden_tools = member(*annotation, L"hiddenTools")) {
             config.annotation_hidden_tools = hidden_tools_from_json_node(*hidden_tools, L"");
         }
-        config.toolbar_order = named_string(*annotation, L"toolbarOrder", L"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,highlight,text,serial,eraser,undo,redo,ocr,scroll,pin,copy,save,close");
+        constexpr std::wstring_view feishu_style_order =
+            L"rect,ellipse,line,arrow,pen,text,serial,mosaic,highlight,watermark,pin,ocr,select,scroll,eraser,undo,redo,save,close,copy";
+        config.toolbar_order = named_string(*annotation, L"toolbarOrder", feishu_style_order);
+        if (config.toolbar_order == L"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,highlight,text,serial,eraser,undo,redo,ocr,scroll,pin,save,copy" ||
+            config.toolbar_order == L"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,highlight,text,serial,eraser,undo,redo,ocr,scroll,pin,copy,save,close" ||
+            config.toolbar_order == L"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,highlight,text,serial,eraser,undo,redo,ocr,scroll,pin,save,close,copy") {
+            config.toolbar_order = feishu_style_order;
+        }
         config.text_font_family = named_string(*annotation, L"textFontFamily", L"Microsoft YaHei");
         config.text_font_bold = named_boolean(*annotation, L"textFontBold", false);
         config.text_font_italic = named_boolean(*annotation, L"textFontItalic", false);
@@ -555,7 +599,7 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text) {
     }
     if (const auto* ocr = member(*root, L"ocr")) {
         config.ocr_enabled = named_boolean(*ocr, L"enabled", true);
-        config.ocr_engine = named_clamped_integer(*ocr, L"engine", kDefaultOcrEngine, 0, 2);
+        config.ocr_engine = named_ocr_engine(*ocr, L"engine");
         config.ocr_download_url = named_string(*ocr, L"downloadUrl", kDefaultOcrDependencyManifestUrl);
     }
     if (const auto* shell = member(*root, L"shell")) {
@@ -586,6 +630,7 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text) {
     if (const auto* capture = member(*root, L"capture")) {
         config.default_output = named_string(*capture, L"defaultOutput", L"clipboard");
         config.custom_color = named_string(*capture, L"customColor", L"#8000FF");
+        config.theme = named_string(*capture, L"theme", L"system");
     }
     return config;
 }
@@ -657,6 +702,27 @@ bool save_config(const AppConfig& config, std::wstring* error) {
         }
         return false;
     }
+}
+
+bool is_windows_system_light_theme() {
+    HKEY hKey;
+    DWORD value = 1; // Default to Light if key not found
+    DWORD size = sizeof(value);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        RegQueryValueExW(hKey, L"AppsUseLightTheme", nullptr, nullptr, reinterpret_cast<BYTE*>(&value), &size);
+        RegCloseKey(hKey);
+    }
+    return value == 1;
+}
+
+bool should_use_light_theme(std::wstring_view theme_config) {
+    if (theme_config == L"light") {
+        return true;
+    }
+    if (theme_config == L"dark") {
+        return false;
+    }
+    return is_windows_system_light_theme();
 }
 
 }  // namespace airshot

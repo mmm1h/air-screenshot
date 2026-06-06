@@ -47,6 +47,10 @@ jobs:
         shell: pwsh
         run: .\scripts\test.ps1 -Configuration Release
 
+      - name: Prepare OCR dependencies
+        shell: pwsh
+        run: .\scripts\prepare-ocr-dependencies.ps1
+
       - name: Package signed portable EXE
         shell: pwsh
         env:
@@ -69,6 +73,7 @@ jobs:
           VERSION: ${{ steps.metadata.outputs.version }}
         run: |
           .\scripts\validate-package.ps1 -Version $env:VERSION -Publisher $env:PUBLISHER
+          .\scripts\smoke-ocr.ps1 -OcrRoot "dist/site/ocr/rapidocr-onnx" -HelperPath "dist/site/airshot_ocr.exe"
           .\scripts\smoke-portable.ps1 -Executable "dist/site/AirScreenshot.exe"
 
       - name: Publish GitHub Release
@@ -126,19 +131,46 @@ jobs:
           for attempt in {1..30}; do
             if curl -fsS -H 'Cache-Control: no-cache' -o latest.json "https://mmm1h.github.io/air-screenshot/latest.json" &&
                curl -fsS -H 'Cache-Control: no-cache' -o index.html "https://mmm1h.github.io/air-screenshot/" &&
-               curl -fsS -H 'Cache-Control: no-cache' -o airshot_ocr.exe "https://mmm1h.github.io/air-screenshot/airshot_ocr.exe"; then
+               curl -fsS -H 'Cache-Control: no-cache' -o airshot_ocr.exe "https://mmm1h.github.io/air-screenshot/airshot_ocr.exe" &&
+               curl -fsS -H 'Cache-Control: no-cache' -o ocr-dependencies.json "https://mmm1h.github.io/air-screenshot/ocr-dependencies.json"; then
               actual_version="$(jq -r '.version' latest.json)"
               download_url="$(jq -r '.url' latest.json)"
               expected_sha256="$(jq -r '.sha256 | ascii_downcase' latest.json)"
               expected_size="$(jq -r '.size' latest.json)"
+              ocr_package_id="$(jq -r '.packageId' ocr-dependencies.json)"
+              ocr_file_count="$(jq -r '.files | length' ocr-dependencies.json)"
+              ocr_zero_hash_count="$(jq -r '[.files[] | select(.sha256 == "0000000000000000000000000000000000000000000000000000000000000000")] | length' ocr-dependencies.json)"
+              ocr_zero_size_count="$(jq -r '[.files[] | select(.size == 0)] | length' ocr-dependencies.json)"
+              ocr_runner_url="$(jq -r '.files[] | select(.path == "rapidocr_runner.exe") | .url' ocr-dependencies.json)"
+              ocr_runner_sha256="$(jq -r '.files[] | select(.path == "rapidocr_runner.exe") | .sha256 | ascii_downcase' ocr-dependencies.json)"
+              ocr_runner_size="$(jq -r '.files[] | select(.path == "rapidocr_runner.exe") | .size' ocr-dependencies.json)"
+              ocr_required_count="$(jq -r '
+                ["rapidocr_api.dll","onnxruntime.dll","rapidocr_runner.exe",
+                 "models/rapidocr-v5-fast/det.onnx","models/rapidocr-v5-fast/rec.onnx","models/rapidocr-v5-fast/cls.onnx","models/rapidocr-v5-fast/dict.txt",
+                 "models/rapidocr-v5-accurate/det.onnx","models/rapidocr-v5-accurate/rec.onnx","models/rapidocr-v5-accurate/cls.onnx","models/rapidocr-v5-accurate/dict.txt",
+                 "models/rapidocr-v4-compat/det.onnx","models/rapidocr-v4-compat/rec.onnx","models/rapidocr-v4-compat/cls.onnx","models/rapidocr-v4-compat/dict.txt"] as $required |
+                [.files[].path] as $paths |
+                [$required[] | select(. as $p | $paths | index($p))] | length
+              ' ocr-dependencies.json)"
               rm -f AirScreenshot.exe
               curl -fsS -H 'Cache-Control: no-cache' -o AirScreenshot.exe "$download_url" || true
               actual_sha256="$(sha256sum AirScreenshot.exe 2>/dev/null | cut -d' ' -f1 || true)"
               actual_size="$(stat -c%s AirScreenshot.exe 2>/dev/null || true)"
+              rm -f rapidocr_runner.exe
+              curl -fsS -H 'Cache-Control: no-cache' -o rapidocr_runner.exe "$ocr_runner_url" || true
+              actual_runner_sha256="$(sha256sum rapidocr_runner.exe 2>/dev/null | cut -d' ' -f1 || true)"
+              actual_runner_size="$(stat -c%s rapidocr_runner.exe 2>/dev/null || true)"
               if [[ "$actual_version" = "$expected_version" ]] &&
                  [[ "$download_url" = "https://mmm1h.github.io/air-screenshot/AirScreenshot.exe" ]] &&
                  [[ "$actual_sha256" = "$expected_sha256" ]] &&
                  [[ "$actual_size" = "$expected_size" ]] &&
+                 [[ "$ocr_package_id" = "rapidocr-onnx" ]] &&
+                 [[ "$ocr_file_count" -ge "15" ]] &&
+                 [[ "$ocr_required_count" = "15" ]] &&
+                 [[ "$ocr_zero_hash_count" = "0" ]] &&
+                 [[ "$ocr_zero_size_count" = "0" ]] &&
+                 [[ "$actual_runner_sha256" = "$ocr_runner_sha256" ]] &&
+                 [[ "$actual_runner_size" = "$ocr_runner_size" ]] &&
                  [[ -s airshot_ocr.exe ]] &&
                  grep -q "AirScreenshot.exe" index.html &&
                  grep -q "airshot_ocr.exe" index.html &&

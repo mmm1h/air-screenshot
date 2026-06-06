@@ -18,7 +18,7 @@ void show_rgb_picker_popup(HWND parent_hwnd,
                            const RectI& monitor_bounds,
                            std::function<void(COLORREF)> on_color_changed);
 
-[[nodiscard]] std::optional<std::wstring> prompt_text(HWND owner, POINT position);
+[[nodiscard]] std::optional<std::wstring> prompt_text(HWND owner, POINT position, COLORREF color, float text_size, bool is_light_theme);
 
 struct ScrollControlState {
     bool finished{false};

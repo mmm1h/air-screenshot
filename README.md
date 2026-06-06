@@ -32,7 +32,7 @@ Windows SmartScreen 可能提示未知发布者。这是因为当前使用自签
 生成本地便携包：
 
 ```powershell
-.\scripts\package.ps1 -Version 0.2.1
+.\scripts\package.ps1 -Version 0.2.2
 ```
 
 ## 自动更新
@@ -50,11 +50,11 @@ Windows SmartScreen 可能提示未知发布者。这是因为当前使用自签
 推送格式为 `vX.Y.Z` 的 tag 会自动运行 [release.yml](.github/workflows/release.yml)：
 
 ```powershell
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
-工作流会运行测试、生成并验证签名 EXE、执行便携烟测、创建 GitHub Release，并更新 GitHub Pages 下载页与 `latest.json`。
+工作流会运行测试、准备 OCR 依赖、生成并验证签名 EXE、执行便携与 OCR 烟测、创建 GitHub Release，并更新 GitHub Pages 下载页、`latest.json`、`ocr-dependencies.json` 和 OCR 依赖文件。
 
 发布工作流使用以下仓库配置；为兼容旧配置，也会回退读取原 `MSIX_*` 名称：
 
@@ -83,19 +83,19 @@ git push origin v0.2.1
 
 ## OCR
 
-OCR 默认使用本地高精度引擎，设置中也可切换为微信 OCR 或 Windows 系统 OCR：
+OCR 使用本地 RapidOCR / PP-OCRv5 / ONNX Runtime CPU 推理，设置中可切换三档：
 
-- 本地高精度：基于 RapidOCR / PP-OCRv5 mobile / ONNX Runtime CPU，首次使用前在设置中点击“下载依赖”。依赖按清单校验 SHA256 后安装到 `%LOCALAPPDATA%\AirScreenshot\ocr\rapidocr-ppocrv5-mobile-v1`。
-- 微信 OCR：复用本机微信 OCR 组件，需要本机已安装微信，并提供 `wechat_ocr_api.dll` 适配 DLL。
-- 系统 OCR：调用 Windows `Windows.Media.Ocr`，可用语言取决于系统语言包。
+- 极速 OCR：默认档，使用 PP-OCRv5 mobile 模型，适合日常截图识字。
+- 高精度 OCR：使用 PP-OCRv5 server 模型，适合小字、大图和复杂背景。
+- 兼容 OCR：使用 PP-OCRv4 mobile 模型，作为稳定兼容档。
 
-OCR 识别在 `airshot_ocr.exe` 子进程中完成；模型和推理运行时不会常驻托盘进程，单次识别超时会停止子进程。离线环境可提前把依赖目录放到程序同目录下的 `ocr\rapidocr-ppocrv5-mobile-v1`。
+首次使用前在设置中点击“下载依赖”。依赖按清单校验 SHA256 后安装到 `%LOCALAPPDATA%\AirScreenshot\ocr\rapidocr-onnx`。OCR 识别在 `airshot_ocr.exe` 子进程中完成；模型和 ONNX Runtime 不会常驻托盘进程，单次识别超时会停止子进程。源码发布前可运行 `.\scripts\prepare-ocr-dependencies.ps1` 准备 `dist\ocr-dependencies\rapidocr-onnx`，再由 `.\scripts\package.ps1` 基于真实文件生成下载清单。离线环境可提前把依赖目录放到程序同目录下的 `ocr\rapidocr-onnx`。
 
 ## 限制
 
 - GDI `BitBlt` 无法捕获受保护内容和部分硬件覆盖层。
 - 不包含录屏、历史记录或通用第三方插件系统。
-- 本地高精度 OCR 依赖需要单独下载；未安装依赖时会提示到设置中下载。
+- 本地 OCR 依赖需要单独下载；未安装依赖时会提示到设置中下载。
 - 旧 MSIX 版本不会自动迁移配置，需要用户自行卸载。
 
 项目采用 `LGPL-3.0-only`。完整许可证见 [LICENSE](LICENSE)，第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

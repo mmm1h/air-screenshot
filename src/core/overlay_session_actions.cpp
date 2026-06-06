@@ -1,5 +1,7 @@
 #include "overlay_session.h"
 
+#include <array>
+
 namespace airshot::overlay_detail {
 namespace {
 
@@ -32,7 +34,12 @@ struct ToolbarRow {
 };
 
 int item_width(std::wstring_view id, const ToolbarMetrics& metrics) {
-    return id == L"|" ? 12 : metrics.button_width;
+    if (id == L"|") return 14;
+    if (id == L"text_size_btn") return 86;
+    if (id == L"mosaic_strength_slider" || id == L"watermark_opacity_slider") return 188;
+    if (id == L"watermark_text") return 122;
+    if (id == L"watermark_apply" || id == L"watermark_clear") return 54;
+    return metrics.button_width;
 }
 
 int row_width(const std::vector<std::pair<std::wstring, std::wstring>>& items, const ToolbarMetrics& metrics) {
@@ -154,12 +161,19 @@ Tool tool_from_id(std::wstring_view id) {
     if (id == L"text") return Tool::text;
     if (id == L"serial") return Tool::serial;
     if (id == L"eraser") return Tool::eraser;
+    if (id == L"watermark") return Tool::watermark;
     return Tool::none;
+}
+
+bool tool_is_feishu_style_shape(Tool tool) {
+    return tool == Tool::rectangle || tool == Tool::ellipse || tool == Tool::line || tool == Tool::arrow ||
+           tool == Tool::pen;
 }
 
 bool tool_supports_color(Tool tool) {
     return tool == Tool::rectangle || tool == Tool::ellipse || tool == Tool::line || tool == Tool::arrow ||
-           tool == Tool::pen || tool == Tool::highlight || tool == Tool::text || tool == Tool::serial;
+           tool == Tool::pen || tool == Tool::highlight || tool == Tool::text || tool == Tool::serial ||
+           tool == Tool::watermark;
 }
 
 bool tool_supports_width(Tool tool) {
@@ -170,6 +184,36 @@ bool tool_supports_width(Tool tool) {
 
 bool tool_supports_alpha(Tool tool) {
     return tool == Tool::highlight;
+}
+
+constexpr std::array<float, 13> kTextSizes{12.0F, 14.0F, 16.0F, 18.0F, 20.0F, 24.0F, 28.0F,
+                                           32.0F, 36.0F, 48.0F, 64.0F, 72.0F, 96.0F};
+
+float nearest_text_size(float value) {
+    float best = kTextSizes.front();
+    float best_distance = std::abs(value - best);
+    for (float option : kTextSizes) {
+        const float distance = std::abs(value - option);
+        if (distance < best_distance) {
+            best = option;
+            best_distance = distance;
+        }
+    }
+    return best;
+}
+
+std::wstring text_size_label(float value) {
+    return std::format(L"{:.0f}pt", nearest_text_size(value));
+}
+
+void add_feishu_palette(std::vector<std::pair<std::wstring, std::wstring>>& items) {
+    items.push_back({L"color_red", L""});
+    items.push_back({L"color_yellow", L""});
+    items.push_back({L"color_green", L""});
+    items.push_back({L"color_blue", L""});
+    items.push_back({L"color_black", L""});
+    items.push_back({L"color_gray", L""});
+    items.push_back({L"color_white", L""});
 }
 
 void blend_pixel(Bitmap& bitmap, int x, int y, COLORREF color, int alpha) {
@@ -228,6 +272,84 @@ void draw_polyline(HDC dc, const std::vector<POINT>& points) {
     }
 }
 
+void draw_text_with_style(
+    HDC dc,
+    const std::wstring& text,
+    RECT bounds,
+    COLORREF color,
+    TextStyle style,
+    HFONT font) {
+    HGDIOBJ previous_font = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+
+    RECT measured = bounds;
+    DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &measured, DT_LEFT | DT_TOP | DT_CALCRECT);
+    measured.right += 8;
+    measured.bottom += 6;
+
+    if (style == TextStyle::dark) {
+        HBRUSH background = CreateSolidBrush(RGB(31, 35, 41));
+        FillRect(dc, &measured, background);
+        DeleteObject(background);
+        SetTextColor(dc, RGB(255, 255, 255));
+        DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &bounds, DT_LEFT | DT_TOP);
+    } else if (style == TextStyle::outline) {
+        SetTextColor(dc, RGB(255, 255, 255));
+        for (int dy = -2; dy <= 2; ++dy) {
+            for (int dx = -2; dx <= 2; ++dx) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                RECT outline = bounds;
+                OffsetRect(&outline, dx, dy);
+                DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &outline, DT_LEFT | DT_TOP);
+            }
+        }
+        SetTextColor(dc, color);
+        DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &bounds, DT_LEFT | DT_TOP);
+    } else {
+        SetTextColor(dc, color);
+        DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &bounds, DT_LEFT | DT_TOP);
+    }
+
+    SelectObject(dc, previous_font);
+}
+
+void draw_watermark_gdi(HDC dc, const Annotation& annotation, const AppConfig& config, int width, int height) {
+    if (annotation.text.empty() || width <= 0 || height <= 0) {
+        return;
+    }
+
+    HFONT font = CreateFontW(-static_cast<int>(std::max(12.0F, annotation.width)),
+                             0,
+                             -180,
+                             -180,
+                             FW_NORMAL,
+                             FALSE,
+                             FALSE,
+                             FALSE,
+                             DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY,
+                             DEFAULT_PITCH,
+                             config.text_font_family.c_str());
+    HGDIOBJ previous_font = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, annotation.color);
+
+    const int step_x = std::max(120, static_cast<int>(annotation.text.size()) * 24 + 80);
+    const int step_y = std::max(70, static_cast<int>(annotation.width * 3.2F));
+    for (int y = -step_y; y < height + step_y; y += step_y) {
+        for (int x = -step_x; x < width + step_x; x += step_x) {
+            TextOutW(dc, x, y, annotation.text.c_str(), static_cast<int>(annotation.text.size()));
+        }
+    }
+
+    SelectObject(dc, previous_font);
+    DeleteObject(font);
+}
+
 }  // namespace
 
 void OverlaySession::build_toolbar() {
@@ -259,6 +381,7 @@ void OverlaySession::build_toolbar() {
         if (id == L"mosaic") return std::wstring(strings::toolbar_mosaic);
         if (id == L"blur") return L"糊";
         if (id == L"highlight") return std::wstring(strings::toolbar_highlight);
+        if (id == L"watermark") return L"水";
         if (id == L"text") return std::wstring(strings::toolbar_text);
         if (id == L"serial") return std::wstring(strings::toolbar_serial);
         if (id == L"eraser") return std::wstring(strings::toolbar_eraser);
@@ -275,33 +398,40 @@ void OverlaySession::build_toolbar() {
 
     auto get_tool_category = [](std::wstring_view id) -> int {
         if (id == L"lock") return 1;
-        if (id == L"select" || id == L"rect" || id == L"ellipse" || id == L"line" ||
-            id == L"arrow" || id == L"pen" || id == L"mosaic" || id == L"blur" ||
-            id == L"highlight" || id == L"text" || id == L"serial" || id == L"eraser") {
+        if (id == L"rect" || id == L"ellipse" || id == L"line" || id == L"arrow" ||
+            id == L"pen" || id == L"text" || id == L"serial") {
             return 2;
         }
-        if (id == L"undo" || id == L"redo") return 3;
-        if (id == L"ocr" || id == L"scroll" || id == L"pin") return 4;
-        if (id == L"copy" || id == L"save" || id == L"close") return 5;
+        if (id == L"mosaic" || id == L"blur" || id == L"highlight" || id == L"watermark" ||
+            id == L"pin" || id == L"ocr" || id == L"select" || id == L"scroll" || id == L"eraser") {
+            return 3;
+        }
+        if (id == L"undo" || id == L"redo") return 4;
+        if (id == L"save" || id == L"close" || id == L"copy") return 5;
         return 0;
     };
 
     int last_category = -1;
     for (const auto& token : split_by_comma(request_.config.toolbar_order)) {
+        if (token == L"blur") continue;
         if (token == L"undo" && annotations_.empty()) continue;
         if (token == L"redo" && redo_.empty()) continue;
         if (token == L"ocr" && !request_.config.ocr_enabled) continue;
         if (token == L"lock" && !request_.config.annotation_enabled) continue;
-        
+
         int cat = get_tool_category(token);
-        if (cat == 2 && !request_.config.annotation_enabled) continue;
-        if (cat == 3 && !request_.config.annotation_enabled) continue;
-        
-        if (hidden(request_.config, token)) continue;
-        
+        const bool annotation_tool =
+            token == L"select" || token == L"rect" || token == L"ellipse" || token == L"line" ||
+            token == L"arrow" || token == L"pen" || token == L"mosaic" || token == L"blur" ||
+            token == L"highlight" || token == L"watermark" || token == L"text" ||
+            token == L"serial" || token == L"eraser" || token == L"undo" || token == L"redo";
+        if (annotation_tool && !request_.config.annotation_enabled) continue;
+
+        if (hidden(request_.config, token) && token != L"close") continue;
+
         std::wstring label = get_tool_label(token);
         if (label.empty()) continue;
-        
+
         if (last_category != -1 && last_category != cat) {
             add_separator(items);
         }
@@ -310,7 +440,7 @@ void OverlaySession::build_toolbar() {
     }
     trim_trailing_separators(items);
 
-    const ToolbarMetrics metrics{36, 32, 4, 6};
+    const ToolbarMetrics metrics{40, 38, 5, 7};
     const auto rows = wrap_toolbar_items(items, metrics, virtual_bounds_);
     const int total_width = toolbar_width(rows, metrics);
     const int total_height = toolbar_height(rows, metrics);
@@ -340,37 +470,65 @@ void OverlaySession::build_sub_toolbar() {
         return;
     }
     std::vector<std::pair<std::wstring, std::wstring>> items;
-    if (tool_supports_color(active_tool_)) {
-        items.push_back({L"color_red", L"红"});
-        items.push_back({L"color_green", L"绿"});
-        items.push_back({L"color_blue", L"蓝"});
-        items.push_back({L"color_yellow", L"黄"});
-        items.push_back({L"color_black", L"黑"});
-        items.push_back({L"color_white", L"白"});
-        items.push_back({L"color_custom", L"自"});
-    }
-    if (tool_supports_width(active_tool_)) {
-        if (!items.empty()) {
-            items.push_back({L"|", L""});
+
+    if (active_tool_ == Tool::mosaic || active_tool_ == Tool::blur) {
+        items.push_back({L"effect_mosaic", L"马赛克"});
+        items.push_back({L"effect_blur", L"模糊"});
+        items.push_back({L"|", L""});
+        items.push_back({L"mode_smear", L"涂抹"});
+        items.push_back({L"mode_rect", L"框选"});
+        items.push_back({L"|", L""});
+        items.push_back({L"mosaic_strength_slider", L""});
+    } else if (active_tool_ == Tool::text) {
+        items.push_back({L"text_style_normal", L""});
+        items.push_back({L"text_style_dark", L""});
+        items.push_back({L"text_style_outline", L""});
+        items.push_back({L"|", L""});
+        std::wstring size_label = text_size_label(active_text_size_);
+        items.push_back({L"text_size_btn", size_label});
+        items.push_back({L"|", L""});
+        add_feishu_palette(items);
+    } else if (active_tool_ == Tool::watermark) {
+        items.push_back({L"watermark_text", watermark_text_.empty() ? L"水印文字" : watermark_text_});
+        items.push_back({L"watermark_apply", L"应用"});
+        items.push_back({L"watermark_clear", L"清除"});
+        items.push_back({L"|", L""});
+        items.push_back({L"watermark_opacity_slider", L""});
+        items.push_back({L"|", L""});
+        add_feishu_palette(items);
+    } else if (tool_is_feishu_style_shape(active_tool_)) {
+        items.push_back({L"width_small", L""});
+        items.push_back({L"width_medium", L""});
+        items.push_back({L"width_large", L""});
+        items.push_back({L"|", L""});
+        add_feishu_palette(items);
+    } else {
+        if (tool_supports_color(active_tool_)) {
+            add_feishu_palette(items);
         }
-        items.push_back({L"width_small", L"细"});
-        items.push_back({L"width_medium", L"中"});
-        items.push_back({L"width_large", L"粗"});
-    }
-    if (tool_supports_alpha(active_tool_)) {
-        if (!items.empty()) {
-            items.push_back({L"|", L""});
+        if (tool_supports_width(active_tool_)) {
+            if (!items.empty()) {
+                items.push_back({L"|", L""});
+            }
+            items.push_back({L"width_small", L""});
+            items.push_back({L"width_medium", L""});
+            items.push_back({L"width_large", L""});
         }
-        items.push_back({L"alpha_low", L"浅"});
-        items.push_back({L"alpha_medium", L"中"});
-        items.push_back({L"alpha_high", L"深"});
+        if (tool_supports_alpha(active_tool_)) {
+            if (!items.empty()) {
+                items.push_back({L"|", L""});
+            }
+            items.push_back({L"alpha_low", L""});
+            items.push_back({L"alpha_medium", L""});
+            items.push_back({L"alpha_high", L""});
+        }
     }
     if (items.empty()) {
         return;
     }
 
     if (toolbar_.empty()) return;
-    const ToolbarMetrics metrics{32, 30, 4, 6};
+    const ToolbarMetrics metrics{34, 32, 5, 7};
     const auto rows = wrap_toolbar_items(items, metrics, virtual_bounds_);
     const int total_width = toolbar_width(rows, metrics);
     const int total_height = toolbar_height(rows, metrics);
@@ -399,11 +557,13 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
     } else if (id == L"color_green") {
         active_color_ = RGB(82, 196, 26);
     } else if (id == L"color_blue") {
-        active_color_ = RGB(22, 119, 255);
+        active_color_ = RGB(0, 102, 255);
     } else if (id == L"color_yellow") {
         active_color_ = RGB(250, 219, 20);
     } else if (id == L"color_black") {
         active_color_ = RGB(0, 0, 0);
+    } else if (id == L"color_gray") {
+        active_color_ = RGB(143, 149, 158);
     } else if (id == L"color_white") {
         active_color_ = RGB(255, 255, 255);
     } else if (id == L"color_custom") {
@@ -435,12 +595,68 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
     } else if (id == L"alpha_high") {
         active_highlight_alpha_ = 144;
         request_.config.annotation_highlight_alpha = active_highlight_alpha_;
+    } else if (id == L"text_style_normal") {
+        active_text_style_ = TextStyle::normal;
+    } else if (id == L"text_style_dark") {
+        active_text_style_ = TextStyle::dark;
+    } else if (id == L"text_style_outline") {
+        active_text_style_ = TextStyle::outline;
+    } else if (id == L"text_size_btn") {
+        text_size_dropdown_open_ = !text_size_dropdown_open_;
+    } else if (id == L"watermark_text") {
+        POINT position{};
+        for (const auto& button : sub_toolbar_) {
+            if (button.id == L"watermark_text") {
+                position = {button.bounds.left, button.bounds.bottom + 6};
+                break;
+            }
+        }
+        bool is_light = should_use_light_theme(request_.config.theme);
+        if (auto text = prompt_text(source, position, active_color_, active_text_size_, is_light)) {
+            watermark_text_ = *text;
+        }
+    } else if (id == L"watermark_apply") {
+        apply_watermark();
+    } else if (id == L"watermark_clear") {
+        discard_redo();
+        std::erase_if(annotations_, [](const Annotation& annotation) {
+            return annotation.tool == Tool::watermark;
+        });
+        build_toolbar();
+        build_sub_toolbar();
+    } else if (id == L"effect_mosaic") {
+        active_tool_ = Tool::mosaic;
+        mosaic_is_blur_ = false;
+        preview_.tool = Tool::mosaic;
+        build_sub_toolbar();
+    } else if (id == L"effect_blur") {
+        active_tool_ = Tool::blur;
+        mosaic_is_blur_ = true;
+        preview_.tool = Tool::blur;
+        build_sub_toolbar();
+    } else if (id == L"mode_smear") {
+        mosaic_is_rect_ = false;
+        build_sub_toolbar();
+    } else if (id == L"mode_rect") {
+        mosaic_is_rect_ = true;
+        preview_.points.clear();
+        build_sub_toolbar();
     }
 }
 
 void OverlaySession::invoke(std::wstring_view id, HWND source) {
     if (id == L"lock") {
         request_.config.annotation_locked_tool = !request_.config.annotation_locked_tool;
+    } else if (id == L"mosaic") {
+        const Tool target = mosaic_is_blur_ ? Tool::blur : Tool::mosaic;
+        const bool switching_on = active_tool_ != target;
+        active_tool_ = switching_on ? target : Tool::none;
+    } else if (id == L"watermark") {
+        const bool switching_on = active_tool_ != Tool::watermark;
+        active_tool_ = switching_on ? Tool::watermark : Tool::none;
+        if (switching_on && active_color_ == RGB(245, 34, 45)) {
+            active_color_ = RGB(255, 150, 150);
+        }
     } else if (const Tool tool = tool_from_id(id); tool != Tool::none) {
         const bool switching_on = active_tool_ != tool;
         active_tool_ = switching_on ? tool : Tool::none;
@@ -469,11 +685,34 @@ void OverlaySession::invoke(std::wstring_view id, HWND source) {
     invalidate_all();
 }
 
+void OverlaySession::apply_watermark() {
+    if (selection_.empty()) {
+        return;
+    }
+    discard_redo();
+    std::erase_if(annotations_, [](const Annotation& annotation) {
+        return annotation.tool == Tool::watermark;
+    });
+
+    Annotation annotation;
+    annotation.tool = Tool::watermark;
+    annotation.start = {0, 0};
+    annotation.end = {selection_.width(), selection_.height()};
+    annotation.text = watermark_text_.empty() ? L"Air Screenshot" : watermark_text_;
+    annotation.color = active_color_;
+    annotation.width = active_text_size_;
+    annotation.alpha = std::clamp(static_cast<int>(std::lround(watermark_opacity_ * 255.0 / 100.0)), 16, 220);
+    annotation.text_style = active_text_style_;
+    annotations_.push_back(std::move(annotation));
+    finish_annotation();
+}
+
 void OverlaySession::finish_annotation() {
     if (!request_.config.annotation_locked_tool) {
         active_tool_ = Tool::none;
     }
     build_toolbar();
+    build_sub_toolbar();
     invalidate_all();
 }
 
@@ -505,14 +744,27 @@ Bitmap OverlaySession::rendered_selection() const {
     Bitmap result = original_selection();
     for (const auto& annotation : annotations_) {
         if (annotation.tool == Tool::mosaic) {
-            for (const POINT point : annotation.points) {
-                pixelate_circle(result, point, 14, 8);
+            const int strength = std::clamp(annotation.alpha, 0, 100);
+            const int block_size = std::clamp(4 + strength / 8, 4, 18);
+            if (annotation.points.empty()) {
+                pixelate_rect(result, RectI{annotation.start.x, annotation.start.y, annotation.end.x, annotation.end.y}, block_size);
+            } else {
+                for (const POINT point : annotation.points) {
+                    pixelate_circle(result, point, 14, block_size);
+                }
             }
         } else if (annotation.tool == Tool::blur) {
-            for (const POINT point : annotation.points) {
-                int radius = static_cast<int>(annotation.width * 3.5F);
-                if (radius < 5) radius = 5;
-                blur_circle(result, point, radius, 6);
+            const int strength = std::clamp(annotation.alpha, 0, 100);
+            const int rect_radius = std::clamp(3 + strength / 5, 3, 23);
+            const int circle_radius = std::clamp(2 + strength / 12, 2, 10);
+            if (annotation.points.empty()) {
+                blur_rect(result, RectI{annotation.start.x, annotation.start.y, annotation.end.x, annotation.end.y}, rect_radius);
+            } else {
+                for (const POINT point : annotation.points) {
+                    int radius = static_cast<int>(annotation.width * 3.5F);
+                    if (radius < 5) radius = 5;
+                    blur_circle(result, point, radius, circle_radius);
+                }
             }
         } else if (annotation.tool == Tool::highlight) {
             const int radius = std::max(4, static_cast<int>(std::lround(annotation.width * 1.6F)));
@@ -602,13 +854,13 @@ Bitmap OverlaySession::rendered_selection() const {
                                          CLEARTYPE_QUALITY,
                                          DEFAULT_PITCH,
                                          request_.config.text_font_family.c_str());
-            HGDIOBJ previous_text_font = SelectObject(dc, text_font);
-            TextOutW(dc,
-                     annotation.start.x,
-                     annotation.start.y,
-                     annotation.text.c_str(),
-                     static_cast<int>(annotation.text.size()));
-            SelectObject(dc, previous_text_font);
+            RECT text_rect{
+                annotation.start.x,
+                annotation.start.y,
+                result.width,
+                result.height,
+            };
+            draw_text_with_style(dc, annotation.text, text_rect, annotation.color, annotation.text_style, text_font);
             DeleteObject(text_font);
         } else if (annotation.tool == Tool::serial) {
             int radius = static_cast<int>(std::round(8.0F + annotation.width * 1.5F));
@@ -651,6 +903,8 @@ Bitmap OverlaySession::rendered_selection() const {
             DrawTextW(dc, serial_text.c_str(), static_cast<int>(serial_text.size()), &text_rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             SelectObject(dc, old_font_in_bubble);
             DeleteObject(serial_font);
+        } else if (annotation.tool == Tool::watermark) {
+            draw_watermark_gdi(dc, annotation, request_.config, result.width, result.height);
         }
         SelectObject(dc, previous_pen);
         DeleteObject(pen);

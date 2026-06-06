@@ -47,6 +47,11 @@ private:
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> toolbar_border_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> hover_bg_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> active_bg_brush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> true_white_brush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> green_brush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> red_brush_;
+    Microsoft::WRL::ComPtr<ID2D1StrokeStyle> round_stroke_style_;
+    bool is_light_theme_{};
 };
 
 }  // namespace airshot::overlay_detail

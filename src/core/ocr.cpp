@@ -22,17 +22,33 @@
 namespace airshot {
 namespace {
 
-constexpr DWORD kOcrProcessTimeoutMs = 15'000;
+constexpr DWORD kOcrProcessTimeoutMs = 90'000;
 constexpr int kMaxOcrImageEdge = 4096;
 constexpr std::uint64_t kMaxOcrPixels = 8ULL * 1024ULL * 1024ULL;
 
-constexpr std::array<std::wstring_view, 6> kRapidOcrRequiredFiles{
+struct OcrEngineSpec {
+    std::wstring_view id;
+    std::wstring_view label;
+    std::wstring_view profile_directory;
+};
+
+constexpr std::array<OcrEngineSpec, 3> kOcrEngineSpecs{{
+    {kOcrEngineRapidV5Fast, L"极速 OCR", L"models/rapidocr-v5-fast"},
+    {kOcrEngineRapidV5Accurate, L"高精度 OCR", L"models/rapidocr-v5-accurate"},
+    {kOcrEngineRapidV4Compat, L"兼容 OCR", L"models/rapidocr-v4-compat"},
+}};
+
+constexpr std::array<std::wstring_view, 3> kRapidOcrCommonRequiredFiles{
     L"rapidocr_api.dll",
     L"onnxruntime.dll",
-    L"models/ch_PP-OCRv5_det_mobile.onnx",
-    L"models/ch_PP-OCRv5_rec_mobile.onnx",
-    L"models/ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx",
-    L"models/ppocrv5_dict.txt",
+    L"rapidocr_runner.exe",
+};
+
+constexpr std::array<std::wstring_view, 4> kRapidOcrProfileRequiredFiles{
+    L"det.onnx",
+    L"rec.onnx",
+    L"cls.onnx",
+    L"dict.txt",
 };
 
 std::wstring normalized_hex(std::wstring_view value) {
@@ -50,6 +66,10 @@ std::wstring normalized_hex(std::wstring_view value) {
     return result;
 }
 
+bool is_zero_hash(std::wstring_view value) {
+    return value.size() == 64 && std::ranges::all_of(value, [](wchar_t ch) { return ch == L'0'; });
+}
+
 std::wstring quote_argument(std::wstring_view value) {
     std::wstring result{L"\""};
     for (const wchar_t character : value) {
@@ -63,6 +83,16 @@ std::wstring quote_argument(std::wstring_view value) {
     return result;
 }
 
+const OcrEngineSpec& ocr_engine_spec(std::wstring_view engine) {
+    const std::wstring normalized = normalize_ocr_engine(engine);
+    for (const auto& spec : kOcrEngineSpecs) {
+        if (normalized == spec.id) {
+            return spec;
+        }
+    }
+    return kOcrEngineSpecs.front();
+}
+
 std::filesystem::path executable_directory() {
     wchar_t exe_path[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
@@ -71,37 +101,64 @@ std::filesystem::path executable_directory() {
 
 std::vector<std::filesystem::path> ocr_dependency_roots() {
     std::vector<std::filesystem::path> roots;
-    roots.push_back(config_directory() / L"ocr" / kRapidOcrPackageId);
-    roots.push_back(executable_directory() / L"ocr" / kRapidOcrPackageId);
-    roots.push_back(config_directory() / L"ocr_onnx");
-    roots.push_back(executable_directory() / L"ocr_onnx");
+    roots.push_back(config_directory() / L"ocr" / kRapidOcrOnnxPackageId);
+    roots.push_back(executable_directory() / L"ocr" / kRapidOcrOnnxPackageId);
     return roots;
-}
-
-std::optional<std::filesystem::path> find_dependency_file(std::wstring_view relative_path) {
-    for (const auto& root : ocr_dependency_roots()) {
-        const auto path = root / std::wstring(relative_path);
-        if (std::filesystem::exists(path)) {
-            return path;
-        }
-    }
-    return std::nullopt;
 }
 
 bool file_exists_in_directory(const std::filesystem::path& root, std::wstring_view relative_path) {
     return std::filesystem::exists(root / std::wstring(relative_path));
 }
 
-std::optional<std::filesystem::path> find_rapid_ocr_dependency_directory() {
-    for (const auto& root : ocr_dependency_roots()) {
-        bool ready = true;
-        for (const auto file : kRapidOcrRequiredFiles) {
-            if (!file_exists_in_directory(root, file)) {
-                ready = false;
-                break;
-            }
+std::wstring profile_relative_path(const OcrEngineSpec& spec, std::wstring_view file) {
+    std::wstring result(spec.profile_directory);
+    result += L"/";
+    result += file;
+    return result;
+}
+
+std::vector<std::wstring> required_dependency_files(const OcrEngineSpec& spec) {
+    std::vector<std::wstring> files;
+    for (const auto file : kRapidOcrCommonRequiredFiles) {
+        files.emplace_back(file);
+    }
+    for (const auto file : kRapidOcrProfileRequiredFiles) {
+        files.push_back(profile_relative_path(spec, file));
+    }
+    return files;
+}
+
+std::vector<std::wstring> all_required_dependency_files() {
+    std::vector<std::wstring> files;
+    for (const auto file : kRapidOcrCommonRequiredFiles) {
+        files.emplace_back(file);
+    }
+    for (const auto& spec : kOcrEngineSpecs) {
+        for (const auto file : kRapidOcrProfileRequiredFiles) {
+            files.push_back(profile_relative_path(spec, file));
         }
-        if (ready) {
+    }
+    return files;
+}
+
+bool dependency_directory_ready(
+    const std::filesystem::path& root,
+    const OcrEngineSpec& spec,
+    std::wstring* missing_file = nullptr) {
+    for (const auto& file : required_dependency_files(spec)) {
+        if (!file_exists_in_directory(root, file)) {
+            if (missing_file) {
+                *missing_file = file;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<std::filesystem::path> find_rapid_ocr_dependency_directory(const OcrEngineSpec& spec) {
+    for (const auto& root : ocr_dependency_roots()) {
+        if (dependency_directory_ready(root, spec)) {
             return root;
         }
     }
@@ -131,9 +188,9 @@ bool valid_manifest_relative_path(std::wstring_view value) {
 }
 
 bool manifest_contains_required_files(const OcrDependencyManifest& manifest) {
-    for (const auto required : kRapidOcrRequiredFiles) {
-        const auto found = std::ranges::find_if(manifest.files, [required](const OcrDependencyFile& file) {
-            return std::wstring_view(file.path) == required;
+    for (const auto& required : all_required_dependency_files()) {
+        const auto found = std::ranges::find_if(manifest.files, [&required](const OcrDependencyFile& file) {
+            return file.path == required;
         });
         if (found == manifest.files.end()) {
             return false;
@@ -184,7 +241,7 @@ bool verify_dependency_file(const OcrDependencyFile& file, const std::filesystem
         }
         return false;
     }
-    if (file.size > 0 && size != file.size) {
+    if (file.size == 0 || size != file.size) {
         if (error) {
             *error = L"OCR 依赖文件大小与清单不一致。";
         }
@@ -227,97 +284,6 @@ Bitmap resize_bitmap_for_ocr(const Bitmap& source) {
         }
     }
     return target;
-}
-
-std::wstring get_wechat_install_path() {
-    HKEY hKey;
-    std::wstring install_path;
-    // 1. Check WeChat registry
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Tencent\\WeChat", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        wchar_t buf[512]{};
-        DWORD type = REG_SZ;
-        DWORD size = sizeof(buf);
-        if (RegQueryValueExW(hKey, L"InstallPath", nullptr, &type, reinterpret_cast<BYTE*>(buf), &size) == ERROR_SUCCESS) {
-            install_path = buf;
-        }
-        RegCloseKey(hKey);
-    }
-    // 2. Check Weixin registry
-    if (install_path.empty()) {
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Tencent\\Weixin", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            wchar_t buf[512]{};
-            DWORD type = REG_SZ;
-            DWORD size = sizeof(buf);
-            if (RegQueryValueExW(hKey, L"InstallPath", nullptr, &type, reinterpret_cast<BYTE*>(buf), &size) == ERROR_SUCCESS) {
-                install_path = buf;
-            }
-            RegCloseKey(hKey);
-        }
-    }
-    return install_path;
-}
-
-std::wstring find_wechat_ocr_exe_dir() {
-    const wchar_t* appdata = _wgetenv(L"APPDATA");
-    if (!appdata) return L"";
-
-    // 1. Scan WeChat 4.x (xwechat/XPlugin/Plugins/WeChatOcr)
-    std::filesystem::path ocr_root_4 = std::filesystem::path(appdata) / L"Tencent" / L"xwechat" / L"XPlugin" / L"Plugins" / L"WeChatOcr";
-    if (std::filesystem::exists(ocr_root_4)) {
-        std::filesystem::path best_dir;
-        int best_ver = -1;
-        for (const auto& entry : std::filesystem::directory_iterator(ocr_root_4)) {
-            if (entry.is_directory()) {
-                std::filesystem::path dll_path = entry.path() / L"extracted" / L"wxocr.dll";
-                if (std::filesystem::exists(dll_path)) {
-                    try {
-                        int ver = std::stoi(entry.path().filename().wstring());
-                        if (ver > best_ver) {
-                            best_ver = ver;
-                            best_dir = entry.path() / L"extracted";
-                        }
-                    } catch (...) {
-                        if (best_ver == -1) {
-                            best_dir = entry.path() / L"extracted";
-                        }
-                    }
-                }
-            }
-        }
-        if (!best_dir.empty()) {
-            return best_dir.wstring();
-        }
-    }
-
-    // 2. Scan WeChat 3.x (Tencent/WeChat/XPlugin/Plugins/ocr)
-    std::filesystem::path ocr_root_3 = std::filesystem::path(appdata) / L"Tencent" / L"WeChat" / L"XPlugin" / L"Plugins" / L"ocr";
-    if (std::filesystem::exists(ocr_root_3)) {
-        std::filesystem::path best_dir;
-        int best_ver = -1;
-        for (const auto& entry : std::filesystem::directory_iterator(ocr_root_3)) {
-            if (entry.is_directory()) {
-                std::filesystem::path exe_path = entry.path() / L"WeChatOCR.exe";
-                if (std::filesystem::exists(exe_path)) {
-                    try {
-                        int ver = std::stoi(entry.path().filename().wstring());
-                        if (ver > best_ver) {
-                            best_ver = ver;
-                            best_dir = entry.path();
-                        }
-                    } catch (...) {
-                        if (best_ver == -1) {
-                            best_dir = entry.path();
-                        }
-                    }
-                }
-            }
-        }
-        if (!best_dir.empty()) {
-            return best_dir.wstring();
-        }
-    }
-
-    return L"";
 }
 
 OcrOutput run_ocr_process(const std::wstring& cmd_line) {
@@ -426,7 +392,7 @@ OcrOutput run_ocr_process(const std::wstring& cmd_line) {
 }  // namespace
 
 std::filesystem::path rapid_ocr_dependency_directory() {
-    return config_directory() / L"ocr" / kRapidOcrPackageId;
+    return config_directory() / L"ocr" / kRapidOcrOnnxPackageId;
 }
 
 std::optional<OcrDependencyManifest> parse_ocr_dependency_manifest(std::wstring_view json) {
@@ -435,12 +401,12 @@ std::optional<OcrDependencyManifest> parse_ocr_dependency_manifest(std::wstring_
         const auto root = winrt::Windows::Data::Json::JsonObject::Parse(json);
         OcrDependencyManifest manifest;
         manifest.package_id = root.GetNamedString(L"packageId").c_str();
-        if (manifest.package_id != kRapidOcrPackageId) {
+        if (manifest.package_id != kRapidOcrOnnxPackageId) {
             return std::nullopt;
         }
 
         const auto files = root.GetNamedArray(L"files");
-        if (files.Size() == 0 || files.Size() > 32) {
+        if (files.Size() == 0 || files.Size() > 512) {
             return std::nullopt;
         }
 
@@ -453,7 +419,8 @@ std::optional<OcrDependencyManifest> parse_ocr_dependency_manifest(std::wstring_
             file.size = object.HasKey(L"size") ? static_cast<std::uint64_t>(object.GetNamedNumber(L"size")) : 0;
 
             if (!valid_manifest_relative_path(file.path) || !file.url.starts_with(L"https://") ||
-                file.sha256.size() != 64 || (file.size > 0 && file.size > 250ULL * 1024ULL * 1024ULL)) {
+                file.sha256.size() != 64 || is_zero_hash(file.sha256) ||
+                file.size == 0 || file.size > 1024ULL * 1024ULL * 1024ULL) {
                 return std::nullopt;
             }
             manifest.files.push_back(std::move(file));
@@ -468,28 +435,24 @@ std::optional<OcrDependencyManifest> parse_ocr_dependency_manifest(std::wstring_
     }
 }
 
-OcrDependencyStatus ocr_dependency_status(int engine) {
-    if (engine == static_cast<int>(OcrEngine::system)) {
-        return {true, false, L"状态: 就绪"};
-    }
-    if (engine == static_cast<int>(OcrEngine::wechat)) {
-        const std::wstring wechat_dir = get_wechat_install_path();
-        const std::wstring ocr_dir = find_wechat_ocr_exe_dir();
-        if (wechat_dir.empty() || ocr_dir.empty()) {
-            return {false, false, L"状态: 未找到微信 OCR"};
+OcrDependencyStatus ocr_dependency_status(std::wstring_view engine) {
+    const auto& spec = ocr_engine_spec(engine);
+    std::wstring first_missing;
+    bool saw_partial_directory = false;
+    for (const auto& root : ocr_dependency_roots()) {
+        std::wstring missing;
+        if (dependency_directory_ready(root, spec, &missing)) {
+            return {true, false, L"状态: " + std::wstring(spec.label) + L" 就绪"};
         }
-        if (!find_dependency_file(L"wechat_ocr_api.dll")) {
-            return {false, false, L"状态: 缺少微信 OCR 适配 DLL"};
+        if (!saw_partial_directory && std::filesystem::exists(root)) {
+            saw_partial_directory = true;
+            first_missing = missing;
         }
-        return {true, false, L"状态: 就绪"};
     }
-    if (engine == static_cast<int>(OcrEngine::rapid_ocr)) {
-        if (find_rapid_ocr_dependency_directory()) {
-            return {true, false, L"状态: 就绪"};
-        }
-        return {false, true, L"状态: 未下载高精度 OCR 依赖"};
+    if (saw_partial_directory) {
+        return {false, true, L"状态: 缺少 " + first_missing};
     }
-    return {false, false, L"状态: 未知 OCR 引擎"};
+    return {false, true, L"状态: 未下载 RapidOCR ONNX 依赖"};
 }
 
 bool download_ocr_dependencies(
@@ -535,7 +498,7 @@ bool download_ocr_dependencies(
     }
 
     const auto final_dir = rapid_ocr_dependency_directory();
-    const auto staging_dir = root / (std::wstring(kRapidOcrPackageId) + L".download");
+    const auto staging_dir = root / (std::wstring(kRapidOcrOnnxPackageId) + L".download");
     std::filesystem::remove_all(staging_dir, ignored);
     std::filesystem::create_directories(staging_dir, ignored);
 
@@ -594,12 +557,11 @@ OcrOutput recognize_text(const Bitmap& bitmap, const AppConfig& config) {
         return {false, {}, L"OCR 图像为空。"};
     }
 
-    if (config.ocr_engine == static_cast<int>(OcrEngine::rapid_ocr) && !find_rapid_ocr_dependency_directory()) {
-        return {false, {}, L"未安装本地高精度 OCR 依赖，请在设置中点击“下载依赖”。"};
-    }
-
-    if (config.ocr_engine == static_cast<int>(OcrEngine::wechat) && !find_dependency_file(L"wechat_ocr_api.dll")) {
-        return {false, {}, L"未安装微信 OCR 适配 DLL，无法使用微信 OCR。"};
+    const auto& spec = ocr_engine_spec(config.ocr_engine);
+    const auto runtime_dir = find_rapid_ocr_dependency_directory(spec);
+    if (!runtime_dir) {
+        const OcrDependencyStatus status = ocr_dependency_status(spec.id);
+        return {false, {}, status.message + L"，请在设置中点击“下载依赖”。"};
     }
 
     const Bitmap ocr_bitmap = resize_bitmap_for_ocr(bitmap);
@@ -618,23 +580,11 @@ OcrOutput recognize_text(const Bitmap& bitmap, const AppConfig& config) {
     }
 
     std::wstring cmd_line = quote_argument(ocr_exe.wstring());
-    if (config.ocr_engine == static_cast<int>(OcrEngine::system)) {
-        cmd_line += L" --engine winrt --image " + quote_argument(temp_png.wstring());
-    } else if (config.ocr_engine == static_cast<int>(OcrEngine::wechat)) {
-        std::wstring wechat_dir = get_wechat_install_path();
-        std::wstring ocr_dir = find_wechat_ocr_exe_dir();
-        cmd_line += L" --engine wechat --image " + quote_argument(temp_png.wstring());
-        cmd_line += L" --wechat-dir " + quote_argument(wechat_dir) + L" --ocr-dir " + quote_argument(ocr_dir);
-    } else if (config.ocr_engine == static_cast<int>(OcrEngine::rapid_ocr)) {
-        const auto runtime_dir = *find_rapid_ocr_dependency_directory();
-        cmd_line += L" --engine onnx --image " + quote_argument(temp_png.wstring());
-        cmd_line += L" --model-dir " + quote_argument((runtime_dir / L"models").wstring());
-        cmd_line += L" --dependency-dir " + quote_argument(runtime_dir.wstring());
-        cmd_line += L" --ort-threads 2";
-    } else {
-        std::filesystem::remove(temp_png);
-        return {false, {}, L"未知的 OCR 引擎配置。"};
-    }
+    cmd_line += L" --engine onnx --image " + quote_argument(temp_png.wstring());
+    cmd_line += L" --model-dir " + quote_argument((*runtime_dir / std::wstring(spec.profile_directory)).wstring());
+    cmd_line += L" --dependency-dir " + quote_argument(runtime_dir->wstring());
+    cmd_line += L" --ocr-profile " + quote_argument(std::wstring(spec.id));
+    cmd_line += L" --ort-threads 2";
 
     OcrOutput result = run_ocr_process(cmd_line);
 

@@ -36,7 +36,7 @@ struct OcrDependencyStatus {
 [[nodiscard]] std::wstring join_ocr_lines(std::span<const std::wstring> lines);
 [[nodiscard]] std::filesystem::path rapid_ocr_dependency_directory();
 [[nodiscard]] std::optional<OcrDependencyManifest> parse_ocr_dependency_manifest(std::wstring_view json);
-[[nodiscard]] OcrDependencyStatus ocr_dependency_status(int engine);
+[[nodiscard]] OcrDependencyStatus ocr_dependency_status(std::wstring_view engine);
 bool download_ocr_dependencies(
     std::wstring_view manifest_url,
     const std::function<void(int)>& progress_callback,

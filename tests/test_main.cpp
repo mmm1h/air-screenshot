@@ -91,7 +91,7 @@ void test_rect_and_bitmap() {
 
 void test_config() {
     expect(airshot::AppConfig{}.ocr_engine == airshot::kDefaultOcrEngine &&
-               airshot::kDefaultOcrEngine == static_cast<int>(airshot::OcrEngine::rapid_ocr),
+               airshot::kDefaultOcrEngine == airshot::kOcrEngineRapidV5Fast,
            L"default OCR engine is local high accuracy");
 
     airshot::AppConfig config;
@@ -110,7 +110,7 @@ void test_config() {
     config.text_font_family = L"Consolas";
     config.text_font_bold = true;
     config.text_font_italic = true;
-    config.ocr_engine = static_cast<int>(airshot::OcrEngine::wechat);
+    config.ocr_engine = std::wstring(airshot::kOcrEngineRapidV5Accurate);
     config.ocr_download_url = L"https://example.com/ocr-dependencies.json";
     const auto parsed = airshot::config_from_json(airshot::config_to_json(config));
     expect(parsed.has_value(), L"config JSON round trip parses");
@@ -125,7 +125,7 @@ void test_config() {
                parsed->text_font_family == L"Consolas" &&
                parsed->text_font_bold == true &&
                parsed->text_font_italic == true &&
-               parsed->ocr_engine == static_cast<int>(airshot::OcrEngine::wechat) &&
+               parsed->ocr_engine == airshot::kOcrEngineRapidV5Accurate &&
                parsed->ocr_download_url == L"https://example.com/ocr-dependencies.json",
            L"config JSON round trip values");
 
@@ -138,9 +138,14 @@ void test_config() {
                future->ocr_engine == airshot::kDefaultOcrEngine,
            L"config accepts unknown future fields and keeps annotation defaults");
     expect(!airshot::config_from_json(L"{\"annotation\":[}"), L"config rejects malformed JSON");
-    const auto clamped_ocr = airshot::config_from_json(LR"({"ocr":{"engine":99}})");
-    expect(clamped_ocr && clamped_ocr->ocr_engine == static_cast<int>(airshot::OcrEngine::rapid_ocr),
+    const auto old_numeric_ocr = airshot::config_from_json(LR"({"ocr":{"engine":1}})");
+    expect(old_numeric_ocr && old_numeric_ocr->ocr_engine == airshot::kDefaultOcrEngine,
+           L"config migrates old numeric OCR engine");
+    const auto invalid_ocr = airshot::config_from_json(LR"({"ocr":{"engine":"banana"}})");
+    expect(invalid_ocr && invalid_ocr->ocr_engine == airshot::kDefaultOcrEngine,
            L"config clamps invalid OCR engine");
+    expect(airshot::normalize_ocr_engine(L"wechat") == airshot::kOcrEngineRapidV5Fast,
+           L"config migrates legacy WeChat OCR engine");
 
     expect(airshot::normalize_annotation_hidden_tools(L"pen,unknown,RECT;pen close") == L"rect,pen,close",
            L"hidden annotation tools normalize, dedupe, and skip unknown values");
@@ -182,23 +187,38 @@ void test_ocr_join() {
 
 void test_ocr_dependency_manifest() {
     const auto manifest = airshot::parse_ocr_dependency_manifest(
-        LR"({"packageId":"rapidocr-ppocrv5-mobile-v1","files":[)"
+        LR"({"packageId":"rapidocr-onnx","files":[)"
         LR"({"path":"rapidocr_api.dll","url":"https://example.com/rapidocr_api.dll","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1},)"
         LR"({"path":"onnxruntime.dll","url":"https://example.com/onnxruntime.dll","sha256":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","size":2},)"
-        LR"({"path":"models/ch_PP-OCRv5_det_mobile.onnx","url":"https://example.com/det.onnx","sha256":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","size":3},)"
-        LR"({"path":"models/ch_PP-OCRv5_rec_mobile.onnx","url":"https://example.com/rec.onnx","sha256":"DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD","size":4},)"
-        LR"({"path":"models/ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx","url":"https://example.com/cls.onnx","sha256":"EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE","size":5},)"
-        LR"({"path":"models/ppocrv5_dict.txt","url":"https://example.com/dict.txt","sha256":"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF","size":6})"
+        LR"({"path":"rapidocr_runner.exe","url":"https://example.com/rapidocr_runner.exe","sha256":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","size":3},)"
+        LR"({"path":"models/rapidocr-v5-fast/det.onnx","url":"https://example.com/v5-fast-det.onnx","sha256":"DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD","size":4},)"
+        LR"({"path":"models/rapidocr-v5-fast/rec.onnx","url":"https://example.com/v5-fast-rec.onnx","sha256":"EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE","size":5},)"
+        LR"({"path":"models/rapidocr-v5-fast/cls.onnx","url":"https://example.com/v5-fast-cls.onnx","sha256":"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF","size":6},)"
+        LR"({"path":"models/rapidocr-v5-fast/dict.txt","url":"https://example.com/v5-fast-dict.txt","sha256":"1111111111111111111111111111111111111111111111111111111111111111","size":7},)"
+        LR"({"path":"models/rapidocr-v5-accurate/det.onnx","url":"https://example.com/v5-accurate-det.onnx","sha256":"2222222222222222222222222222222222222222222222222222222222222222","size":8},)"
+        LR"({"path":"models/rapidocr-v5-accurate/rec.onnx","url":"https://example.com/v5-accurate-rec.onnx","sha256":"3333333333333333333333333333333333333333333333333333333333333333","size":9},)"
+        LR"({"path":"models/rapidocr-v5-accurate/cls.onnx","url":"https://example.com/v5-accurate-cls.onnx","sha256":"4444444444444444444444444444444444444444444444444444444444444444","size":10},)"
+        LR"({"path":"models/rapidocr-v5-accurate/dict.txt","url":"https://example.com/v5-accurate-dict.txt","sha256":"5555555555555555555555555555555555555555555555555555555555555555","size":11},)"
+        LR"({"path":"models/rapidocr-v4-compat/det.onnx","url":"https://example.com/v4-compat-det.onnx","sha256":"6666666666666666666666666666666666666666666666666666666666666666","size":12},)"
+        LR"({"path":"models/rapidocr-v4-compat/rec.onnx","url":"https://example.com/v4-compat-rec.onnx","sha256":"7777777777777777777777777777777777777777777777777777777777777777","size":13},)"
+        LR"({"path":"models/rapidocr-v4-compat/cls.onnx","url":"https://example.com/v4-compat-cls.onnx","sha256":"8888888888888888888888888888888888888888888888888888888888888888","size":14},)"
+        LR"({"path":"models/rapidocr-v4-compat/dict.txt","url":"https://example.com/v4-compat-dict.txt","sha256":"9999999999999999999999999999999999999999999999999999999999999999","size":15})"
         LR"(]})");
-    expect(manifest && manifest->package_id == airshot::kRapidOcrPackageId && manifest->files.size() == 6,
+    expect(manifest && manifest->package_id == airshot::kRapidOcrOnnxPackageId && manifest->files.size() == 15,
            L"OCR dependency manifest parses required files");
 
     expect(!airshot::parse_ocr_dependency_manifest(
-               LR"({"packageId":"rapidocr-ppocrv5-mobile-v1","files":[{"path":"../rapidocr_api.dll","url":"https://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]})"),
+               LR"({"packageId":"rapidocr-onnx","files":[{"path":"../rapidocr_api.dll","url":"https://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1}]})"),
            L"OCR dependency manifest rejects unsafe paths");
     expect(!airshot::parse_ocr_dependency_manifest(
-               LR"({"packageId":"rapidocr-ppocrv5-mobile-v1","files":[{"path":"rapidocr_api.dll","url":"http://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]})"),
+               LR"({"packageId":"rapidocr-onnx","files":[{"path":"rapidocr_api.dll","url":"http://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1}]})"),
            L"OCR dependency manifest rejects non-HTTPS URLs");
+    expect(!airshot::parse_ocr_dependency_manifest(
+               LR"({"packageId":"rapidocr-onnx","files":[{"path":"rapidocr_api.dll","url":"https://example.com/a","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":1}]})"),
+           L"OCR dependency manifest rejects zero SHA256");
+    expect(!airshot::parse_ocr_dependency_manifest(
+               LR"({"packageId":"rapidocr-onnx","files":[{"path":"rapidocr_api.dll","url":"https://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":0}]})"),
+           L"OCR dependency manifest rejects zero size");
 }
 
 void test_portable_runtime() {

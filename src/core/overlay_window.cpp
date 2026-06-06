@@ -5,8 +5,10 @@
 #include <dwrite.h>
 #include <imm.h>
 
+#include <array>
 #include <cmath>
 #include <mutex>
+#include <utility>
 
 namespace airshot::overlay_detail {
 
@@ -68,6 +70,7 @@ bool OverlayWindow::create() {
 void OverlayWindow::destroy() {
     background_.Reset();
     render_target_.Reset();
+    round_stroke_style_.Reset();
     if (hwnd_) {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
@@ -84,6 +87,29 @@ bool OverlayWindow::create_render_target() {
     if (!hwnd_) {
         return false;
     }
+    bool current_theme_is_light = should_use_light_theme(session_.request_.config.theme);
+    if (render_target_) {
+        if (is_light_theme_ == current_theme_is_light) {
+            return true;
+        }
+        render_target_.Reset();
+        background_.Reset();
+        dim_brush_.Reset();
+        blue_brush_.Reset();
+        white_brush_.Reset();
+        black_brush_.Reset();
+        toolbar_brush_.Reset();
+        toolbar_bg_brush_.Reset();
+        toolbar_border_brush_.Reset();
+        hover_bg_brush_.Reset();
+        active_bg_brush_.Reset();
+        true_white_brush_.Reset();
+        green_brush_.Reset();
+        red_brush_.Reset();
+        round_stroke_style_.Reset();
+    }
+    is_light_theme_ = current_theme_is_light;
+
     const D2D1_SIZE_U size =
         D2D1::SizeU(static_cast<UINT>(monitor_.bounds.width()), static_cast<UINT>(monitor_.bounds.height()));
     HRESULT result = d2d_factory()->CreateHwndRenderTarget(
@@ -104,14 +130,42 @@ bool OverlayWindow::create_render_target() {
         return false;
     }
     render_target_->CreateSolidColorBrush(D2D1::ColorF(0, 0.48F), dim_brush_.GetAddressOf());
-    render_target_->CreateSolidColorBrush(D2D1::ColorF(0x1677FF), blue_brush_.GetAddressOf());
-    render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), white_brush_.GetAddressOf());
-    render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), black_brush_.GetAddressOf());
-    render_target_->CreateSolidColorBrush(D2D1::ColorF(0x202124, 0.94F), toolbar_brush_.GetAddressOf());
-    render_target_->CreateSolidColorBrush(D2D1::ColorF(0x21252B, 0.94F), toolbar_bg_brush_.GetAddressOf());
-    render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White, 0.15F), toolbar_border_brush_.GetAddressOf());
-    render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White, 0.12F), hover_bg_brush_.GetAddressOf());
-    render_target_->CreateSolidColorBrush(D2D1::ColorF(0x1677FF, 0.85F), active_bg_brush_.GetAddressOf());
+    render_target_->CreateSolidColorBrush(D2D1::ColorF(0x0066FF), blue_brush_.GetAddressOf());
+    render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), true_white_brush_.GetAddressOf());
+    render_target_->CreateSolidColorBrush(D2D1::ColorF(0x00B634), green_brush_.GetAddressOf());
+    render_target_->CreateSolidColorBrush(D2D1::ColorF(0xF54A45), red_brush_.GetAddressOf());
+
+    if (is_light_theme_) {
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x1F2329), white_brush_.GetAddressOf());
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), black_brush_.GetAddressOf());
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(1.0F, 1.0F, 1.0F, 0.96F), toolbar_brush_.GetAddressOf());
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(1.0F, 1.0F, 1.0F, 0.96F), toolbar_bg_brush_.GetAddressOf());
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(0xDCDFE6), toolbar_border_brush_.GetAddressOf());
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x1F2329, 0.08F), hover_bg_brush_.GetAddressOf());
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x0066FF, 0.15F), active_bg_brush_.GetAddressOf());
+    } else {
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), white_brush_.GetAddressOf());
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), black_brush_.GetAddressOf());
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x121316, 0.94F), toolbar_brush_.GetAddressOf());
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x121316, 0.94F), toolbar_bg_brush_.GetAddressOf());
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x0066FF, 0.20F), toolbar_border_brush_.GetAddressOf());
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White, 0.12F), hover_bg_brush_.GetAddressOf());
+        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x0066FF, 0.85F), active_bg_brush_.GetAddressOf());
+    }
+
+    D2D1_STROKE_STYLE_PROPERTIES stroke_properties = D2D1::StrokeStyleProperties(
+        D2D1_CAP_STYLE_ROUND,
+        D2D1_CAP_STYLE_ROUND,
+        D2D1_CAP_STYLE_ROUND,
+        D2D1_LINE_JOIN_ROUND,
+        1.0f,
+        D2D1_DASH_STYLE_SOLID,
+        0.0f
+    );
+    HRESULT hr = d2d_factory()->CreateStrokeStyle(stroke_properties, nullptr, 0, round_stroke_style_.GetAddressOf());
+    if (FAILED(hr)) {
+        return false;
+    }
     return true;
 }
 
@@ -222,27 +276,38 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
             }
         }
     } else if (annotation.tool == Tool::mosaic) {
-        for (const POINT relative : annotation.points) {
-            POINT point{selection.left + relative.x, selection.top + relative.y};
-            RectI block{point.x - 7, point.y - 7, point.x + 7, point.y + 7};
-            render_target_->FillRectangle(local_rect(block), dim_brush_.Get());
+        if (annotation.points.empty()) {
+            render_target_->FillRectangle(local_rect(RectI{start.x, start.y, end.x, end.y}), dim_brush_.Get());
+            render_target_->DrawRectangle(local_rect(RectI{start.x, start.y, end.x, end.y}), white_brush_.Get(), 1.0F, round_stroke_style_.Get());
+        } else {
+            for (const POINT relative : annotation.points) {
+                POINT point{selection.left + relative.x, selection.top + relative.y};
+                RectI block{point.x - 7, point.y - 7, point.x + 7, point.y + 7};
+                render_target_->FillRectangle(local_rect(block), dim_brush_.Get());
+            }
         }
     } else if (annotation.tool == Tool::blur) {
         ComPtr<ID2D1SolidColorBrush> temp_blur_brush;
         render_target_->CreateSolidColorBrush(D2D1::ColorF(0.7F, 0.7F, 0.7F, 0.45F), temp_blur_brush.GetAddressOf());
-        for (const POINT relative : annotation.points) {
-            POINT point{selection.left + relative.x, selection.top + relative.y};
-            float radius = draw_width * 3.5F;
-            if (radius < 5.0F) radius = 5.0F;
-            D2D1_ELLIPSE ellipse = D2D1::Ellipse(
-                D2D1::Point2F(static_cast<float>(point.x - monitor_.bounds.left), static_cast<float>(point.y - monitor_.bounds.top)),
-                radius,
-                radius);
-            render_target_->FillEllipse(ellipse, temp_blur_brush.Get());
+        if (annotation.points.empty()) {
+            render_target_->FillRectangle(local_rect(RectI{start.x, start.y, end.x, end.y}), temp_blur_brush.Get());
+            render_target_->DrawRectangle(local_rect(RectI{start.x, start.y, end.x, end.y}), white_brush_.Get(), 1.0F, round_stroke_style_.Get());
+        } else {
+            for (const POINT relative : annotation.points) {
+                POINT point{selection.left + relative.x, selection.top + relative.y};
+                float radius = draw_width * 3.5F;
+                if (radius < 5.0F) radius = 5.0F;
+                D2D1_ELLIPSE ellipse = D2D1::Ellipse(
+                    D2D1::Point2F(static_cast<float>(point.x - monitor_.bounds.left), static_cast<float>(point.y - monitor_.bounds.top)),
+                    radius,
+                    radius);
+                render_target_->FillEllipse(ellipse, temp_blur_brush.Get());
+            }
         }
     } else if (annotation.tool == Tool::text) {
         ComPtr<IDWriteTextFormat> format;
         float fontSize = preview ? session_.active_text_size() : annotation.width;
+        TextStyle text_style = preview ? session_.active_text_style() : annotation.text_style;
         dwrite_factory()->CreateTextFormat(session_.request_.config.text_font_family.c_str(),
                                            nullptr,
                                            session_.request_.config.text_font_bold ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL,
@@ -256,11 +321,111 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
                         static_cast<float>(start.y - monitor_.bounds.top),
                         static_cast<float>(monitor_.bounds.width()),
                         static_cast<float>(monitor_.bounds.height()));
-        render_target_->DrawTextW(annotation.text.c_str(),
-                                  static_cast<UINT32>(annotation.text.size()),
-                                  format.Get(),
-                                  bounds,
-                                  brush.Get());
+        if (text_style == TextStyle::dark) {
+            ComPtr<IDWriteTextLayout> layout;
+            dwrite_factory()->CreateTextLayout(annotation.text.c_str(),
+                                               static_cast<UINT32>(annotation.text.size()),
+                                               format.Get(),
+                                               800.0F,
+                                               160.0F,
+                                               layout.GetAddressOf());
+            DWRITE_TEXT_METRICS metrics{};
+            if (layout) {
+                layout->GetMetrics(&metrics);
+            }
+            const D2D1_RECT_F background = D2D1::RectF(bounds.left - 4.0F,
+                                                       bounds.top - 2.0F,
+                                                       bounds.left + std::max(40.0F, metrics.widthIncludingTrailingWhitespace) + 8.0F,
+                                                       bounds.top + std::max(fontSize + 8.0F, metrics.height + 6.0F));
+            ComPtr<ID2D1SolidColorBrush> dark_background;
+            render_target_->CreateSolidColorBrush(D2D1::ColorF(0x1F2329, 0.90F), dark_background.GetAddressOf());
+            render_target_->FillRoundedRectangle(D2D1::RoundedRect(background, 3.0F, 3.0F), dark_background.Get());
+            render_target_->DrawTextW(annotation.text.c_str(),
+                                      static_cast<UINT32>(annotation.text.size()),
+                                      format.Get(),
+                                      bounds,
+                                      true_white_brush_.Get());
+        } else if (text_style == TextStyle::outline) {
+            for (float dy : {-2.0F, 0.0F, 2.0F}) {
+                for (float dx : {-2.0F, 0.0F, 2.0F}) {
+                    if (dx == 0.0F && dy == 0.0F) {
+                        continue;
+                    }
+                    D2D1_RECT_F outline_bounds = bounds;
+                    outline_bounds.left += dx;
+                    outline_bounds.right += dx;
+                    outline_bounds.top += dy;
+                    outline_bounds.bottom += dy;
+                    render_target_->DrawTextW(annotation.text.c_str(),
+                                              static_cast<UINT32>(annotation.text.size()),
+                                              format.Get(),
+                                              outline_bounds,
+                                              true_white_brush_.Get());
+                }
+            }
+            render_target_->DrawTextW(annotation.text.c_str(),
+                                      static_cast<UINT32>(annotation.text.size()),
+                                      format.Get(),
+                                      bounds,
+                                      brush.Get());
+        } else {
+            render_target_->DrawTextW(annotation.text.c_str(),
+                                      static_cast<UINT32>(annotation.text.size()),
+                                      format.Get(),
+                                      bounds,
+                                      brush.Get());
+        }
+    } else if (annotation.tool == Tool::watermark) {
+        if (annotation.text.empty()) {
+            return;
+        }
+        ComPtr<IDWriteTextFormat> format;
+        dwrite_factory()->CreateTextFormat(session_.request_.config.text_font_family.c_str(),
+                                           nullptr,
+                                           DWRITE_FONT_WEIGHT_NORMAL,
+                                           DWRITE_FONT_STYLE_NORMAL,
+                                           DWRITE_FONT_STRETCH_NORMAL,
+                                           annotation.width,
+                                           L"zh-CN",
+                                           format.GetAddressOf());
+        format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+
+        const float watermark_alpha = std::clamp(annotation.alpha / 255.0F, 0.08F, 0.86F);
+        ComPtr<ID2D1SolidColorBrush> watermark_brush;
+        render_target_->CreateSolidColorBrush(
+            D2D1::ColorF(GetRValue(annotation.color) / 255.0F,
+                         GetGValue(annotation.color) / 255.0F,
+                         GetBValue(annotation.color) / 255.0F,
+                         watermark_alpha),
+            watermark_brush.GetAddressOf());
+
+        const RectI selected_rect = session_.selection();
+        const float left = static_cast<float>(selected_rect.left - monitor_.bounds.left);
+        const float top = static_cast<float>(selected_rect.top - monitor_.bounds.top);
+        const float width = static_cast<float>(selected_rect.width());
+        const float height = static_cast<float>(selected_rect.height());
+        const float step_x = std::max(120.0F, static_cast<float>(annotation.text.size()) * annotation.width + 72.0F);
+        const float step_y = std::max(70.0F, annotation.width * 3.2F);
+
+        render_target_->PushAxisAlignedClip(D2D1::RectF(left, top, left + width, top + height),
+                                            D2D1_ANTIALIAS_MODE_ALIASED);
+        D2D1_MATRIX_3X2_F previous_transform{};
+        render_target_->GetTransform(&previous_transform);
+        const D2D1_POINT_2F center = D2D1::Point2F(left + width / 2.0F, top + height / 2.0F);
+        render_target_->SetTransform(D2D1::Matrix3x2F::Rotation(-18.0F, center) * previous_transform);
+        for (float y = top - step_y; y < top + height + step_y; y += step_y) {
+            for (float x = left - step_x; x < left + width + step_x; x += step_x) {
+                const D2D1_RECT_F text_bounds = D2D1::RectF(x, y, x + step_x, y + annotation.width * 2.0F);
+                render_target_->DrawTextW(annotation.text.c_str(),
+                                          static_cast<UINT32>(annotation.text.size()),
+                                          format.Get(),
+                                          text_bounds,
+                                          watermark_brush.Get());
+            }
+        }
+        render_target_->SetTransform(previous_transform);
+        render_target_->PopAxisAlignedClip();
     } else if (annotation.tool == Tool::serial) {
         float radius = 8.0F + annotation.width * 1.5F;
         const D2D1_ELLIPSE ellipse = D2D1::Ellipse(
@@ -296,7 +461,7 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
 }
 
 void OverlayWindow::paint() {
-    if (!render_target_ && !create_render_target()) {
+    if (!create_render_target()) {
         return;
     }
     PAINTSTRUCT paint{};
@@ -391,15 +556,16 @@ void OverlayWindow::paint() {
                 render_target_->DrawRectangle(local_rect_f, blue_brush_.Get(), 1.0F);
 
                 float handle_size = 4.0F;
-                D2D1_RECT_F handles[] = {
-                    D2D1::RectF(local_rect_f.left - handle_size, local_rect_f.top - handle_size, local_rect_f.left + handle_size, local_rect_f.top + handle_size),
-                    D2D1::RectF(local_rect_f.right - handle_size, local_rect_f.top - handle_size, local_rect_f.right + handle_size, local_rect_f.top + handle_size),
-                    D2D1::RectF(local_rect_f.left - handle_size, local_rect_f.bottom - handle_size, local_rect_f.left + handle_size, local_rect_f.bottom + handle_size),
-                    D2D1::RectF(local_rect_f.right - handle_size, local_rect_f.bottom - handle_size, local_rect_f.right + handle_size, local_rect_f.bottom + handle_size),
+                D2D1_POINT_2F handles[] = {
+                    D2D1::Point2F(local_rect_f.left, local_rect_f.top),
+                    D2D1::Point2F(local_rect_f.right, local_rect_f.top),
+                    D2D1::Point2F(local_rect_f.left, local_rect_f.bottom),
+                    D2D1::Point2F(local_rect_f.right, local_rect_f.bottom),
                 };
-                for (const auto& h : handles) {
-                    render_target_->FillRectangle(h, blue_brush_.Get());
-                    render_target_->DrawRectangle(h, white_brush_.Get(), 1.0F);
+                for (const auto& pt : handles) {
+                    D2D1_ELLIPSE circle = D2D1::Ellipse(pt, handle_size, handle_size);
+                    render_target_->FillEllipse(circle, blue_brush_.Get());
+                    render_target_->DrawEllipse(circle, white_brush_.Get(), 1.0F);
                 }
             }
         }
@@ -438,9 +604,25 @@ void OverlayWindow::paint() {
 
         // Draw main toolbar background rounded rectangle card
         if (!session_.toolbar().empty()) {
-            D2D1_RECT_F bg_rect = local_rect(padded_buttons_bounds(session_.toolbar(), 6));
+            D2D1_RECT_F bg_rect = local_rect(padded_buttons_bounds(session_.toolbar(), 8));
+            bg_rect.left -= 14.0F; // Leave 14px for drag handle
             render_target_->FillRoundedRectangle(D2D1::RoundedRect(bg_rect, 6.f, 6.f), toolbar_bg_brush_.Get());
             render_target_->DrawRoundedRectangle(D2D1::RoundedRect(bg_rect, 6.f, 6.f), toolbar_border_brush_.Get(), 1.f);
+
+            // Draw drag handle (6 vertical dots)
+            float first_btn_left = local_rect(session_.toolbar().front().bounds).left;
+            float handle_cx = first_btn_left - 9.0F;
+            float handle_cy = bg_rect.top + (bg_rect.bottom - bg_rect.top) / 2.0F;
+
+            ComPtr<ID2D1SolidColorBrush> handle_brush;
+            render_target_->CreateSolidColorBrush(D2D1::ColorF(is_light_theme_ ? 0x1F2329 : 0xFFFFFF, 0.35F), handle_brush.GetAddressOf());
+
+            render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx - 1.5f, handle_cy - 4.0f), 1.0f, 1.0f), handle_brush.Get());
+            render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx + 1.5f, handle_cy - 4.0f), 1.0f, 1.0f), handle_brush.Get());
+            render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx - 1.5f, handle_cy), 1.0f, 1.0f), handle_brush.Get());
+            render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx + 1.5f, handle_cy), 1.0f, 1.0f), handle_brush.Get());
+            render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx - 1.5f, handle_cy + 4.0f), 1.0f, 1.0f), handle_brush.Get());
+            render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx + 1.5f, handle_cy + 4.0f), 1.0f, 1.0f), handle_brush.Get());
 
             for (const auto& button : session_.toolbar()) {
                 if (!intersect(button.bounds, monitor_.bounds)) {
@@ -450,16 +632,16 @@ void OverlayWindow::paint() {
 
                 if (button.id == L"|") {
                     float cx = bounds.left + (bounds.right - bounds.left) / 2.0F;
-                    ComPtr<ID2D1SolidColorBrush> sep_brush;
-                    render_target_->CreateSolidColorBrush(D2D1::ColorF(0.35f, 0.38f, 0.43f, 0.6f), sep_brush.GetAddressOf());
                     render_target_->DrawLine(
-                        D2D1::Point2F(cx, bounds.top + 6.0F),
-                        D2D1::Point2F(cx, bounds.bottom - 6.0F),
-                        sep_brush.Get(),
-                        1.0F
+                        D2D1::Point2F(cx, bounds.top + 11.0F),
+                        D2D1::Point2F(cx, bounds.bottom - 11.0F),
+                        toolbar_border_brush_.Get(),
+                        1.2F
                     );
                     continue;
                 }
+
+                ComPtr<ID2D1SolidColorBrush> original_white_brush = white_brush_;
 
                 bool is_active = (button.id == L"lock" && session_.annotation_locked_tool()) ||
                                  (session_.active_tool() != Tool::none &&
@@ -469,9 +651,9 @@ void OverlayWindow::paint() {
                                    (button.id == L"line" && session_.active_tool() == Tool::line) ||
                                    (button.id == L"arrow" && session_.active_tool() == Tool::arrow) ||
                                    (button.id == L"pen" && session_.active_tool() == Tool::pen) ||
-                                   (button.id == L"mosaic" && session_.active_tool() == Tool::mosaic) ||
-                                   (button.id == L"blur" && session_.active_tool() == Tool::blur) ||
+                                   (button.id == L"mosaic" && (session_.active_tool() == Tool::mosaic || session_.active_tool() == Tool::blur)) ||
                                    (button.id == L"highlight" && session_.active_tool() == Tool::highlight) ||
+                                   (button.id == L"watermark" && session_.active_tool() == Tool::watermark) ||
                                    (button.id == L"text" && session_.active_tool() == Tool::text) ||
                                    (button.id == L"serial" && session_.active_tool() == Tool::serial) ||
                                    (button.id == L"eraser" && session_.active_tool() == Tool::eraser)));
@@ -484,92 +666,194 @@ void OverlayWindow::paint() {
                     render_target_->FillRoundedRectangle(D2D1::RoundedRect(bounds, 4.f, 4.f), hover_bg_brush_.Get());
                 }
 
+                if (button.id == L"copy") {
+                    white_brush_ = green_brush_;
+                } else if (button.id == L"close") {
+                    white_brush_ = red_brush_;
+                } else if (is_active && is_light_theme_) {
+                    white_brush_ = blue_brush_;
+                }
+
                 const float cx = bounds.left + (bounds.right - bounds.left) / 2.0F;
                 const float cy = bounds.top + (bounds.bottom - bounds.top) / 2.0F;
 
                 if (button.id == L"lock") {
-                    render_target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 6.0F, cy - 1.0F, cx + 6.0F, cy + 7.0F), 1.5F, 1.5F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 4.5F, cy - 1.0F), D2D1::Point2F(cx - 4.5F, cy - 4.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 4.5F, cy - 1.0F), D2D1::Point2F(cx + 4.5F, cy - 4.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 4.5F, cy - 4.0F), D2D1::Point2F(cx + 4.5F, cy - 4.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 7.0F, cy - 1.0F, cx + 7.0F, cy + 8.0F), 2.0F, 2.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 4.5F, cy - 1.0F), D2D1::Point2F(cx - 4.5F, cy - 5.5F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + 4.5F, cy - 1.0F), D2D1::Point2F(cx + 4.5F, cy - 5.5F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 4.5F, cy - 5.5F), D2D1::Point2F(cx + 4.5F, cy - 5.5F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                 } else if (button.id == L"select") {
-                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy - 6.0F), D2D1::Point2F(cx - 5.0F, cy + 6.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy - 6.0F), D2D1::Point2F(cx + 4.0F, cy + 2.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy + 6.0F), D2D1::Point2F(cx - 1.0F, cy + 2.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 1.0F, cy + 2.0F), D2D1::Point2F(cx + 4.0F, cy + 2.0F), white_brush_.Get(), 1.5F);
+                    ComPtr<ID2D1PathGeometry> select_geom;
+                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(select_geom.GetAddressOf()))) {
+                        ComPtr<ID2D1GeometrySink> sink;
+                        if (SUCCEEDED(select_geom->Open(sink.GetAddressOf()))) {
+                            sink->BeginFigure(D2D1::Point2F(cx - 6.0F, cy - 8.0F), D2D1_FIGURE_BEGIN_HOLLOW);
+                            sink->AddLine(D2D1::Point2F(cx + 5.5F, cy + 3.5F));
+                            sink->AddLine(D2D1::Point2F(cx + 0.5F, cy + 3.5F));
+                            sink->AddLine(D2D1::Point2F(cx + 4.5F, cy + 9.0F));
+                            sink->AddLine(D2D1::Point2F(cx + 2.0F, cy + 10.0F));
+                            sink->AddLine(D2D1::Point2F(cx - 2.0F, cy + 4.5F));
+                            sink->AddLine(D2D1::Point2F(cx - 6.0F, cy + 7.5F));
+                            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                            sink->Close();
+                            render_target_->DrawGeometry(select_geom.Get(), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                        }
+                    }
                 } else if (button.id == L"rect") {
-                    render_target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 7.5F, cy - 6.5F, cx + 7.5F, cy + 6.5F), 1.5F, 1.5F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 9.0F, cy - 8.0F, cx + 9.0F, cy + 8.0F), 2.0F, 2.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                 } else if (button.id == L"ellipse") {
-                    render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 8.0F, 6.5F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 9.0F, 9.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                 } else if (button.id == L"line") {
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy + 5.0F), D2D1::Point2F(cx + 7.0F, cy - 5.0F), white_brush_.Get(), 1.8F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 9.0F, cy + 9.0F), D2D1::Point2F(cx + 9.0F, cy - 9.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                 } else if (button.id == L"arrow") {
-                    render_target_->DrawLine(D2D1::Point2F(cx - 4.0F, cy + 4.0F), D2D1::Point2F(cx + 5.0F, cy - 5.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 5.0F, cy - 5.0F), D2D1::Point2F(cx - 1.0F, cy - 5.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 5.0F, cy - 5.0F), D2D1::Point2F(cx + 5.0F, cy - 1.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx - 6.0F, cy + 6.0F), 1.8F, 1.8F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 9.0F, cy + 9.0F), D2D1::Point2F(cx + 8.0F, cy - 8.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + 8.0F, cy - 8.0F), D2D1::Point2F(cx + 2.0F, cy - 8.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + 8.0F, cy - 8.0F), D2D1::Point2F(cx + 8.0F, cy - 2.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                 } else if (button.id == L"pen") {
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy + 5.0F), D2D1::Point2F(cx - 2.0F, cy - 4.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 2.0F, cy - 4.0F), D2D1::Point2F(cx + 6.0F, cy + 3.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy + 7.0F), D2D1::Point2F(cx + 6.0F, cy + 7.0F), white_brush_.Get(), 1.2F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy + 3.0F), D2D1::Point2F(cx + 4.0F, cy - 6.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 3.0F, cy + 5.0F), D2D1::Point2F(cx + 6.0F, cy - 4.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + 4.0F, cy - 6.0F), D2D1::Point2F(cx + 6.0F, cy - 4.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy + 3.0F), D2D1::Point2F(cx - 8.0F, cy + 8.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 3.0F, cy + 5.0F), D2D1::Point2F(cx - 8.0F, cy + 8.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    ComPtr<ID2D1PathGeometry> scribble_geom;
+                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(scribble_geom.GetAddressOf()))) {
+                        ComPtr<ID2D1GeometrySink> sink;
+                        if (SUCCEEDED(scribble_geom->Open(sink.GetAddressOf()))) {
+                            sink->BeginFigure(D2D1::Point2F(cx - 7.0F, cy + 9.0F), D2D1_FIGURE_BEGIN_HOLLOW);
+                            sink->AddBezier(D2D1::BezierSegment(
+                                D2D1::Point2F(cx - 3.0F, cy + 7.0F),
+                                D2D1::Point2F(cx + 2.0F, cy + 11.0F),
+                                D2D1::Point2F(cx + 6.0F, cy + 9.0F)
+                            ));
+                            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                            sink->Close();
+                            render_target_->DrawGeometry(scribble_geom.Get(), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                        }
+                    }
                 } else if (button.id == L"mosaic") {
-                    float step = 3.5F;
-                    // Row 0
-                    render_target_->FillRectangle(D2D1::RectF(cx - 7.0F, cy - 7.0F, cx - 7.0F + step, cy - 7.0F + step), white_brush_.Get());
-                    render_target_->FillRectangle(D2D1::RectF(cx, cy - 7.0F, cx + step, cy - 7.0F + step), white_brush_.Get());
-                    // Row 1
-                    render_target_->FillRectangle(D2D1::RectF(cx - 7.0F + step, cy - 7.0F + step, cx, cy), white_brush_.Get());
-                    render_target_->FillRectangle(D2D1::RectF(cx + step, cy - 7.0F + step, cx + 7.0F, cy), white_brush_.Get());
-                    // Row 2
-                    render_target_->FillRectangle(D2D1::RectF(cx - 7.0F, cy, cx - 7.0F + step, cy + step), white_brush_.Get());
-                    render_target_->FillRectangle(D2D1::RectF(cx, cy, cx + step, cy + step), white_brush_.Get());
-                    // Row 3
-                    render_target_->FillRectangle(D2D1::RectF(cx - 7.0F + step, cy + step, cx, cy + 7.0F), white_brush_.Get());
-                    render_target_->FillRectangle(D2D1::RectF(cx + step, cy + step, cx + 7.0F, cy + 7.0F), white_brush_.Get());
-
-                    render_target_->DrawRectangle(D2D1::RectF(cx - 7.0F, cy - 7.0F, cx + 7.0F, cy + 7.0F), white_brush_.Get(), 1.5F);
+                    float step = 5.0F;
+                    render_target_->FillRectangle(D2D1::RectF(cx - 7.5F, cy - 7.5F, cx - 7.5F + step, cy - 7.5F + step), white_brush_.Get());
+                    render_target_->FillRectangle(D2D1::RectF(cx - 7.5F + step*2, cy - 7.5F, cx + 7.5F, cy - 7.5F + step), white_brush_.Get());
+                    render_target_->FillRectangle(D2D1::RectF(cx - 7.5F + step, cy - 7.5F + step, cx - 7.5F + step*2, cy - 7.5F + step*2), white_brush_.Get());
+                    render_target_->FillRectangle(D2D1::RectF(cx - 7.5F, cy - 7.5F + step*2, cx - 7.5F + step, cy + 7.5F), white_brush_.Get());
+                    render_target_->FillRectangle(D2D1::RectF(cx - 7.5F + step*2, cy - 7.5F + step*2, cx + 7.5F, cy + 7.5F), white_brush_.Get());
+                    render_target_->DrawRectangle(D2D1::RectF(cx - 7.5F, cy - 7.5F, cx + 7.5F, cy + 7.5F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                 } else if (button.id == L"blur") {
-                    render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy + 1.0F), 4.5F, 4.5F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 6.0F), D2D1::Point2F(cx - 4.5F, cy + 1.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 6.0F), D2D1::Point2F(cx + 4.5F, cy + 1.0F), white_brush_.Get(), 1.5F);
+                    ComPtr<ID2D1PathGeometry> drop_geom;
+                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(drop_geom.GetAddressOf()))) {
+                        ComPtr<ID2D1GeometrySink> sink;
+                        if (SUCCEEDED(drop_geom->Open(sink.GetAddressOf()))) {
+                            sink->BeginFigure(D2D1::Point2F(cx, cy - 8.0F), D2D1_FIGURE_BEGIN_HOLLOW);
+                            sink->AddBezier(D2D1::BezierSegment(
+                                D2D1::Point2F(cx + 5.0F, cy - 3.0F),
+                                D2D1::Point2F(cx + 6.0F, cy + 0.5F),
+                                D2D1::Point2F(cx + 6.0F, cy + 3.0F)
+                            ));
+                            sink->AddArc(D2D1::ArcSegment(
+                                D2D1::Point2F(cx - 6.0F, cy + 3.0F),
+                                D2D1::SizeF(6.0F, 6.0F),
+                                0.0f,
+                                D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                                D2D1_ARC_SIZE_SMALL
+                            ));
+                            sink->AddBezier(D2D1::BezierSegment(
+                                D2D1::Point2F(cx - 6.0F, cy + 0.5F),
+                                D2D1::Point2F(cx - 5.0F, cy - 3.0F),
+                                D2D1::Point2F(cx, cy - 8.0F)
+                            ));
+                            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                            sink->Close();
+                            render_target_->DrawGeometry(drop_geom.Get(), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                        }
+                    }
                 } else if (button.id == L"highlight") {
-                    ComPtr<ID2D1SolidColorBrush> highlight_brush;
-                    render_target_->CreateSolidColorBrush(D2D1::ColorF(0xFADB14, 0.55F), highlight_brush.GetAddressOf());
-                    render_target_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 8.0F, cy - 3.5F, cx + 8.0F, cy + 3.5F), 3.5F, 3.5F), highlight_brush.Get());
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy + 5.0F), D2D1::Point2F(cx + 7.0F, cy + 5.0F), white_brush_.Get(), 1.2F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 3.0F, cy + 3.0F), D2D1::Point2F(cx + 4.0F, cy - 4.0F), white_brush_.Get(), 4.0F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 3.5F, cy + 3.5F), D2D1::Point2F(cx - 5.0F, cy + 5.0F), white_brush_.Get(), 2.0F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy + 5.0F), D2D1::Point2F(cx - 7.0F, cy + 5.5F), white_brush_.Get(), 3.0F, round_stroke_style_.Get());
+                    ComPtr<ID2D1SolidColorBrush> hl_brush;
+                    render_target_->CreateSolidColorBrush(D2D1::ColorF(0xFADB14, 0.4F), hl_brush.GetAddressOf());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 9.0F, cy + 8.0F), D2D1::Point2F(cx + 9.0F, cy + 8.0F), hl_brush.Get(), 3.0F, round_stroke_style_.Get());
+                } else if (button.id == L"watermark") {
+                    render_target_->DrawLine(D2D1::Point2F(cx - 9.0F, cy + 7.0F), D2D1::Point2F(cx + 8.0F, cy - 7.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy + 9.0F), D2D1::Point2F(cx + 9.0F, cy - 3.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 9.0F, cy - 2.0F), D2D1::Point2F(cx - 4.0F, cy - 6.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + 2.0F, cy + 8.0F), D2D1::Point2F(cx + 8.0F, cy + 3.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                 } else if (button.id == L"text") {
-                    render_target_->DrawLine(D2D1::Point2F(cx - 3.0F, cy - 5.0F), D2D1::Point2F(cx + 3.0F, cy - 5.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 5.0F), D2D1::Point2F(cx, cy + 5.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 1.5F, cy + 5.0F), D2D1::Point2F(cx + 1.5F, cy + 5.0F), white_brush_.Get(), 1.5F);
-
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy - 7.0F), D2D1::Point2F(cx - 7.0F, cy + 7.0F), white_brush_.Get(), 1.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy - 7.0F), D2D1::Point2F(cx - 5.0F, cy - 7.0F), white_brush_.Get(), 1.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy + 7.0F), D2D1::Point2F(cx - 5.0F, cy + 7.0F), white_brush_.Get(), 1.0F);
-
-                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy - 7.0F), D2D1::Point2F(cx + 7.0F, cy + 7.0F), white_brush_.Get(), 1.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy - 7.0F), D2D1::Point2F(cx + 5.0F, cy - 7.0F), white_brush_.Get(), 1.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 7.0F, cy + 7.0F), D2D1::Point2F(cx + 5.0F, cy + 7.0F), white_brush_.Get(), 1.0F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 7.5F, cy - 7.5F), D2D1::Point2F(cx + 7.5F, cy - 7.5F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 7.5F), D2D1::Point2F(cx, cy + 7.5F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                 } else if (button.id == L"serial") {
-                    render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 8.0F, 8.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawTextW(L"1", 1, format.Get(), D2D1::RectF(cx - 8.0F, cy - 8.0F, cx + 8.0F, cy + 8.0F), white_brush_.Get());
+                    ComPtr<ID2D1PathGeometry> tag_geom;
+                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(tag_geom.GetAddressOf()))) {
+                        ComPtr<ID2D1GeometrySink> sink;
+                        if (SUCCEEDED(tag_geom->Open(sink.GetAddressOf()))) {
+                            sink->BeginFigure(D2D1::Point2F(cx + 6.5F, cy - 6.5F), D2D1_FIGURE_BEGIN_HOLLOW);
+                            sink->AddLine(D2D1::Point2F(cx + 4.5F, cy - 0.5F));
+                            sink->AddLine(D2D1::Point2F(cx - 2.5F, cy + 6.5F));
+                            sink->AddLine(D2D1::Point2F(cx - 6.5F, cy + 2.5F));
+                            sink->AddLine(D2D1::Point2F(cx - 0.5F, cy - 4.5F));
+                            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                            sink->Close();
+                            render_target_->DrawGeometry(tag_geom.Get(), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                            render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx + 3.0F, cy - 3.0F), 1.2F, 1.2F), white_brush_.Get(), 1.5F);
+                        }
+                    }
                 } else if (button.id == L"eraser") {
-                    render_target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 6.0F, cy - 5.0F, cx + 5.0F, cy + 5.0F), 2.0F, 2.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 3.0F, cy + 6.5F), D2D1::Point2F(cx + 7.0F, cy + 6.5F), white_brush_.Get(), 1.3F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy), D2D1::Point2F(cx + 5.0F, cy), white_brush_.Get(), 1.0F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 9.0F, cy + 7.5F), D2D1::Point2F(cx + 9.0F, cy + 7.5F), white_brush_.Get(), 1.2F, round_stroke_style_.Get());
+                    ComPtr<ID2D1PathGeometry> eraser_geom;
+                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(eraser_geom.GetAddressOf()))) {
+                        ComPtr<ID2D1GeometrySink> sink;
+                        if (SUCCEEDED(eraser_geom->Open(sink.GetAddressOf()))) {
+                            sink->BeginFigure(D2D1::Point2F(cx - 6.0F, cy - 3.0F), D2D1_FIGURE_BEGIN_HOLLOW);
+							sink->AddLine(D2D1::Point2F(cx + 2.0F, cy - 6.0F));
+                            sink->AddLine(D2D1::Point2F(cx + 7.0F, cy + 1.0F));
+                            sink->AddLine(D2D1::Point2F(cx - 1.0F, cy + 4.0F));
+                            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                            sink->Close();
+                            render_target_->DrawGeometry(eraser_geom.Get(), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                        }
+                    }
+                    render_target_->DrawLine(D2D1::Point2F(cx - 2.0F, cy + 0.5F), D2D1::Point2F(cx + 6.0F, cy - 2.5F), white_brush_.Get(), 1.0F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 3.0F, cy + 2.5F), D2D1::Point2F(cx + 4.0F, cy + 0.5F), white_brush_.Get(), 1.0F, round_stroke_style_.Get());
                 } else if (button.id == L"undo") {
-                    render_target_->DrawLine(D2D1::Point2F(cx + 5.0F, cy + 4.0F), D2D1::Point2F(cx + 5.0F, cy), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 5.0F, cy), D2D1::Point2F(cx + 4.0F, cy - 3.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 4.0F, cy - 3.0F), D2D1::Point2F(cx + 1.0F, cy - 5.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 1.0F, cy - 5.0F), D2D1::Point2F(cx - 4.0F, cy - 4.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 4.0F, cy - 4.0F), D2D1::Point2F(cx - 4.0F, cy), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 4.0F, cy - 4.0F), D2D1::Point2F(cx, cy - 4.0F), white_brush_.Get(), 1.5F);
+                    ComPtr<ID2D1PathGeometry> undo_geom;
+                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(undo_geom.GetAddressOf()))) {
+                        ComPtr<ID2D1GeometrySink> sink;
+                        if (SUCCEEDED(undo_geom->Open(sink.GetAddressOf()))) {
+                            sink->BeginFigure(D2D1::Point2F(cx + 6.5F, cy + 4.5F), D2D1_FIGURE_BEGIN_HOLLOW);
+                            sink->AddArc(D2D1::ArcSegment(
+                                D2D1::Point2F(cx - 3.5F, cy - 1.5F),
+                                D2D1::SizeF(6.5F, 6.5F),
+                                0.0f,
+                                D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                                D2D1_ARC_SIZE_SMALL
+                            ));
+                            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                            sink->Close();
+                            render_target_->DrawGeometry(undo_geom.Get(), white_brush_.Get(), 1.6F, round_stroke_style_.Get());
+                        }
+                    }
+                    render_target_->DrawLine(D2D1::Point2F(cx - 3.5F, cy - 1.5F), D2D1::Point2F(cx - 3.5F, cy - 6.0F), white_brush_.Get(), 1.6F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 3.5F, cy - 1.5F), D2D1::Point2F(cx + 1.0F, cy - 1.5F), white_brush_.Get(), 1.6F, round_stroke_style_.Get());
                 } else if (button.id == L"redo") {
-                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy + 4.0F), D2D1::Point2F(cx - 5.0F, cy), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy), D2D1::Point2F(cx - 4.0F, cy - 3.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 4.0F, cy - 3.0F), D2D1::Point2F(cx - 1.0F, cy - 5.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 1.0F, cy - 5.0F), D2D1::Point2F(cx + 4.0F, cy - 4.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 4.0F, cy - 4.0F), D2D1::Point2F(cx + 4.0F, cy), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 4.0F, cy - 4.0F), D2D1::Point2F(cx, cy - 4.0F), white_brush_.Get(), 1.5F);
+                    ComPtr<ID2D1PathGeometry> redo_geom;
+                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(redo_geom.GetAddressOf()))) {
+                        ComPtr<ID2D1GeometrySink> sink;
+                        if (SUCCEEDED(redo_geom->Open(sink.GetAddressOf()))) {
+                            sink->BeginFigure(D2D1::Point2F(cx - 6.5F, cy + 4.5F), D2D1_FIGURE_BEGIN_HOLLOW);
+                            sink->AddArc(D2D1::ArcSegment(
+                                D2D1::Point2F(cx + 3.5F, cy - 1.5F),
+                                D2D1::SizeF(6.5F, 6.5F),
+                                0.0f,
+                                D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                                D2D1_ARC_SIZE_SMALL
+                            ));
+                            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                            sink->Close();
+                            render_target_->DrawGeometry(redo_geom.Get(), white_brush_.Get(), 1.6F, round_stroke_style_.Get());
+                        }
+                    }
+                    render_target_->DrawLine(D2D1::Point2F(cx + 3.5F, cy - 1.5F), D2D1::Point2F(cx + 3.5F, cy - 6.0F), white_brush_.Get(), 1.6F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + 3.5F, cy - 1.5F), D2D1::Point2F(cx - 1.0F, cy - 1.5F), white_brush_.Get(), 1.6F, round_stroke_style_.Get());
                 } else if (button.id == L"ocr") {
                     ComPtr<IDWriteTextFormat> ocr_format;
                     dwrite_factory()->CreateTextFormat(L"Consolas",
@@ -577,54 +861,51 @@ void OverlayWindow::paint() {
                                                        DWRITE_FONT_WEIGHT_BOLD,
                                                        DWRITE_FONT_STYLE_NORMAL,
                                                        DWRITE_FONT_STRETCH_NORMAL,
-                                                       8.0F,
+                                                       9.0F,
                                                        L"zh-CN",
                                                        ocr_format.GetAddressOf());
                     ocr_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                     ocr_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
-                    constexpr float len = 3.5F;
-                    constexpr float r = 7.0F;
-                    render_target_->DrawLine(D2D1::Point2F(cx - r, cy - r), D2D1::Point2F(cx - r + len, cy - r), white_brush_.Get(), 1.2F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - r, cy - r), D2D1::Point2F(cx - r, cy - r + len), white_brush_.Get(), 1.2F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + r, cy - r), D2D1::Point2F(cx + r - len, cy - r), white_brush_.Get(), 1.2F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + r, cy - r), D2D1::Point2F(cx + r, cy - r + len), white_brush_.Get(), 1.2F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - r, cy + r), D2D1::Point2F(cx - r + len, cy + r), white_brush_.Get(), 1.2F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - r, cy + r), D2D1::Point2F(cx - r, cy + r - len), white_brush_.Get(), 1.2F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + r, cy + r), D2D1::Point2F(cx + r - len, cy + r), white_brush_.Get(), 1.2F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + r, cy + r), D2D1::Point2F(cx + r, cy + r - len), white_brush_.Get(), 1.2F);
+                    constexpr float len = 5.0F;
+                    constexpr float r = 9.0F;
+                    render_target_->DrawLine(D2D1::Point2F(cx - r, cy - r), D2D1::Point2F(cx - r + len, cy - r), white_brush_.Get(), 1.4F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - r, cy - r), D2D1::Point2F(cx - r, cy - r + len), white_brush_.Get(), 1.4F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + r, cy - r), D2D1::Point2F(cx + r - len, cy - r), white_brush_.Get(), 1.4F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + r, cy - r), D2D1::Point2F(cx + r, cy - r + len), white_brush_.Get(), 1.4F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - r, cy + r), D2D1::Point2F(cx - r + len, cy + r), white_brush_.Get(), 1.4F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - r, cy + r), D2D1::Point2F(cx - r, cy + r - len), white_brush_.Get(), 1.4F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + r, cy + r), D2D1::Point2F(cx + r - len, cy + r), white_brush_.Get(), 1.4F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + r, cy + r), D2D1::Point2F(cx + r, cy + r - len), white_brush_.Get(), 1.4F, round_stroke_style_.Get());
 
-                    render_target_->DrawTextW(L"OCR", 3, ocr_format.Get(), D2D1::RectF(cx - 8.0F, cy - 8.0F, cx + 8.0F, cy + 8.0F), white_brush_.Get());
+                    render_target_->DrawTextW(L"OCR", 3, ocr_format.Get(), D2D1::RectF(cx - 9.0F, cy - 9.0F, cx + 9.0F, cy + 9.0F), white_brush_.Get());
                 } else if (button.id == L"copy") {
-                    render_target_->DrawRectangle(D2D1::RectF(cx - 3.0F, cy - 7.0F, cx + 7.0F, cy + 3.0F), blue_brush_.Get(), 1.5F);
-                    render_target_->FillRectangle(D2D1::RectF(cx - 7.0F, cy - 3.0F, cx + 3.0F, cy + 7.0F), is_active ? active_bg_brush_.Get() : (is_hovered ? hover_bg_brush_.Get() : toolbar_bg_brush_.Get()));
-                    render_target_->DrawRectangle(D2D1::RectF(cx - 7.0F, cy - 3.0F, cx + 3.0F, cy + 7.0F), blue_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 6.5F, cy + 0.5F), D2D1::Point2F(cx - 2.0F, cy + 5.0F), white_brush_.Get(), 2.0F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 2.0F, cy + 5.0F), D2D1::Point2F(cx + 7.0F, cy - 5.0F), white_brush_.Get(), 2.0F, round_stroke_style_.Get());
                 } else if (button.id == L"save") {
-                    render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy - 6.0F), D2D1::Point2F(cx + 3.0F, cy - 6.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 3.0F, cy - 6.0F), D2D1::Point2F(cx + 6.0F, cy - 3.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 6.0F, cy - 3.0F), D2D1::Point2F(cx + 6.0F, cy + 6.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 6.0F, cy + 6.0F), D2D1::Point2F(cx - 6.0F, cy + 6.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy + 6.0F), D2D1::Point2F(cx - 6.0F, cy - 6.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawRectangle(D2D1::RectF(cx - 3.0F, cy + 1.0F, cx + 3.0F, cy + 6.0F), white_brush_.Get(), 1.5F);
-                    render_target_->FillRectangle(D2D1::RectF(cx - 2.0F, cy - 6.0F, cx + 1.0F, cy - 3.0F), white_brush_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 8.0F, cy + 2.0F), D2D1::Point2F(cx - 8.0F, cy + 7.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 8.0F, cy + 7.0F), D2D1::Point2F(cx + 8.0F, cy + 7.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + 8.0F, cy + 7.0F), D2D1::Point2F(cx + 8.0F, cy + 2.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 7.0F), D2D1::Point2F(cx, cy + 2.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx, cy + 2.0F), D2D1::Point2F(cx - 3.5F, cy - 1.5F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx, cy + 2.0F), D2D1::Point2F(cx + 3.5F, cy - 1.5F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                 } else if (button.id == L"scroll") {
-                    render_target_->DrawRectangle(D2D1::RectF(cx - 6.0F, cy - 7.0F, cx + 6.0F, cy + 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy - 3.0F), D2D1::Point2F(cx + 6.0F, cy - 3.0F), white_brush_.Get(), 1.2F);
-                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 1.0F), D2D1::Point2F(cx, cy + 4.5F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx, cy + 4.5F), D2D1::Point2F(cx - 2.5F, cy + 2.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx, cy + 4.5F), D2D1::Point2F(cx + 2.5F, cy + 2.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 8.0F, cy - 9.0F, cx + 8.0F, cy + 9.0F), 1.5F, 1.5F), white_brush_.Get(), 1.3F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 8.0F, cy - 3.5F), D2D1::Point2F(cx + 8.0F, cy - 3.5F), white_brush_.Get(), 1.0F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 1.0F), D2D1::Point2F(cx, cy + 5.5F), white_brush_.Get(), 1.3F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx, cy + 5.5F), D2D1::Point2F(cx - 2.5F, cy + 3.0F), white_brush_.Get(), 1.3F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx, cy + 5.5F), D2D1::Point2F(cx + 2.5F, cy + 3.0F), white_brush_.Get(), 1.3F, round_stroke_style_.Get());
                 } else if (button.id == L"pin") {
-                    render_target_->DrawLine(D2D1::Point2F(cx, cy - 1.0F), D2D1::Point2F(cx, cy + 7.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy - 6.0F), D2D1::Point2F(cx + 5.0F, cy - 6.0F), white_brush_.Get(), 2.0F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 3.5F, cy - 6.0F), D2D1::Point2F(cx - 3.5F, cy - 1.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx + 3.5F, cy - 6.0F), D2D1::Point2F(cx + 3.5F, cy - 1.0F), white_brush_.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 3.5F, cy - 1.0F), D2D1::Point2F(cx + 3.5F, cy - 1.0F), white_brush_.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx, cy + 1.0F), D2D1::Point2F(cx, cy + 9.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 7.0F, cy - 7.0F), D2D1::Point2F(cx + 7.0F, cy - 7.0F), white_brush_.Get(), 2.0F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy - 7.0F), D2D1::Point2F(cx - 5.0F, cy + 1.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + 5.0F, cy - 7.0F), D2D1::Point2F(cx + 5.0F, cy + 1.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy + 1.0F), D2D1::Point2F(cx + 5.0F, cy + 1.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                 } else if (button.id == L"close") {
-                    ComPtr<ID2D1SolidColorBrush> red_brush;
-                    render_target_->CreateSolidColorBrush(D2D1::ColorF(0xFF4D4F), red_brush.GetAddressOf());
-                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy - 5.0F), D2D1::Point2F(cx + 5.0F, cy + 5.0F), red_brush.Get(), 1.5F);
-                    render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy + 5.0F), D2D1::Point2F(cx + 5.0F, cy - 5.0F), red_brush.Get(), 1.5F);
+                    render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy - 6.0F), D2D1::Point2F(cx + 6.0F, cy + 6.0F), white_brush_.Get(), 2.0F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy + 6.0F), D2D1::Point2F(cx + 6.0F, cy - 6.0F), white_brush_.Get(), 2.0F, round_stroke_style_.Get());
                 }
+                white_brush_ = original_white_brush;
             }
         }
 
@@ -641,13 +922,12 @@ void OverlayWindow::paint() {
                 const D2D1_RECT_F bounds = local_rect(button.bounds);
                 if (button.id == L"|") {
                     float cx = bounds.left + (bounds.right - bounds.left) / 2.0F;
-                    ComPtr<ID2D1SolidColorBrush> sep_brush;
-                    render_target_->CreateSolidColorBrush(D2D1::ColorF(0.35f, 0.38f, 0.43f, 0.6f), sep_brush.GetAddressOf());
                     render_target_->DrawLine(
-                        D2D1::Point2F(cx, bounds.top + 6.0F),
-                        D2D1::Point2F(cx, bounds.bottom - 6.0F),
-                        sep_brush.Get(),
-                        1.0F
+                        D2D1::Point2F(cx, bounds.top + 8.0F),
+                        D2D1::Point2F(cx, bounds.bottom - 8.0F),
+                        toolbar_border_brush_.Get(),
+                        1.2F,
+                        round_stroke_style_.Get()
                     );
                     continue;
                 }
@@ -660,23 +940,33 @@ void OverlayWindow::paint() {
                 else if (button.id == L"alpha_high" && session_.active_highlight_alpha() == 144) is_selected = true;
                 else if (button.id == L"color_red" && session_.active_color() == RGB(245, 34, 45)) is_selected = true;
                 else if (button.id == L"color_green" && session_.active_color() == RGB(82, 196, 26)) is_selected = true;
-                else if (button.id == L"color_blue" && session_.active_color() == RGB(22, 119, 255)) is_selected = true;
+                else if (button.id == L"color_blue" && session_.active_color() == RGB(0, 102, 255)) is_selected = true;
                 else if (button.id == L"color_yellow" && session_.active_color() == RGB(250, 219, 20)) is_selected = true;
                 else if (button.id == L"color_black" && session_.active_color() == RGB(0, 0, 0)) is_selected = true;
+                else if (button.id == L"color_gray" && session_.active_color() == RGB(143, 149, 158)) is_selected = true;
                 else if (button.id == L"color_white" && session_.active_color() == RGB(255, 255, 255)) is_selected = true;
+                else if (button.id == L"text_style_normal" && session_.active_text_style() == TextStyle::normal) is_selected = true;
+                else if (button.id == L"text_style_dark" && session_.active_text_style() == TextStyle::dark) is_selected = true;
+                else if (button.id == L"text_style_outline" && session_.active_text_style() == TextStyle::outline) is_selected = true;
+                else if (button.id == L"effect_mosaic" && !session_.mosaic_is_blur()) is_selected = true;
+                else if (button.id == L"effect_blur" && session_.mosaic_is_blur()) is_selected = true;
+                else if (button.id == L"mode_smear" && !session_.mosaic_is_rect()) is_selected = true;
+                else if (button.id == L"mode_rect" && session_.mosaic_is_rect()) is_selected = true;
                 else if (button.id == L"color_custom" &&
                          session_.active_color() != RGB(245, 34, 45) &&
                          session_.active_color() != RGB(82, 196, 26) &&
-                         session_.active_color() != RGB(22, 119, 255) &&
+                         session_.active_color() != RGB(0, 102, 255) &&
                          session_.active_color() != RGB(250, 219, 20) &&
                          session_.active_color() != RGB(0, 0, 0) &&
+                         session_.active_color() != RGB(143, 149, 158) &&
                          session_.active_color() != RGB(255, 255, 255)) {
                     is_selected = true;
                 }
 
                 bool is_hovered = (session_.hovered_button_id() == button.id);
 
-                if ((button.id.starts_with(L"width_") || button.id.starts_with(L"alpha_")) && is_selected) {
+                if ((button.id.starts_with(L"width_") || button.id.starts_with(L"alpha_") || button.id.starts_with(L"effect_") ||
+                     button.id.starts_with(L"mode_") || button.id.starts_with(L"text_style_")) && is_selected) {
                     render_target_->FillRoundedRectangle(D2D1::RoundedRect(bounds, 4.f, 4.f), active_bg_brush_.Get());
                 } else if (is_hovered) {
                     render_target_->FillRoundedRectangle(D2D1::RoundedRect(bounds, 4.f, 4.f), hover_bg_brush_.Get());
@@ -686,19 +976,21 @@ void OverlayWindow::paint() {
                 const float cy = bounds.top + (bounds.bottom - bounds.top) / 2.0F;
 
                 if (button.id.starts_with(L"color_")) {
-                    COLORREF color = RGB(22, 119, 255);
+                    COLORREF color = RGB(0, 102, 255);
                     if (button.id == L"color_red") color = RGB(245, 34, 45);
                     else if (button.id == L"color_green") color = RGB(82, 196, 26);
                     else if (button.id == L"color_yellow") color = RGB(250, 219, 20);
                     else if (button.id == L"color_black") color = RGB(0, 0, 0);
+                    else if (button.id == L"color_gray") color = RGB(143, 149, 158);
                     else if (button.id == L"color_white") color = RGB(255, 255, 255);
                     else if (button.id == L"color_custom") color = session_.custom_color();
 
                     ComPtr<ID2D1SolidColorBrush> brush;
                     render_target_->CreateSolidColorBrush(D2D1::ColorF(GetRValue(color) / 255.0F, GetGValue(color) / 255.0F, GetBValue(color) / 255.0F), brush.GetAddressOf());
 
-                    render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 8.0F, 8.0F), brush.Get());
-                    render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 8.0F, 8.0F), white_brush_.Get(), 1.5F);
+                    const D2D1_RECT_F swatch = D2D1::RectF(cx - 10.0F, cy - 10.0F, cx + 10.0F, cy + 10.0F);
+                    render_target_->FillRoundedRectangle(D2D1::RoundedRect(swatch, 3.0F, 3.0F), brush.Get());
+                    render_target_->DrawRoundedRectangle(D2D1::RoundedRect(swatch, 3.0F, 3.0F), toolbar_border_brush_.Get(), 1.0F);
 
                     if (button.id == L"color_custom") {
                         COLORREF plus_color = RGB(255, 255, 255);
@@ -713,7 +1005,12 @@ void OverlayWindow::paint() {
                     }
 
                     if (is_selected) {
-                        render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 11.0F, 11.0F), white_brush_.Get(), 1.5F);
+                        ComPtr<ID2D1SolidColorBrush> check_brush = true_white_brush_;
+                        if (button.id == L"color_white") {
+                            check_brush = black_brush_;
+                        }
+                        render_target_->DrawLine(D2D1::Point2F(cx - 4.0F, cy - 0.5F), D2D1::Point2F(cx - 1.0F, cy + 3.0F), check_brush.Get(), 2.0F, round_stroke_style_.Get());
+                        render_target_->DrawLine(D2D1::Point2F(cx - 1.0F, cy + 3.0F), D2D1::Point2F(cx + 5.0F, cy - 4.0F), check_brush.Get(), 2.0F, round_stroke_style_.Get());
                     }
                 } else if (button.id.starts_with(L"width_")) {
                     float w = 2.0F;
@@ -721,23 +1018,163 @@ void OverlayWindow::paint() {
                     else if (button.id == L"width_large") w = 8.0F;
 
                     render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), w / 2.0F + 1.0F, w / 2.0F + 1.0F), white_brush_.Get());
+                } else if (button.id.starts_with(L"text_style_")) {
+                    ComPtr<IDWriteTextFormat> style_format;
+                    dwrite_factory()->CreateTextFormat(L"Segoe UI",
+                                                       nullptr,
+                                                       DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                                       DWRITE_FONT_STYLE_NORMAL,
+                                                       DWRITE_FONT_STRETCH_NORMAL,
+                                                       22.0F,
+                                                       L"zh-CN",
+                                                       style_format.GetAddressOf());
+                    style_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    style_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+                    ComPtr<ID2D1SolidColorBrush> icon_brush = (is_selected && is_light_theme_) ? blue_brush_ : white_brush_;
+                    if (button.id == L"text_style_dark") {
+                        render_target_->FillRoundedRectangle(
+                            D2D1::RoundedRect(D2D1::RectF(cx - 11.0F, cy - 11.0F, cx + 11.0F, cy + 11.0F), 3.0F, 3.0F),
+                            black_brush_.Get());
+                        render_target_->DrawTextW(L"T", 1, style_format.Get(), D2D1::RectF(cx - 11.0F, cy - 13.0F, cx + 11.0F, cy + 11.0F), true_white_brush_.Get());
+                    } else if (button.id == L"text_style_outline") {
+                        for (float dy : {-1.5F, 1.5F}) {
+                            for (float dx : {-1.5F, 1.5F}) {
+                                render_target_->DrawTextW(L"T", 1, style_format.Get(), D2D1::RectF(cx - 11.0F + dx, cy - 13.0F + dy, cx + 11.0F + dx, cy + 11.0F + dy), true_white_brush_.Get());
+                            }
+                        }
+                        render_target_->DrawTextW(L"T", 1, style_format.Get(), D2D1::RectF(cx - 11.0F, cy - 13.0F, cx + 11.0F, cy + 11.0F), icon_brush.Get());
+                    } else {
+                        render_target_->DrawTextW(L"T", 1, style_format.Get(), D2D1::RectF(cx - 11.0F, cy - 13.0F, cx + 11.0F, cy + 11.0F), icon_brush.Get());
+                    }
+                } else if (button.id == L"text_size_btn") {
+                    ComPtr<IDWriteTextFormat> dropdown_text_format;
+                    dwrite_factory()->CreateTextFormat(L"Segoe UI",
+                                                       nullptr,
+                                                       DWRITE_FONT_WEIGHT_NORMAL,
+                                                       DWRITE_FONT_STYLE_NORMAL,
+                                                       DWRITE_FONT_STRETCH_NORMAL,
+                                                       12.5F,
+                                                       L"zh-CN",
+                                                       dropdown_text_format.GetAddressOf());
+                    dropdown_text_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    dropdown_text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+                    render_target_->DrawTextW(button.label.c_str(), static_cast<UINT32>(button.label.size()), dropdown_text_format.Get(), D2D1::RectF(bounds.left, bounds.top, bounds.right - 14.0F, bounds.bottom), white_brush_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + 14.0F, cy - 1.5F), D2D1::Point2F(cx + 17.0F, cy + 1.5F), white_brush_.Get(), 1.2F, round_stroke_style_.Get());
+                    render_target_->DrawLine(D2D1::Point2F(cx + 17.0F, cy + 1.5F), D2D1::Point2F(cx + 20.0F, cy - 1.5F), white_brush_.Get(), 1.2F, round_stroke_style_.Get());
+                } else if (button.id == L"mosaic_strength_slider" || button.id == L"watermark_opacity_slider") {
+                    const bool watermark_slider = button.id == L"watermark_opacity_slider";
+                    const int value = watermark_slider ? session_.watermark_opacity() : session_.mosaic_strength();
+                    const wchar_t* label = watermark_slider ? L"水印透明度" : L"模糊强度";
+
+                    ComPtr<IDWriteTextFormat> slider_format;
+                    dwrite_factory()->CreateTextFormat(L"Microsoft YaHei",
+                                                       nullptr,
+                                                       DWRITE_FONT_WEIGHT_NORMAL,
+                                                       DWRITE_FONT_STYLE_NORMAL,
+                                                       DWRITE_FONT_STRETCH_NORMAL,
+                                                       12.0F,
+                                                       L"zh-CN",
+                                                       slider_format.GetAddressOf());
+                    slider_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    slider_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    render_target_->DrawTextW(label,
+                                              static_cast<UINT32>(wcslen(label)),
+                                              slider_format.Get(),
+                                              D2D1::RectF(bounds.left + 6.0F, bounds.top, bounds.left + 86.0F, bounds.bottom),
+                                              white_brush_.Get());
+
+                    const float track_left = bounds.left + 88.0F;
+                    const float track_right = bounds.right - 42.0F;
+                    const float track_y = cy;
+                    ComPtr<ID2D1SolidColorBrush> track_brush;
+                    render_target_->CreateSolidColorBrush(D2D1::ColorF(0xC9CDD4), track_brush.GetAddressOf());
+                    render_target_->DrawLine(D2D1::Point2F(track_left, track_y),
+                                             D2D1::Point2F(track_right, track_y),
+                                             track_brush.Get(),
+                                             3.0F,
+                                             round_stroke_style_.Get());
+                    const float knob_x = track_left + (track_right - track_left) * (static_cast<float>(value) / 100.0F);
+                    render_target_->DrawLine(D2D1::Point2F(track_left, track_y),
+                                             D2D1::Point2F(knob_x, track_y),
+                                             blue_brush_.Get(),
+                                             3.0F,
+                                             round_stroke_style_.Get());
+                    render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knob_x, track_y), 5.0F, 5.0F), true_white_brush_.Get());
+                    render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(knob_x, track_y), 5.0F, 5.0F), blue_brush_.Get(), 2.0F);
+
+                    const std::wstring value_text = std::format(L"{} %", value);
+                    slider_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    render_target_->DrawTextW(value_text.c_str(),
+                                              static_cast<UINT32>(value_text.size()),
+                                              slider_format.Get(),
+                                              D2D1::RectF(bounds.right - 40.0F, bounds.top, bounds.right - 4.0F, bounds.bottom),
+                                              white_brush_.Get());
+                } else if (button.id == L"watermark_text" || button.id == L"watermark_apply" || button.id == L"watermark_clear") {
+                    ComPtr<IDWriteTextFormat> label_format;
+                    dwrite_factory()->CreateTextFormat(L"Microsoft YaHei",
+                                                       nullptr,
+                                                       DWRITE_FONT_WEIGHT_NORMAL,
+                                                       DWRITE_FONT_STYLE_NORMAL,
+                                                       DWRITE_FONT_STRETCH_NORMAL,
+                                                       12.5F,
+                                                       L"zh-CN",
+                                                       label_format.GetAddressOf());
+                    label_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    label_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    std::wstring label = button.label;
+                    if (button.id == L"watermark_text" && label.size() > 6) {
+                        label = label.substr(0, 6) + L"...";
+                    }
+                    render_target_->DrawTextW(label.c_str(),
+                                              static_cast<UINT32>(label.size()),
+                                              label_format.Get(),
+                                              bounds,
+                                              white_brush_.Get());
+                } else if (button.id.starts_with(L"effect_") || button.id.starts_with(L"mode_")) {
+                    ComPtr<ID2D1SolidColorBrush> icon_brush = (is_selected && is_light_theme_) ? blue_brush_ : white_brush_;
+                    if (button.id == L"effect_mosaic") {
+                        float step = 3.5F;
+                        render_target_->FillRectangle(D2D1::RectF(cx - 5.25F, cy - 5.25F, cx - 5.25F + step, cy - 5.25F + step), icon_brush.Get());
+                        render_target_->FillRectangle(D2D1::RectF(cx - 5.25F + step*2, cy - 5.25F, cx + 5.25F, cy - 5.25F + step), icon_brush.Get());
+                        render_target_->FillRectangle(D2D1::RectF(cx - 5.25F + step, cy - 5.25F + step, cx - 5.25F + step*2, cy - 5.25F + step*2), icon_brush.Get());
+                        render_target_->FillRectangle(D2D1::RectF(cx - 5.25F, cy - 5.25F + step*2, cx - 5.25F + step, cy + 5.25F), icon_brush.Get());
+                        render_target_->FillRectangle(D2D1::RectF(cx - 5.25F + step*2, cy - 5.25F + step*2, cx + 5.25F, cy + 5.25F), icon_brush.Get());
+                        render_target_->DrawRectangle(D2D1::RectF(cx - 5.25F, cy - 5.25F, cx + 5.25F, cy + 5.25F), icon_brush.Get(), 1.2F, round_stroke_style_.Get());
+                    } else if (button.id == L"effect_blur") {
+                        render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 6.0F, 6.0F), icon_brush.Get(), 1.2F, round_stroke_style_.Get());
+                        render_target_->DrawLine(D2D1::Point2F(cx - 4.2F, cy + 4.2F), D2D1::Point2F(cx + 4.2F, cy - 4.2F), icon_brush.Get(), 1.2F, round_stroke_style_.Get());
+                        render_target_->DrawLine(D2D1::Point2F(cx - 5.6F, cy - 1.9F), D2D1::Point2F(cx - 1.9F, cy - 5.6F), icon_brush.Get(), 1.2F, round_stroke_style_.Get());
+                        render_target_->DrawLine(D2D1::Point2F(cx + 1.9F, cy + 5.6F), D2D1::Point2F(cx + 5.6F, cy + 1.9F), icon_brush.Get(), 1.2F, round_stroke_style_.Get());
+                    } else if (button.id == L"mode_smear") {
+                        render_target_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 3.5F, cy + 1.0F, cx + 3.5F, cy + 5.5F), 1.0F, 1.0F), icon_brush.Get(), 1.2F, round_stroke_style_.Get());
+                        render_target_->DrawLine(D2D1::Point2F(cx - 1.5F, cy + 1.0F), D2D1::Point2F(cx - 1.5F, cy - 5.0F), icon_brush.Get(), 1.2F, round_stroke_style_.Get());
+                        render_target_->DrawLine(D2D1::Point2F(cx + 1.5F, cy + 1.0F), D2D1::Point2F(cx + 1.5F, cy - 2.0F), icon_brush.Get(), 1.2F, round_stroke_style_.Get());
+                    } else if (button.id == L"mode_rect") {
+                        render_target_->DrawRectangle(D2D1::RectF(cx - 5.0F, cy - 5.0F, cx + 5.0F, cy + 5.0F), icon_brush.Get(), 1.2F, round_stroke_style_.Get());
+                        render_target_->FillRectangle(D2D1::RectF(cx - 6.0F, cy - 6.0F, cx - 4.0F, cy - 4.0F), icon_brush.Get());
+                        render_target_->FillRectangle(D2D1::RectF(cx + 4.0F, cy - 6.0F, cx + 6.0F, cy - 4.0F), icon_brush.Get());
+                        render_target_->FillRectangle(D2D1::RectF(cx - 6.0F, cy + 4.0F, cx - 4.0F, cy + 6.0F), icon_brush.Get());
+                        render_target_->FillRectangle(D2D1::RectF(cx + 4.0F, cy + 4.0F, cx + 6.0F, cy + 6.0F), icon_brush.Get());
+                    }
                 } else if (button.id.starts_with(L"alpha_")) {
                     float alpha = 0.25F;
-                    if (button.id == L"alpha_medium") alpha = 0.38F;
-                    else if (button.id == L"alpha_high") alpha = 0.56F;
+                    if (button.id == L"alpha_medium") alpha = 0.55F;
+                    else if (button.id == L"alpha_high") alpha = 0.85F;
                     ComPtr<ID2D1SolidColorBrush> alpha_brush;
                     render_target_->CreateSolidColorBrush(D2D1::ColorF(0xFADB14, alpha), alpha_brush.GetAddressOf());
-                    render_target_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 9.0F, cy - 6.0F, cx + 9.0F, cy + 6.0F), 3.0F, 3.0F), alpha_brush.Get());
-                    render_target_->DrawTextW(button.label.c_str(), static_cast<UINT32>(button.label.size()), format.Get(), bounds, white_brush_.Get());
+                    render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 6.0F, 6.0F), alpha_brush.Get());
+                    render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 6.0F, 6.0F), white_brush_.Get(), 1.2F, round_stroke_style_.Get());
                 }
             }
         }
 
         // Draw 8-point handles
         for (const auto& pt : handles) {
-            D2D1_RECT_F r = D2D1::RectF(pt.x - 3.5F, pt.y - 3.5F, pt.x + 3.5F, pt.y + 3.5F);
-            render_target_->FillRectangle(r, blue_brush_.Get());
-            render_target_->DrawRectangle(r, white_brush_.Get(), 1.0F);
+            D2D1_ELLIPSE circle = D2D1::Ellipse(pt, 4.0F, 4.0F);
+            render_target_->FillEllipse(circle, blue_brush_.Get());
+            render_target_->DrawEllipse(circle, true_white_brush_.Get(), 1.2F);
         }
 
         const std::wstring dimensions =
@@ -955,12 +1392,215 @@ void OverlayWindow::paint() {
             if (monitor_.bounds.contains(cursor_pos)) {
                 float cx = static_cast<float>(cursor_pos.x - monitor_.bounds.left);
                 float cy = static_cast<float>(cursor_pos.y - monitor_.bounds.top);
-                
+
                 D2D1_ELLIPSE cursor_ellipse = D2D1::Ellipse(D2D1::Point2F(cx, cy), radius, radius);
-                
+
                 // Draw white outer circle and black inner circle for high contrast
                 render_target_->DrawEllipse(cursor_ellipse, white_brush_.Get(), 1.5F);
                 render_target_->DrawEllipse(cursor_ellipse, black_brush_.Get(), 0.5F);
+            }
+        }
+    }
+
+    // Draw text size dropdown card if open
+    if (session_.text_size_dropdown_open()) {
+        RectI card_bounds = session_.get_text_size_dropdown_bounds();
+        D2D1_RECT_F local_card = local_rect(card_bounds);
+
+        render_target_->FillRoundedRectangle(D2D1::RoundedRect(local_card, 6.f, 6.f), toolbar_bg_brush_.Get());
+        render_target_->DrawRoundedRectangle(D2D1::RoundedRect(local_card, 6.f, 6.f), toolbar_border_brush_.Get(), 1.f);
+
+        ComPtr<IDWriteTextFormat> dropdown_text_format;
+        dwrite_factory()->CreateTextFormat(L"Segoe UI",
+                                           nullptr,
+                                           DWRITE_FONT_WEIGHT_NORMAL,
+                                           DWRITE_FONT_STYLE_NORMAL,
+                                           DWRITE_FONT_STRETCH_NORMAL,
+                                           12.5F,
+                                           L"zh-CN",
+                                           dropdown_text_format.GetAddressOf());
+        dropdown_text_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        dropdown_text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+        const std::array<std::pair<std::wstring_view, float>, 13> options{{
+            {L"12pt", 12.0F},
+            {L"14pt", 14.0F},
+            {L"16pt", 16.0F},
+            {L"18pt", 18.0F},
+            {L"20pt", 20.0F},
+            {L"24pt", 24.0F},
+            {L"28pt", 28.0F},
+            {L"32pt", 32.0F},
+            {L"36pt", 36.0F},
+            {L"48pt", 48.0F},
+            {L"64pt", 64.0F},
+            {L"72pt", 72.0F},
+            {L"96pt", 96.0F},
+        }};
+
+        for (std::size_t i = 0; i < options.size(); ++i) {
+            D2D1_RECT_F item_rect_full = D2D1::RectF(
+                local_card.left + 2.0F,
+                local_card.top + static_cast<float>(i) * 32.0F + 2.0F,
+                local_card.right - 2.0F,
+                local_card.top + static_cast<float>(i + 1) * 32.0F - 2.0F
+            );
+
+            bool is_active = (std::abs(session_.active_text_size() - options[i].second) < 0.5F);
+            bool is_hovered = (session_.text_size_hovered_idx() == static_cast<int>(i));
+
+            if (is_hovered) {
+                render_target_->FillRoundedRectangle(D2D1::RoundedRect(item_rect_full, 4.f, 4.f), hover_bg_brush_.Get());
+            }
+
+            ComPtr<ID2D1SolidColorBrush> text_brush = white_brush_;
+            if (is_active) {
+                text_brush = blue_brush_;
+                render_target_->FillRoundedRectangle(D2D1::RoundedRect(item_rect_full, 4.f, 4.f), active_bg_brush_.Get());
+            }
+
+            render_target_->DrawTextW(options[i].first.data(),
+                                      static_cast<UINT32>(options[i].first.size()),
+                                      dropdown_text_format.Get(),
+                                      item_rect_full,
+                                      text_brush.Get());
+        }
+    }
+
+    // Draw hovered tooltips
+    if (!session_.hovered_button_id().empty()) {
+        std::wstring hovered_id = session_.hovered_button_id();
+        RectI button_bounds{};
+        bool found_button = false;
+        for (const auto& btn : session_.toolbar()) {
+            if (btn.id == hovered_id) {
+                button_bounds = btn.bounds;
+                found_button = true;
+                break;
+            }
+        }
+        if (!found_button) {
+            for (const auto& btn : session_.sub_toolbar()) {
+                if (btn.id == hovered_id) {
+                    button_bounds = btn.bounds;
+                    found_button = true;
+                    break;
+                }
+            }
+        }
+
+        if (found_button) {
+            auto get_tooltip_text = [&](std::wstring_view id) -> std::wstring {
+                const auto& config = session_.request_.config;
+                if (id == L"lock") return L"锁定工具";
+                if (id == L"select") return std::format(L"选择 ({})", config.tool_shortcut_select);
+                if (id == L"rect") return std::format(L"矩形 ({})", config.tool_shortcut_rectangle);
+                if (id == L"ellipse") return std::format(L"椭圆 ({})", config.tool_shortcut_ellipse);
+                if (id == L"line") return std::format(L"直线 ({})", config.tool_shortcut_line);
+                if (id == L"arrow") return std::format(L"箭头 ({})", config.tool_shortcut_arrow);
+                if (id == L"pen") return std::format(L"画笔 ({})", config.tool_shortcut_pen);
+                if (id == L"mosaic") {
+                    return session_.mosaic_is_blur() ?
+                        std::format(L"模糊 ({})", config.tool_shortcut_blur) :
+                        std::format(L"马赛克 ({})", config.tool_shortcut_mosaic);
+                }
+                if (id == L"highlight") return std::format(L"荧光笔 ({})", config.tool_shortcut_highlight);
+                if (id == L"watermark") return L"水印";
+                if (id == L"text") return std::format(L"文本 ({})", config.tool_shortcut_text);
+                if (id == L"serial") return std::format(L"序号 ({})", config.tool_shortcut_serial);
+                if (id == L"eraser") return std::format(L"橡皮擦 ({})", config.tool_shortcut_eraser);
+                if (id == L"undo") return L"撤销 (Ctrl+Z)";
+                if (id == L"redo") return L"重做 (Ctrl+Y)";
+                if (id == L"ocr") return L"屏幕识图 (Shift+C)";
+                if (id == L"scroll") return L"滚动截图";
+                if (id == L"pin") return L"贴图";
+                if (id == L"copy") return L"复制 (Enter)";
+                if (id == L"save") return L"保存 (Ctrl+S)";
+                if (id == L"close") return L"关闭 (Esc)";
+
+                if (id == L"effect_mosaic") return L"马赛克效果";
+                if (id == L"effect_blur") return L"模糊效果";
+                if (id == L"mode_smear") return L"涂抹模式";
+                if (id == L"mode_rect") return L"框选模式";
+                if (id == L"text_style_normal") return L"普通文字";
+                if (id == L"text_style_dark") return L"黑底文字";
+                if (id == L"text_style_outline") return L"轮廓高亮";
+                if (id == L"watermark_text") return L"设置水印文字";
+                if (id == L"watermark_apply") return L"应用水印";
+                if (id == L"watermark_clear") return L"清除水印";
+
+                return L"";
+            };
+
+            std::wstring tooltip_str = get_tooltip_text(hovered_id);
+            if (!tooltip_str.empty()) {
+                ComPtr<IDWriteTextFormat> tooltip_format;
+                dwrite_factory()->CreateTextFormat(L"Microsoft YaHei",
+                                                   nullptr,
+                                                   DWRITE_FONT_WEIGHT_NORMAL,
+                                                   DWRITE_FONT_STYLE_NORMAL,
+                                                   DWRITE_FONT_STRETCH_NORMAL,
+                                                   13.0F,
+                                                   L"zh-CN",
+                                                   tooltip_format.GetAddressOf());
+                tooltip_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                tooltip_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+                ComPtr<IDWriteTextLayout> layout;
+                dwrite_factory()->CreateTextLayout(tooltip_str.c_str(),
+                                                   static_cast<UINT32>(tooltip_str.size()),
+                                                   tooltip_format.Get(),
+                                                   400.0F,
+                                                   100.0F,
+                                                   layout.GetAddressOf());
+                DWRITE_TEXT_METRICS metrics{};
+                layout->GetMetrics(&metrics);
+                float text_width = metrics.width;
+                float text_height = metrics.height;
+
+                float bubble_width = text_width + 20.0F;
+                float bubble_height = text_height + 12.0F;
+
+                float btn_cx = static_cast<float>(button_bounds.left - monitor_.bounds.left) + static_cast<float>(button_bounds.width()) / 2.0F;
+                float btn_top = static_cast<float>(button_bounds.top - monitor_.bounds.top);
+                float btn_bottom = static_cast<float>(button_bounds.bottom - monitor_.bounds.top);
+
+                float bubble_left = btn_cx - bubble_width / 2.0F;
+                float bubble_bottom = btn_top - 8.0F;
+                float bubble_top = bubble_bottom - bubble_height;
+
+                if (bubble_top < 0.0F) {
+                    bubble_top = btn_bottom + 8.0F;
+                    bubble_bottom = bubble_top + bubble_height;
+                }
+
+                ComPtr<ID2D1SolidColorBrush> tooltip_bg_brush;
+                render_target_->CreateSolidColorBrush(D2D1::ColorF(0x1F2329, 0.95F), tooltip_bg_brush.GetAddressOf());
+                ComPtr<ID2D1SolidColorBrush> tooltip_fg_brush;
+                render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), tooltip_fg_brush.GetAddressOf());
+
+                render_target_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bubble_left, bubble_top, bubble_left + bubble_width, bubble_bottom), 4.0F, 4.0F), tooltip_bg_brush.Get());
+
+                ComPtr<ID2D1PathGeometry> tri_geom;
+                if (SUCCEEDED(d2d_factory()->CreatePathGeometry(tri_geom.GetAddressOf()))) {
+                    ComPtr<ID2D1GeometrySink> sink;
+                    if (SUCCEEDED(tri_geom->Open(sink.GetAddressOf()))) {
+                        if (bubble_top > btn_bottom) {
+                            sink->BeginFigure(D2D1::Point2F(btn_cx, btn_bottom + 3.0F), D2D1_FIGURE_BEGIN_FILLED);
+                            sink->AddLine(D2D1::Point2F(btn_cx - 4.0F, btn_bottom + 8.0F));
+                            sink->AddLine(D2D1::Point2F(btn_cx + 4.0F, btn_bottom + 8.0F));
+                        } else {
+                            sink->BeginFigure(D2D1::Point2F(btn_cx, btn_top - 3.0F), D2D1_FIGURE_BEGIN_FILLED);
+                            sink->AddLine(D2D1::Point2F(btn_cx - 4.0F, btn_top - 8.0F));
+                            sink->AddLine(D2D1::Point2F(btn_cx + 4.0F, btn_top - 8.0F));
+                        }
+                        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                        sink->Close();
+                        render_target_->FillGeometry(tri_geom.Get(), tooltip_bg_brush.Get());
+                    }
+                }
+
+                render_target_->DrawTextW(tooltip_str.c_str(), static_cast<UINT32>(tooltip_str.size()), tooltip_format.Get(), D2D1::RectF(bubble_left, bubble_top, bubble_left + bubble_width, bubble_bottom), tooltip_fg_brush.Get());
             }
         }
     }

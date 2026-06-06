@@ -22,6 +22,8 @@ void blit(const Bitmap& source, const RectI& source_rect, Bitmap& target, POINT 
 [[nodiscard]] Bitmap crop(const Bitmap& source, const RectI& rect);
 void pixelate_circle(Bitmap& bitmap, POINT center, int radius, int block_size);
 void blur_circle(Bitmap& bitmap, POINT center, int radius, int blur_radius);
+void pixelate_rect(Bitmap& bitmap, const RectI& rect, int block_size);
+void blur_rect(Bitmap& bitmap, const RectI& rect, int blur_radius);
 [[nodiscard]] Bitmap rotate_90_cw(const Bitmap& source);
 [[nodiscard]] Bitmap rotate_90_ccw(const Bitmap& source);
 [[nodiscard]] Bitmap flip_horizontal(const Bitmap& source);
