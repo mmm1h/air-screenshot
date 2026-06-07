@@ -42,4 +42,6 @@ bool download_ocr_dependencies(
     const std::function<void(int)>& progress_callback,
     std::wstring* error = nullptr);
 
+int run_ocr_cli(std::span<const std::wstring> arguments);
+
 }  // namespace airshot

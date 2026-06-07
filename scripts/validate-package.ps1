@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory)]
     [string]$Version,
@@ -12,18 +12,17 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $site = Join-Path $root "dist\site"
 $executable = Join-Path $site "AirScreenshot.exe"
-$ocrHelper = Join-Path $site "airshot_ocr.exe"
 $latestPath = Join-Path $site "latest.json"
 $indexPath = Join-Path $site "index.html"
 $ocrManifestPath = Join-Path $site "ocr-dependencies.json"
 
-foreach ($path in @($executable, $ocrHelper, $latestPath, $indexPath, $ocrManifestPath)) {
+foreach ($path in @($executable, $latestPath, $indexPath, $ocrManifestPath)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "缺少发布文件：$path"
     }
 }
 $unexpectedFiles = Get-ChildItem -LiteralPath $site -File |
-    Where-Object Name -NotIn @("AirScreenshot.exe", "airshot_ocr.exe", "latest.json", "index.html", ".nojekyll", "ocr-dependencies.json")
+    Where-Object Name -NotIn @("AirScreenshot.exe", "latest.json", "index.html", ".nojekyll", "ocr-dependencies.json")
 if ($unexpectedFiles) {
     throw "发布目录包含多余文件：$($unexpectedFiles.Name -join ', ')"
 }
@@ -58,20 +57,6 @@ if ($actualSignerSha256 -ne $SignerSha256) {
 }
 if ($RequireTrustedSignature -and $signature.Status -ne [Management.Automation.SignatureStatus]::Valid) {
     throw "EXE 签名未通过信任验证：$($signature.StatusMessage)"
-}
-
-$ocrSignature = Get-AuthenticodeSignature -FilePath $ocrHelper
-if (-not $ocrSignature.SignerCertificate -or $ocrSignature.Status -in @("NotSigned", "HashMismatch")) {
-    throw "airshot_ocr.exe 签名无效：$($ocrSignature.StatusMessage)"
-}
-if ($ocrSignature.SignerCertificate.Subject -ne $Publisher) {
-    throw "OCR helper 签名证书主题与 Publisher 不匹配：$($ocrSignature.SignerCertificate.Subject)"
-}
-if ($ocrSignature.SignerCertificate.GetCertHashString([Security.Cryptography.HashAlgorithmName]::SHA256) -ne $SignerSha256) {
-    throw "OCR helper 签名证书指纹与程序内置发布证书不一致。"
-}
-if ($RequireTrustedSignature -and $ocrSignature.Status -ne [Management.Automation.SignatureStatus]::Valid) {
-    throw "OCR helper 签名未通过信任验证：$($ocrSignature.StatusMessage)"
 }
 
 $latest = Get-Content -LiteralPath $latestPath -Raw | ConvertFrom-Json
@@ -161,7 +146,6 @@ finally {
 
 $index = Get-Content -LiteralPath $indexPath -Raw
 if ($index -notmatch [Regex]::Escape($Version) -or $index -notmatch "AirScreenshot.exe" -or
-    $index -notmatch "airshot_ocr.exe" -or
     $index -match "MSIX|AppInstaller|Install-AirScreenshot") {
     throw "下载页未指向当前便携版。"
 }

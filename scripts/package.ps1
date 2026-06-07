@@ -1,6 +1,6 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
-    [string]$Version = "0.2.2",
+    [string]$Version = "0.2.3",
     [switch]$Sign,
     [string]$CertPath,
     [string]$CertPassword,
@@ -23,8 +23,6 @@ New-Item -ItemType Directory -Path $site -Force | Out-Null
 
 $executable = Join-Path $site "AirScreenshot.exe"
 Copy-Item (Join-Path $root "build\AirScreenshot.exe") $executable
-$ocrHelper = Join-Path $site "airshot_ocr.exe"
-Copy-Item (Join-Path $root "build\airshot_ocr.exe") $ocrHelper
 
 if ($Sign) {
     if ([string]::IsNullOrWhiteSpace($CertPassword)) {
@@ -42,7 +40,7 @@ if ($Sign) {
         Sort-Object Name -Descending |
         Select-Object -First 1
     $signTool = Join-Path $sdkBin.FullName "x64\signtool.exe"
-    foreach ($binary in @($executable, $ocrHelper)) {
+    foreach ($binary in @($executable)) {
         & $signTool sign /fd SHA256 /f $CertPath /p $CertPassword $binary
         if ($LASTEXITCODE -ne 0) {
             throw "SignTool 签名失败：$binary"
@@ -89,3 +87,4 @@ if (Test-Path -LiteralPath $ocrSource) {
 }
 
 Write-Host "便携版已生成：$executable"
+

@@ -215,12 +215,25 @@ void HostApp::show_tray_menu() {
 }
 
 void HostApp::show_settings() {
+    if (settings_open_) {
+        return;
+    }
+    settings_open_ = true;
+    unregister_hotkeys();
+
     AppConfig edited = config_;
-    if (show_settings_window(window_, edited)) {
+    bool saved = show_settings_window(window_, edited);
+
+    settings_open_ = false;
+
+    if (saved) {
         config_ = std::move(edited);
         std::wstring error;
         if (!save_config(config_, &error)) {
             MessageBoxW(window_, error.c_str(), kAppName, MB_OK | MB_ICONERROR);
+            if (config_.shell_enabled) {
+                register_hotkeys();
+            }
             return;
         }
         features_.unload_disabled(config_);
@@ -228,6 +241,10 @@ void HostApp::show_settings() {
         sync_startup_task();
         if (!config_.shell_enabled && !transient_) {
             PostMessageW(window_, WM_CLOSE, 0, 0);
+        }
+    } else {
+        if (config_.shell_enabled) {
+            register_hotkeys();
         }
     }
 }
@@ -266,6 +283,9 @@ void HostApp::sync_region_config(const RegionResult& result) {
 }
 
 void HostApp::capture_region(RegionAction action) {
+    if (settings_open_) {
+        return;
+    }
     if (action == RegionAction::interactive && config_.annotation_enabled) {
         features_.activate(L"annotation", config_);
     } else if (action == RegionAction::ocr) {
@@ -320,6 +340,9 @@ CommandResponse HostApp::execute_request(std::wstring_view request_json) {
 }
 
 CommandResponse HostApp::execute_capture(const JsonObject& request) {
+    if (settings_open_) {
+        return {ExitCode::operation_failed, L"正在修改设置，无法进行截图。"};
+    }
     const std::wstring mode = request.GetNamedString(L"mode", L"").c_str();
     const std::wstring output = request.GetNamedString(L"output", L"").c_str();
     const std::wstring path = request.GetNamedString(L"path", L"").c_str();
@@ -358,6 +381,9 @@ CommandResponse HostApp::execute_capture(const JsonObject& request) {
 }
 
 CommandResponse HostApp::execute_ocr(const JsonObject& request) {
+    if (settings_open_) {
+        return {ExitCode::operation_failed, L"正在修改设置，无法进行截图。"};
+    }
     if (!config_.ocr_enabled) {
         return {ExitCode::module_unavailable, L"OCR 模块已关闭。"};
     }

@@ -1,10 +1,12 @@
 #include "airshot/config.h"
+#include "airshot/portable.h"
 #include <windows.h>
 #include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <string>
 #include <vector>
+#include <span>
 #include <fcntl.h>
 #include <io.h>
 
@@ -79,7 +81,6 @@ std::wstring quote_argument(std::wstring_view value) {
 }
 
 std::filesystem::path get_dependency_file_path(
-    const wchar_t* argv0,
     const std::wstring& dependency_dir,
     const wchar_t* relative_path) {
     if (!dependency_dir.empty()) {
@@ -89,7 +90,7 @@ std::filesystem::path get_dependency_file_path(
         }
     }
 
-    const std::filesystem::path current_dir = std::filesystem::path(argv0).parent_path();
+    const std::filesystem::path current_dir = airshot::portable_executable_path().parent_path();
     const std::filesystem::path packaged_path =
         current_dir / L"ocr" / airshot::kRapidOcrOnnxPackageId / relative_path;
     if (std::filesystem::exists(packaged_path)) {
@@ -363,7 +364,9 @@ bool run_onnx_ocr(
 
 }  // namespace
 
-int wmain(int argc, wchar_t* argv[]) {
+namespace airshot {
+
+int run_ocr_cli(std::span<const std::wstring> arguments) {
     _setmode(_fileno(stdout), _O_U16TEXT);
     _setmode(_fileno(stderr), _O_U16TEXT);
 
@@ -374,21 +377,22 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wstring ocr_profile{std::wstring(airshot::kDefaultOcrEngine)};
     int ort_threads = 2;
 
-    for (int i = 1; i < argc; ++i) {
-        std::wstring arg = argv[i];
-        if (arg == L"--engine" && i + 1 < argc) {
-            engine = argv[++i];
-        } else if (arg == L"--image" && i + 1 < argc) {
-            image_path = argv[++i];
-        } else if (arg == L"--model-dir" && i + 1 < argc) {
-            model_dir = argv[++i];
-        } else if (arg == L"--dependency-dir" && i + 1 < argc) {
-            dependency_dir = argv[++i];
-        } else if (arg == L"--ocr-profile" && i + 1 < argc) {
-            ocr_profile = airshot::normalize_ocr_engine(argv[++i]);
-        } else if (arg == L"--ort-threads" && i + 1 < argc) {
+    // Loop starts at 1 to skip "--ocr-internal"
+    for (std::size_t i = 1; i < arguments.size(); ++i) {
+        std::wstring arg = arguments[i];
+        if (arg == L"--engine" && i + 1 < arguments.size()) {
+            engine = arguments[++i];
+        } else if (arg == L"--image" && i + 1 < arguments.size()) {
+            image_path = arguments[++i];
+        } else if (arg == L"--model-dir" && i + 1 < arguments.size()) {
+            model_dir = arguments[++i];
+        } else if (arg == L"--dependency-dir" && i + 1 < arguments.size()) {
+            dependency_dir = arguments[++i];
+        } else if (arg == L"--ocr-profile" && i + 1 < arguments.size()) {
+            ocr_profile = airshot::normalize_ocr_engine(arguments[++i]);
+        } else if (arg == L"--ort-threads" && i + 1 < arguments.size()) {
             try {
-                ort_threads = std::max(1, std::stoi(argv[++i]));
+                ort_threads = std::max(1, std::stoi(arguments[++i]));
             } catch (...) {
                 ort_threads = 2;
             }
@@ -400,18 +404,18 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
     if (engine != L"onnx") {
-        std::wcerr << L"错误: airshot_ocr 仅支持 RapidOCR ONNX 引擎。\n";
+        std::wcerr << L"错误: OCR 仅支持 RapidOCR ONNX 引擎。\n";
         return 1;
     }
 
-    std::filesystem::path dll_path = get_dependency_file_path(argv[0], dependency_dir, L"rapidocr_api.dll");
+    std::filesystem::path dll_path = get_dependency_file_path(dependency_dir, L"rapidocr_api.dll");
     if (model_dir.empty()) {
         model_dir = (dll_path.parent_path() / L"models" / ocr_profile).wstring();
     }
 
     std::wstring out_text;
     std::wstring out_error;
-    const auto runner_path = get_dependency_file_path(argv[0], dependency_dir, L"rapidocr_runner.exe");
+    const auto runner_path = get_dependency_file_path(dependency_dir, L"rapidocr_runner.exe");
     bool success = false;
     if (std::filesystem::exists(runner_path)) {
         run_external_runner(
@@ -443,3 +447,5 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wcerr << out_error;
     return 2;
 }
+
+}  // namespace airshot

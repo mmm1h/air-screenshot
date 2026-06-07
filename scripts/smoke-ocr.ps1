@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",
@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $helper = if ([string]::IsNullOrWhiteSpace($HelperPath)) {
-    Join-Path $root "build\airshot_ocr.exe"
+    Join-Path $root "build\AirScreenshot.exe"
 } else {
     $HelperPath
 }
@@ -17,7 +17,7 @@ if (-not (Test-Path -LiteralPath $helper)) {
     & (Join-Path $PSScriptRoot "build.ps1") -Configuration $Configuration
 }
 if (-not (Test-Path -LiteralPath $helper)) {
-    throw "未找到 OCR helper：$helper"
+    throw "鏈壘鍒?OCR helper锛?helper"
 }
 
 if ([string]::IsNullOrWhiteSpace($OcrRoot)) {
@@ -51,7 +51,7 @@ foreach ($relative in $required) {
     }
 }
 if ($missing.Count -gt 0) {
-    throw "OCR 依赖不完整：$($missing -join ', ')"
+    throw "OCR 渚濊禆涓嶅畬鏁达細$($missing -join ', ')"
 }
 
 Add-Type -AssemblyName System.Drawing
@@ -66,7 +66,7 @@ try {
     $graphics.TextRenderingHint = [Drawing.Text.TextRenderingHint]::ClearTypeGridFit
     $font = New-Object Drawing.Font "Microsoft YaHei", 34, ([Drawing.FontStyle]::Regular)
     $brush = [Drawing.Brushes]::Black
-    $graphics.DrawString("Air OCR 123 中文测试", $font, $brush, 24, 52)
+    $graphics.DrawString("Air OCR 123 涓枃娴嬭瘯", $font, $brush, 24, 52)
     $bitmap.Save($image, [Drawing.Imaging.ImageFormat]::Png)
     $graphics.Dispose()
     $font.Dispose()
@@ -76,6 +76,7 @@ try {
         Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
         $modelDir = Join-Path $OcrRoot "models\$profile"
         $args = @(
+            "--ocr-internal",
             "--engine", "onnx",
             "--image", "`"$image`"",
             "--dependency-dir", "`"$OcrRoot`"",
@@ -91,10 +92,10 @@ try {
         $outText = if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout -Raw -Encoding Unicode } else { "" }
         $errText = if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -Raw -Encoding Unicode } else { "" }
         if ($process.ExitCode -ne 0) {
-            throw "$profile OCR 失败：$errText"
+            throw "$profile OCR 澶辫触锛?errText"
         }
         if ($outText -notmatch "Air" -or $outText -notmatch "123") {
-            throw "$profile OCR 输出未包含预期文本：$outText"
+            throw "$profile OCR 杈撳嚭鏈寘鍚鏈熸枃鏈細$outText"
         }
         Write-Host "$profile OCR smoke passed: $($outText.Trim())"
     }
@@ -102,3 +103,4 @@ try {
 finally {
     Remove-Item -LiteralPath $image, $stdout, $stderr -Force -ErrorAction SilentlyContinue
 }
+

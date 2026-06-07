@@ -58,6 +58,7 @@ private:
     bool transient_{};
     bool tray_added_{};
     bool shutting_down_{};
+    bool settings_open_{};
     HANDLE mutex_{};
     AppConfig config_;
     FeatureRegistry features_;

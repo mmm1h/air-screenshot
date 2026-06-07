@@ -572,15 +572,15 @@ OcrOutput recognize_text(const Bitmap& bitmap, const AppConfig& config) {
         return {false, {}, L"无法保存临时 OCR 选区图像: " + save_error};
     }
 
-    std::filesystem::path ocr_exe = executable_directory() / L"airshot_ocr.exe";
+    std::filesystem::path ocr_exe = portable_executable_path();
 
     if (!std::filesystem::exists(ocr_exe)) {
         std::filesystem::remove(temp_png);
-        return {false, {}, L"未找到 airshot_ocr.exe，请重新编译或安装程序。"};
+        return {false, {}, L"未找到 " + ocr_exe.filename().wstring() + L"，请重新编译或安装程序。"};
     }
 
     std::wstring cmd_line = quote_argument(ocr_exe.wstring());
-    cmd_line += L" --engine onnx --image " + quote_argument(temp_png.wstring());
+    cmd_line += L" --ocr-internal --engine onnx --image " + quote_argument(temp_png.wstring());
     cmd_line += L" --model-dir " + quote_argument((*runtime_dir / std::wstring(spec.profile_directory)).wstring());
     cmd_line += L" --dependency-dir " + quote_argument(runtime_dir->wstring());
     cmd_line += L" --ocr-profile " + quote_argument(std::wstring(spec.id));

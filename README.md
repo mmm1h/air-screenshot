@@ -14,7 +14,7 @@ Air Screenshot 是一个面向 Windows 10 2004+ x64 的轻量原生截图工具�
 
 ## 下载与使用
 
-从 [公开下载页](https://mmm1h.github.io/air-screenshot/) 下载 `AirScreenshot.exe` 和 `airshot_ocr.exe`，放到同一个普通可写目录后双击运行。无需安装、管理员权限或证书脚本。
+从 [公开下载页](https://mmm1h.github.io/air-screenshot/) 下载 `AirScreenshot.exe`，放到普通可写目录后双击运行。无需安装、管理员权限或证书脚本。
 
 首次启动默认注册当前用户开机启动项，可在设置中关闭。移动 EXE 后再次启动会自动修正启动项路径。
 
@@ -32,7 +32,7 @@ Windows SmartScreen 可能提示未知发布者。这是因为当前使用自签
 生成本地便携包：
 
 ```powershell
-.\scripts\package.ps1 -Version 0.2.2
+.\scripts\package.ps1 -Version 0.2.3
 ```
 
 ## 自动更新
@@ -50,8 +50,8 @@ Windows SmartScreen 可能提示未知发布者。这是因为当前使用自签
 推送格式为 `vX.Y.Z` 的 tag 会自动运行 [release.yml](.github/workflows/release.yml)：
 
 ```powershell
-git tag v0.2.2
-git push origin v0.2.2
+git tag v0.2.3
+git push origin v0.2.3
 ```
 
 工作流会运行测试、准备 OCR 依赖、生成并验证签名 EXE、执行便携与 OCR 烟测、创建 GitHub Release，并更新 GitHub Pages 下载页、`latest.json`、`ocr-dependencies.json` 和 OCR 依赖文件。
@@ -89,7 +89,7 @@ OCR 使用本地 RapidOCR / PP-OCRv5 / ONNX Runtime CPU 推理，设置中可切
 - 高精度 OCR：使用 PP-OCRv5 server 模型，适合小字、大图和复杂背景。
 - 兼容 OCR：使用 PP-OCRv4 mobile 模型，作为稳定兼容档。
 
-首次使用前在设置中点击“下载依赖”。依赖按清单校验 SHA256 后安装到 `%LOCALAPPDATA%\AirScreenshot\ocr\rapidocr-onnx`。OCR 识别在 `airshot_ocr.exe` 子进程中完成；模型和 ONNX Runtime 不会常驻托盘进程，单次识别超时会停止子进程。源码发布前可运行 `.\scripts\prepare-ocr-dependencies.ps1` 准备 `dist\ocr-dependencies\rapidocr-onnx`，再由 `.\scripts\package.ps1` 基于真实文件生成下载清单。离线环境可提前把依赖目录放到程序同目录下的 `ocr\rapidocr-onnx`。
+首次使用前在设置中点击“下载依赖”。依赖按清单校验 SHA256 后安装到 `%LOCALAPPDATA%\AirScreenshot\ocr\rapidocr-onnx`。OCR 识别在独立的自身子进程中完成；模型和 ONNX Runtime 不会常驻托盘进程，单次识别超时会停止子进程。源码发布前可运行 `.\scripts\prepare-ocr-dependencies.ps1` 准备 `dist\ocr-dependencies\rapidocr-onnx`，再由 `.\scripts\package.ps1` 基于真实文件生成下载清单。离线环境可提前把依赖目录放到程序同目录下的 `ocr\rapidocr-onnx`。
 
 ## 限制
 

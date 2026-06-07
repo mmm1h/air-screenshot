@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(AirScreenshot VERSION 0.2.2 LANGUAGES CXX)
+project(AirScreenshot VERSION 0.2.3 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "Air Screenshot only supports Windows.")
@@ -84,6 +84,7 @@ add_executable(AirScreenshot WIN32
     src/host/main.cpp
     src/host/settings_window.cpp
     src/host/pin_window.cpp
+    src/core/ocr_cli_main.cpp
     src/host/resources.rc
     src/host/AirScreenshot.exe.manifest
 )
@@ -92,12 +93,6 @@ target_compile_options(AirScreenshot PRIVATE /W4 /permissive- /utf-8 "$<$<CONFIG
 target_link_options(AirScreenshot PRIVATE "$<$<CONFIG:Release>:/DEBUG>" "$<$<CONFIG:Release>:/OPT:REF>" "$<$<CONFIG:Release>:/OPT:ICF>")
 target_link_libraries(AirScreenshot PRIVATE airshot_core comctl32)
 
-add_executable(airshot_ocr
-    src/core/ocr_cli_main.cpp
-)
-target_compile_options(airshot_ocr PRIVATE /W4 /permissive- /utf-8)
-target_link_libraries(airshot_ocr PRIVATE airshot_core)
-
 if(BUILD_TESTING)
     add_executable(airshot_tests tests/test_main.cpp)
     target_compile_options(airshot_tests PRIVATE /W4 /permissive- /utf-8)
@@ -105,4 +100,4 @@ if(BUILD_TESTING)
     add_test(NAME airshot_tests COMMAND airshot_tests)
 endif()
 
-install(TARGETS AirScreenshot airshot_ocr RUNTIME DESTINATION .)
+install(TARGETS AirScreenshot RUNTIME DESTINATION .)

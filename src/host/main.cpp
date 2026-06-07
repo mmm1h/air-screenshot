@@ -1,5 +1,6 @@
 #include "host_app.h"
 #include "cli_app.h"
+#include "airshot/ocr.h"
 
 #include "airshot/portable.h"
 
@@ -26,6 +27,9 @@ std::vector<std::wstring> command_arguments() {
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const auto arguments = command_arguments();
+    if (!arguments.empty() && arguments[0] == L"--ocr-internal") {
+        return airshot::run_ocr_cli(arguments);
+    }
     if (!arguments.empty() &&
         (arguments[0] == L"--apply-update" || arguments[0] == L"--verify-update" ||
          arguments[0] == L"--check-update-target")) {
