@@ -15,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <memory>
 #include <ranges>
 #include <string>
@@ -25,12 +26,17 @@ namespace airshot::overlay_detail {
 
 class OverlaySession {
 public:
-    explicit OverlaySession(RegionRequest request);
+    explicit OverlaySession(RegionRequest request, RegionCaptureCompletion completion = {});
+    ~OverlaySession();
+
+    bool start();
     RegionResult run();
+    void cancel();
+    [[nodiscard]] bool active() const noexcept { return started_ && !done_; }
     DragMode hit_test_drag_mode(POINT point) const;
     void on_mouse_down(HWND source, POINT point, bool right);
     void on_mouse_move(POINT point);
-    void on_mouse_up(POINT point);
+    void on_mouse_up(HWND source, POINT point);
     void on_double_click(POINT point);
     void on_key_down(HWND source, WPARAM key);
     void on_mouse_wheel(short delta);
@@ -82,16 +88,25 @@ private:
     void discard_redo();
     Bitmap original_selection() const;
     Bitmap rendered_selection() const;
+    void complete_default(HWND owner);
     void complete_clipboard();
     void complete_file(std::wstring_view requested_path, HWND owner);
     void complete_ocr();
     void complete_pin();
     void complete_scroll(HWND source);
     void run_scroll_capture(HWND source);
+    void capture_scroll_frame();
+    void finish_scroll_capture(bool cancelled);
+    void destroy_scroll_windows();
+    void enter_modal() noexcept;
+    void leave_modal();
+    void deliver_completion();
     void finish(RegionResult result);
+    void destroy_windows();
 
     RegionRequest request_;
     RegionResult result_;
+    RegionCaptureCompletion completion_;
     std::vector<MonitorSnapshot> monitors_;
     std::vector<WindowCandidate> window_candidates_;
     std::vector<std::unique_ptr<OverlayWindow>> windows_;
@@ -104,6 +119,9 @@ private:
     bool selection_complete_{};
     bool drawing_annotation_{};
     bool done_{};
+    bool started_{};
+    unsigned int modal_depth_{};
+    bool completion_pending_{};
     Tool active_tool_{Tool::none};
     Annotation preview_;
     std::vector<Annotation> annotations_;
@@ -131,6 +149,21 @@ private:
     bool mosaic_is_rect_{};
     bool text_size_dropdown_open_{};
     int text_size_hovered_idx_{-1};
+    HWND prompt_window_{};
+
+    struct ActiveScrollCapture {
+        std::unique_ptr<ScrollStitcher> stitcher;
+        Bitmap last_frame;
+        ScrollControlState control_state;
+        HWND border_window{};
+        HWND control_window{};
+        int locked_direction{};
+        int consecutive_failures{};
+        bool paused{};
+        bool processing{};
+        std::wstring pause_text;
+    };
+    std::unique_ptr<ActiveScrollCapture> scroll_capture_;
 
     friend class OverlayWindow;
 };

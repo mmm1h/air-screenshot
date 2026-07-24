@@ -11,14 +11,15 @@ inline constexpr std::wstring_view kDefaultOcrEngine = kOcrEngineRapidV5Fast;
 inline constexpr wchar_t kRapidOcrOnnxPackageId[] = L"rapidocr-onnx";
 inline constexpr wchar_t kDefaultOcrDependencyManifestUrl[] =
     L"https://mmm1h.github.io/air-screenshot/ocr-dependencies.json";
+inline constexpr int kCurrentConfigSchemaVersion = 2;
 
 struct AppConfig {
-    int schema_version{1};
+    int schema_version{kCurrentConfigSchemaVersion};
     bool annotation_enabled{true};
     bool annotation_locked_tool{true};
     bool ocr_enabled{true};
     bool shell_enabled{true};
-    bool start_at_login{true};
+    bool start_at_login{false};
     bool global_ocr_enabled{false};
     bool notifications_enabled{false};
     std::wstring ocr_engine{std::wstring(kDefaultOcrEngine)};
@@ -48,6 +49,10 @@ struct AppConfig {
     std::wstring tool_shortcut_text{L"T"};
     std::wstring tool_shortcut_serial{L"N"};
     std::wstring tool_shortcut_eraser{L"D"};
+
+    // Persistence metadata. These fields are not emitted as configuration keys.
+    std::wstring preserved_json;
+    bool write_protected{};
 };
 
 struct Hotkey {
@@ -58,14 +63,33 @@ struct Hotkey {
 [[nodiscard]] bool is_windows_system_light_theme();
 [[nodiscard]] bool should_use_light_theme(std::wstring_view theme_config);
 [[nodiscard]] std::optional<Hotkey> parse_hotkey(std::wstring_view value);
+[[nodiscard]] bool validate_global_hotkeys(
+    const AppConfig& config,
+    std::wstring* error = nullptr);
 [[nodiscard]] std::wstring normalize_ocr_engine(std::wstring_view value);
 [[nodiscard]] std::wstring normalize_annotation_hidden_tools(std::wstring_view value);
 [[nodiscard]] bool annotation_tool_hidden(std::wstring_view hidden_tools, std::wstring_view tool_id);
 [[nodiscard]] std::wstring config_to_json(const AppConfig& config);
-[[nodiscard]] std::optional<AppConfig> config_from_json(std::wstring_view json);
+[[nodiscard]] std::optional<AppConfig> config_from_json(
+    std::wstring_view json,
+    std::wstring* error = nullptr);
 [[nodiscard]] std::filesystem::path config_directory();
-[[nodiscard]] std::filesystem::path config_path();
+
+class ConfigStore {
+public:
+    ConfigStore();
+    explicit ConfigStore(std::filesystem::path directory);
+
+    [[nodiscard]] const std::filesystem::path& directory() const noexcept;
+    [[nodiscard]] std::filesystem::path path() const;
+    [[nodiscard]] std::filesystem::path legacy_path() const;
+    [[nodiscard]] std::optional<AppConfig> load(std::wstring* error = nullptr) const;
+    bool save(const AppConfig& config, std::wstring* error = nullptr) const;
+
+private:
+    std::filesystem::path directory_;
+};
+
 [[nodiscard]] AppConfig load_config();
-bool save_config(const AppConfig& config, std::wstring* error = nullptr);
 
 }  // namespace airshot

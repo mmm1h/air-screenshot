@@ -2,7 +2,11 @@
 
 #include "airshot/common.h"
 
+#include <stop_token>
+
 namespace airshot {
+
+inline constexpr std::uint64_t kMaxPortableUpdateBytes = 50ULL * 1024ULL * 1024ULL;
 
 struct UpdateManifest {
     std::wstring version;
@@ -29,6 +33,9 @@ bool sync_portable_startup(bool enabled, std::wstring* error = nullptr);
     const std::filesystem::path& path, const UpdateManifest& manifest, std::wstring* error = nullptr);
 
 UpdateStageResult stage_latest_update(std::wstring* message = nullptr);
+UpdateStageResult stage_latest_update(
+    std::wstring* message,
+    std::stop_token stop_token);
 [[nodiscard]] bool pending_update_available();
 bool launch_pending_update(bool restart_after_update, std::wstring* error = nullptr);
 int run_update_helper(std::span<const std::wstring> arguments);

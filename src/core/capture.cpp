@@ -4,23 +4,151 @@
 
 #include <cstring>
 #include <cwctype>
+#include <limits>
+#include <tuple>
 
 namespace airshot {
 namespace {
 
-Bitmap capture_with_gdi(const RectI& rect) {
-    if (rect.empty()) {
+struct CheckedRect {
+    RectI rect;
+    int width{};
+    int height{};
+};
+
+[[nodiscard]] std::optional<CheckedRect> normalize_checked(const RectI& rect) noexcept {
+    const std::int64_t left = std::min<std::int64_t>(rect.left, rect.right);
+    const std::int64_t top = std::min<std::int64_t>(rect.top, rect.bottom);
+    const std::int64_t right = std::max<std::int64_t>(rect.left, rect.right);
+    const std::int64_t bottom = std::max<std::int64_t>(rect.top, rect.bottom);
+    const std::int64_t width = right - left;
+    const std::int64_t height = bottom - top;
+    if (width <= 0 || height <= 0 ||
+        width > std::numeric_limits<int>::max() || height > std::numeric_limits<int>::max()) {
+        return std::nullopt;
+    }
+    return CheckedRect{
+        RectI{
+            static_cast<int>(left),
+            static_cast<int>(top),
+            static_cast<int>(right),
+            static_cast<int>(bottom),
+        },
+        static_cast<int>(width),
+        static_cast<int>(height),
+    };
+}
+
+[[nodiscard]] std::optional<RectI> intersect_checked(const RectI& first, const RectI& second) noexcept {
+    const RectI value{
+        std::max(first.left, second.left),
+        std::max(first.top, second.top),
+        std::min(first.right, second.right),
+        std::min(first.bottom, second.bottom),
+    };
+    if (value.left >= value.right || value.top >= value.bottom) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+[[nodiscard]] std::optional<int> checked_difference(int first, int second) noexcept {
+    const std::int64_t value = static_cast<std::int64_t>(first) - second;
+    if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<int>(value);
+}
+
+class ScreenDc {
+public:
+    explicit ScreenDc(HWND window) noexcept : window_(window), value_(GetDC(window)) {}
+    ~ScreenDc() {
+        if (value_) {
+            ReleaseDC(window_, value_);
+        }
+    }
+    ScreenDc(const ScreenDc&) = delete;
+    ScreenDc& operator=(const ScreenDc&) = delete;
+
+    [[nodiscard]] HDC get() const noexcept { return value_; }
+
+private:
+    HWND window_{};
+    HDC value_{};
+};
+
+class MemoryDc {
+public:
+    explicit MemoryDc(HDC compatible_with) noexcept : value_(CreateCompatibleDC(compatible_with)) {}
+    ~MemoryDc() {
+        if (value_) {
+            DeleteDC(value_);
+        }
+    }
+    MemoryDc(const MemoryDc&) = delete;
+    MemoryDc& operator=(const MemoryDc&) = delete;
+
+    [[nodiscard]] HDC get() const noexcept { return value_; }
+
+private:
+    HDC value_{};
+};
+
+class OwnedBitmap {
+public:
+    explicit OwnedBitmap(HBITMAP value = nullptr) noexcept : value_(value) {}
+    ~OwnedBitmap() {
+        if (value_) {
+            DeleteObject(value_);
+        }
+    }
+    OwnedBitmap(const OwnedBitmap&) = delete;
+    OwnedBitmap& operator=(const OwnedBitmap&) = delete;
+
+    [[nodiscard]] HBITMAP get() const noexcept { return value_; }
+
+private:
+    HBITMAP value_{};
+};
+
+class SelectedObject {
+public:
+    SelectedObject(HDC dc, HGDIOBJ object) noexcept : dc_(dc), previous_(SelectObject(dc, object)) {}
+    ~SelectedObject() {
+        if (valid()) {
+            SelectObject(dc_, previous_);
+        }
+    }
+    SelectedObject(const SelectedObject&) = delete;
+    SelectedObject& operator=(const SelectedObject&) = delete;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return previous_ != nullptr && previous_ != HGDI_ERROR;
+    }
+
+private:
+    HDC dc_{};
+    HGDIOBJ previous_{};
+};
+
+[[nodiscard]] Bitmap capture_with_gdi(const RectI& requested_rect) {
+    const auto checked = normalize_checked(requested_rect);
+    if (!checked) {
         return {};
     }
 
-    Bitmap result(rect.width(), rect.height());
-    HDC screen_dc = GetDC(nullptr);
-    if (!screen_dc) {
+    Bitmap result(checked->width, checked->height);
+    if (result.empty()) {
         return {};
     }
-    HDC memory_dc = CreateCompatibleDC(screen_dc);
-    if (!memory_dc) {
-        ReleaseDC(nullptr, screen_dc);
+
+    ScreenDc screen_dc(nullptr);
+    if (!screen_dc.get()) {
+        return {};
+    }
+    MemoryDc memory_dc(screen_dc.get());
+    if (!memory_dc.get()) {
         return {};
     }
 
@@ -31,70 +159,96 @@ Bitmap capture_with_gdi(const RectI& rect) {
     info.bmiHeader.biPlanes = 1;
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
+    info.bmiHeader.biSizeImage = static_cast<DWORD>(result.pixels.size());
 
     void* bits = nullptr;
-    HBITMAP dib = CreateDIBSection(screen_dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!dib || !bits) {
-        DeleteDC(memory_dc);
-        ReleaseDC(nullptr, screen_dc);
+    OwnedBitmap dib(CreateDIBSection(screen_dc.get(), &info, DIB_RGB_COLORS, &bits, nullptr, 0));
+    if (!dib.get() || !bits) {
+        return {};
+    }
+    SelectedObject selection(memory_dc.get(), dib.get());
+    if (!selection.valid()) {
         return {};
     }
 
-    HGDIOBJ previous = SelectObject(memory_dc, dib);
-    const BOOL copied = BitBlt(memory_dc,
-                               0,
-                               0,
-                               result.width,
-                               result.height,
-                               screen_dc,
-                               rect.left,
-                               rect.top,
-                               SRCCOPY | CAPTUREBLT);
-    if (copied) {
-        std::memcpy(result.pixels.data(), bits, result.pixels.size());
-    } else {
-        result = {};
+    if (!BitBlt(memory_dc.get(),
+                0,
+                0,
+                result.width,
+                result.height,
+                screen_dc.get(),
+                checked->rect.left,
+                checked->rect.top,
+                SRCCOPY | CAPTUREBLT) ||
+        !GdiFlush()) {
+        return {};
     }
 
-    SelectObject(memory_dc, previous);
-    DeleteObject(dib);
-    DeleteDC(memory_dc);
-    ReleaseDC(nullptr, screen_dc);
+    std::memcpy(result.pixels.data(), bits, result.pixels.size());
+    result.make_opaque();
     return result;
 }
 
-RectI virtual_desktop_bounds() {
-    const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    return {left,
-            top,
-            left + GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            top + GetSystemMetrics(SM_CYVIRTUALSCREEN)};
+[[nodiscard]] std::optional<RectI> virtual_desktop_bounds() noexcept {
+    const std::int64_t left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const std::int64_t top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const std::int64_t width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const std::int64_t height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    const std::int64_t right = left + width;
+    const std::int64_t bottom = top + height;
+    if (width <= 0 || height <= 0 ||
+        right < std::numeric_limits<int>::min() || right > std::numeric_limits<int>::max() ||
+        bottom < std::numeric_limits<int>::min() || bottom > std::numeric_limits<int>::max()) {
+        return std::nullopt;
+    }
+    return RectI{
+        static_cast<int>(left),
+        static_cast<int>(top),
+        static_cast<int>(right),
+        static_cast<int>(bottom),
+    };
 }
 
-std::optional<RectI> window_bounds(HWND window) {
+[[nodiscard]] std::optional<RectI> window_bounds(HWND window) {
+    if (!window) {
+        return std::nullopt;
+    }
     RECT rect{};
     if (FAILED(DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &rect, sizeof(rect))) &&
         !GetWindowRect(window, &rect)) {
         return std::nullopt;
     }
-    RectI result = RectI::from_native(rect);
-    if (result.empty()) {
-        return std::nullopt;
-    }
-    return result;
+    const RectI result = RectI::from_native(rect);
+    return normalize_checked(result) ? std::optional(result) : std::nullopt;
 }
 
 BOOL CALLBACK collect_monitors(HMONITOR monitor, HDC, LPRECT rect, LPARAM context) {
     auto* monitors = reinterpret_cast<std::vector<MonitorSnapshot>*>(context);
-    MONITORINFO info{sizeof(info)};
-    GetMonitorInfoW(monitor, &info);
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, reinterpret_cast<MONITORINFO*>(&info))) {
+        return TRUE;
+    }
+
     MonitorSnapshot snapshot;
     snapshot.handle = monitor;
     snapshot.bounds = RectI::from_native(*rect);
     snapshot.primary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+    snapshot.device_name = info.szDevice;
     monitors->push_back(std::move(snapshot));
     return TRUE;
+}
+
+[[nodiscard]] std::vector<MonitorSnapshot> enumerate_monitors() {
+    std::vector<MonitorSnapshot> result;
+    if (!EnumDisplayMonitors(nullptr, nullptr, collect_monitors, reinterpret_cast<LPARAM>(&result))) {
+        return {};
+    }
+    std::ranges::sort(result, [](const MonitorSnapshot& first, const MonitorSnapshot& second) {
+        return std::tie(first.bounds.left, first.bounds.top, first.device_name) <
+               std::tie(second.bounds.left, second.bounds.top, second.device_name);
+    });
+    return result;
 }
 
 BOOL CALLBACK collect_windows(HWND window, LPARAM context) {
@@ -106,7 +260,11 @@ BOOL CALLBACK collect_windows(HWND window, LPARAM context) {
         return TRUE;
     }
     const auto bounds = window_bounds(window);
-    if (!bounds || bounds->width() <= 6 || bounds->height() <= 6) {
+    if (!bounds) {
+        return TRUE;
+    }
+    const auto checked = normalize_checked(*bounds);
+    if (!checked || checked->width <= 6 || checked->height <= 6) {
         return TRUE;
     }
     auto* windows = reinterpret_cast<std::vector<WindowCandidate>*>(context);
@@ -114,11 +272,42 @@ BOOL CALLBACK collect_windows(HWND window, LPARAM context) {
     return TRUE;
 }
 
+[[nodiscard]] Bitmap capture_from_monitors(const std::vector<MonitorSnapshot>& monitors,
+                                           const RectI& selection) {
+    const auto checked = normalize_checked(selection);
+    if (!checked) {
+        return {};
+    }
+    Bitmap result(checked->width, checked->height);
+    if (result.empty()) {
+        return {};
+    }
+
+    for (const auto& monitor : monitors) {
+        const auto overlap = intersect_checked(monitor.bounds, checked->rect);
+        if (!overlap) {
+            continue;
+        }
+        Bitmap captured = capture_with_gdi(*overlap);
+        if (captured.empty()) {
+            return {};
+        }
+        const auto target_x = checked_difference(overlap->left, checked->rect.left);
+        const auto target_y = checked_difference(overlap->top, checked->rect.top);
+        if (!target_x || !target_y) {
+            return {};
+        }
+        const RectI source_rect{0, 0, captured.width, captured.height};
+        const POINT target_origin{*target_x, *target_y};
+        blit(captured, source_rect, result, target_origin);
+    }
+    return result;
+}
+
 }  // namespace
 
 std::vector<MonitorSnapshot> capture_monitors() {
-    std::vector<MonitorSnapshot> result;
-    EnumDisplayMonitors(nullptr, nullptr, collect_monitors, reinterpret_cast<LPARAM>(&result));
+    auto result = enumerate_monitors();
     for (auto& monitor : result) {
         monitor.bitmap = capture_with_gdi(monitor.bounds);
     }
@@ -127,25 +316,33 @@ std::vector<MonitorSnapshot> capture_monitors() {
 
 std::vector<WindowCandidate> enumerate_window_candidates() {
     std::vector<WindowCandidate> result;
-    EnumWindows(collect_windows, reinterpret_cast<LPARAM>(&result));
+    if (!EnumWindows(collect_windows, reinterpret_cast<LPARAM>(&result))) {
+        return {};
+    }
     return result;
 }
 
 Bitmap capture_rect(const RectI& rect) {
-    return capture_with_gdi(rect.normalized());
+    const auto monitors = enumerate_monitors();
+    return monitors.empty() ? Bitmap{} : capture_from_monitors(monitors, rect);
 }
 
 Bitmap capture_virtual_desktop() {
-    return capture_with_gdi(virtual_desktop_bounds());
+    const auto bounds = virtual_desktop_bounds();
+    const auto monitors = enumerate_monitors();
+    if (!bounds || monitors.empty()) {
+        return {};
+    }
+    return capture_from_monitors(monitors, *bounds);
 }
 
 std::optional<std::pair<Bitmap, RectI>> capture_active_window() {
-    HWND window = GetForegroundWindow();
+    const HWND window = GetForegroundWindow();
     const auto bounds = window_bounds(window);
-    if (!window || !bounds) {
+    if (!bounds) {
         return std::nullopt;
     }
-    Bitmap bitmap = capture_with_gdi(*bounds);
+    Bitmap bitmap = capture_rect(*bounds);
     if (bitmap.empty()) {
         return std::nullopt;
     }
@@ -154,13 +351,15 @@ std::optional<std::pair<Bitmap, RectI>> capture_active_window() {
 
 std::optional<std::pair<Bitmap, RectI>> capture_monitor(std::wstring_view selector) {
     if (selector.empty() || _wcsicmp(std::wstring(selector).c_str(), L"all") == 0) {
-        RectI bounds = virtual_desktop_bounds();
-        Bitmap bitmap = capture_with_gdi(bounds);
-        return bitmap.empty() ? std::nullopt : std::optional(std::pair{std::move(bitmap), bounds});
+        const auto bounds = virtual_desktop_bounds();
+        if (!bounds) {
+            return std::nullopt;
+        }
+        Bitmap bitmap = capture_virtual_desktop();
+        return bitmap.empty() ? std::nullopt : std::optional(std::pair{std::move(bitmap), *bounds});
     }
 
-    std::vector<MonitorSnapshot> monitors;
-    EnumDisplayMonitors(nullptr, nullptr, collect_monitors, reinterpret_cast<LPARAM>(&monitors));
+    auto monitors = enumerate_monitors();
     if (monitors.empty()) {
         return std::nullopt;
     }
@@ -172,14 +371,21 @@ std::optional<std::pair<Bitmap, RectI>> capture_monitor(std::wstring_view select
         index = found == monitors.end() ? 0U : static_cast<std::size_t>(std::distance(monitors.begin(), found));
     } else if (_wcsicmp(value.c_str(), L"cursor") == 0) {
         POINT cursor{};
-        GetCursorPos(&cursor);
+        if (!GetCursorPos(&cursor)) {
+            return std::nullopt;
+        }
         const HMONITOR target = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
         const auto found =
             std::ranges::find_if(monitors, [target](const auto& monitor) { return monitor.handle == target; });
         index = found == monitors.end() ? 0U : static_cast<std::size_t>(std::distance(monitors.begin(), found));
     } else {
         try {
-            index = static_cast<std::size_t>(std::stoul(value));
+            std::size_t parsed_characters = 0;
+            const unsigned long parsed = std::stoul(value, &parsed_characters);
+            if (parsed_characters != value.size()) {
+                return std::nullopt;
+            }
+            index = static_cast<std::size_t>(parsed);
         } catch (...) {
             return std::nullopt;
         }
@@ -194,20 +400,36 @@ std::optional<std::pair<Bitmap, RectI>> capture_monitor(std::wstring_view select
 }
 
 Bitmap compose_selection(const std::vector<MonitorSnapshot>& monitors, const RectI& selection) {
-    const RectI normalized = selection.normalized();
-    Bitmap result(normalized.width(), normalized.height());
+    const auto checked = normalize_checked(selection);
+    if (!checked) {
+        return {};
+    }
+    Bitmap result(checked->width, checked->height);
+    if (result.empty()) {
+        return {};
+    }
+
     for (const auto& monitor : monitors) {
-        const auto overlap = intersect(monitor.bounds, normalized);
+        const auto overlap = intersect_checked(monitor.bounds, checked->rect);
         if (!overlap || monitor.bitmap.empty()) {
             continue;
         }
-        RectI source_rect{
-            overlap->left - monitor.bounds.left,
-            overlap->top - monitor.bounds.top,
-            overlap->right - monitor.bounds.left,
-            overlap->bottom - monitor.bounds.top,
+        const auto source_left = checked_difference(overlap->left, monitor.bounds.left);
+        const auto source_top = checked_difference(overlap->top, monitor.bounds.top);
+        const auto source_right = checked_difference(overlap->right, monitor.bounds.left);
+        const auto source_bottom = checked_difference(overlap->bottom, monitor.bounds.top);
+        const auto target_x = checked_difference(overlap->left, checked->rect.left);
+        const auto target_y = checked_difference(overlap->top, checked->rect.top);
+        if (!source_left || !source_top || !source_right || !source_bottom || !target_x || !target_y) {
+            continue;
+        }
+        const RectI source_rect{
+            *source_left,
+            *source_top,
+            *source_right,
+            *source_bottom,
         };
-        POINT target_origin{overlap->left - normalized.left, overlap->top - normalized.top};
+        const POINT target_origin{*target_x, *target_y};
         blit(monitor.bitmap, source_rect, result, target_origin);
     }
     return result;

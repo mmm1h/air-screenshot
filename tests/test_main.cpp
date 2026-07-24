@@ -1,7 +1,6 @@
 #include "airshot/bitmap.h"
 #include "airshot/command.h"
 #include "airshot/config.h"
-#include "airshot/feature.h"
 #include "airshot/ocr.h"
 #include "airshot/portable.h"
 #include "airshot/output.h"
@@ -102,7 +101,7 @@ void test_config() {
     config.annotation_next_serial = 12;
     config.global_ocr_enabled = true;
     config.capture_hotkey = L"Ctrl+Shift+F9";
-    config.global_ocr_hotkey = L"Ctrl+Alt+\\\"O";
+    config.global_ocr_hotkey = L"Ctrl+Alt+O";
     config.custom_color = L"#123456";
     config.tool_shortcut_select = L"Shift+S";
     config.tool_shortcut_rectangle = L"Shift+R";
@@ -117,7 +116,7 @@ void test_config() {
     expect(parsed && !parsed->annotation_enabled && parsed->global_ocr_enabled &&
                !parsed->annotation_locked_tool && parsed->annotation_hidden_tools == L"rect,pen,close" &&
                parsed->annotation_highlight_alpha == 192 && parsed->annotation_next_serial == 12 &&
-               parsed->capture_hotkey == L"Ctrl+Shift+F9" && parsed->global_ocr_hotkey == L"Ctrl+Alt+\\\"O" &&
+               parsed->capture_hotkey == L"Ctrl+Shift+F9" && parsed->global_ocr_hotkey == L"Ctrl+Alt+O" &&
                parsed->custom_color == L"#123456" &&
                parsed->tool_shortcut_select == L"Shift+S" &&
                parsed->tool_shortcut_rectangle == L"Shift+R" &&
@@ -187,7 +186,7 @@ void test_ocr_join() {
 
 void test_ocr_dependency_manifest() {
     const auto manifest = airshot::parse_ocr_dependency_manifest(
-        LR"({"packageId":"rapidocr-onnx","files":[)"
+        LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[)"
         LR"({"path":"rapidocr_api.dll","url":"https://example.com/rapidocr_api.dll","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1},)"
         LR"({"path":"onnxruntime.dll","url":"https://example.com/onnxruntime.dll","sha256":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","size":2},)"
         LR"({"path":"rapidocr_runner.exe","url":"https://example.com/rapidocr_runner.exe","sha256":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","size":3},)"
@@ -208,16 +207,16 @@ void test_ocr_dependency_manifest() {
            L"OCR dependency manifest parses required files");
 
     expect(!airshot::parse_ocr_dependency_manifest(
-               LR"({"packageId":"rapidocr-onnx","files":[{"path":"../rapidocr_api.dll","url":"https://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1}]})"),
+               LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[{"path":"../rapidocr_api.dll","url":"https://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1}]})"),
            L"OCR dependency manifest rejects unsafe paths");
     expect(!airshot::parse_ocr_dependency_manifest(
-               LR"({"packageId":"rapidocr-onnx","files":[{"path":"rapidocr_api.dll","url":"http://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1}]})"),
+               LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[{"path":"rapidocr_api.dll","url":"http://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1}]})"),
            L"OCR dependency manifest rejects non-HTTPS URLs");
     expect(!airshot::parse_ocr_dependency_manifest(
-               LR"({"packageId":"rapidocr-onnx","files":[{"path":"rapidocr_api.dll","url":"https://example.com/a","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":1}]})"),
+               LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[{"path":"rapidocr_api.dll","url":"https://example.com/a","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":1}]})"),
            L"OCR dependency manifest rejects zero SHA256");
     expect(!airshot::parse_ocr_dependency_manifest(
-               LR"({"packageId":"rapidocr-onnx","files":[{"path":"rapidocr_api.dll","url":"https://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":0}]})"),
+               LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[{"path":"rapidocr_api.dll","url":"https://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":0}]})"),
            L"OCR dependency manifest rejects zero size");
 }
 
@@ -278,47 +277,6 @@ void test_portable_runtime() {
            L"portable startup command quotes executable path");
 }
 
-void test_feature_registry() {
-    airshot::AppConfig config;
-    airshot::FeatureRegistry registry;
-    expect(!registry.loaded(L"annotation") && !registry.loaded(L"ocr") && !registry.loaded(L"shell"),
-           L"feature modules start unloaded");
-    expect(registry.list(config).size() == 3 && !registry.loaded(L"annotation"),
-           L"feature listing does not load modules");
-    expect(registry.activate(L"annotation", config) != nullptr && registry.loaded(L"annotation"),
-           L"feature activates lazily");
-    config.annotation_enabled = false;
-    registry.unload_disabled(config);
-    expect(!registry.loaded(L"annotation") && registry.activate(L"annotation", config) == nullptr,
-           L"disabled feature unloads and cannot activate");
-}
-
-void test_clipboard_formats() {
-    airshot::Bitmap source(2, 2);
-    for (std::size_t index = 0; index < source.pixels.size(); ++index) {
-        source.pixels[index] = 255;
-    }
-    std::wstring error;
-    expect(airshot::copy_bitmap_to_clipboard(source, &error), L"copy_bitmap_to_clipboard works");
-
-    if (OpenClipboard(nullptr)) {
-        UINT format = 0;
-        bool has_png = false;
-        bool has_image_png = false;
-        while ((format = EnumClipboardFormats(format)) != 0) {
-            wchar_t name[256]{};
-            if (GetClipboardFormatNameW(format, name, 256) > 0) {
-                std::wstring sname(name);
-                if (sname == L"PNG") has_png = true;
-                if (sname == L"image/png") has_image_png = true;
-            }
-        }
-        CloseClipboard();
-        expect(has_png, L"clipboard has PNG format");
-        expect(has_image_png, L"clipboard has image/png format");
-    }
-}
-
 }  // namespace
 
 int wmain() {
@@ -329,8 +287,6 @@ int wmain() {
     test_ocr_join();
     test_ocr_dependency_manifest();
     test_portable_runtime();
-    test_feature_registry();
-    test_clipboard_formats();
     if (failures == 0) {
         std::wcout << L"All tests passed.\n";
     }

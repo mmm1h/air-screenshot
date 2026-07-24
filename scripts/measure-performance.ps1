@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 & (Join-Path $PSScriptRoot "build.ps1") -Configuration Release
-$hostPath = Join-Path $root "build\AirScreenshot.exe"
+$hostPath = Join-Path $root "build\release\bin\AirScreenshot.exe"
 $cliPath = $hostPath
 if (Get-Process AirScreenshot -ErrorAction SilentlyContinue) {
     throw "性能测量前请先退出现有 Air Screenshot 进程。"

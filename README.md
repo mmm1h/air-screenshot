@@ -16,24 +16,29 @@ Air Screenshot 是一个面向 Windows 10 2004+ x64 的轻量原生截图工具�
 
 从 [公开下载页](https://mmm1h.github.io/air-screenshot/) 下载 `AirScreenshot.exe`，放到普通可写目录后双击运行。无需安装、管理员权限或证书脚本。
 
-首次启动默认注册当前用户开机启动项，可在设置中关闭。移动 EXE 后再次启动会自动修正启动项路径。
+全新配置默认不开机启动，可在设置中开启；已有配置保留原值。移动 EXE 后再次启动会自动修正已启用启动项的路径。
 
 Windows SmartScreen 可能提示未知发布者。这是因为当前使用自签名代码签名证书；请确认下载来源为本项目后再选择继续运行。
 
 ## 构建与验证
 
+要求 PowerShell 7、CMake 3.25+、Ninja，以及带“使用 C++ 的桌面开发”和 CMake 组件的 Visual Studio 2022 17.8+。只支持 MSVC x64，Windows SDK 必须为 10.0.19041 或更新版本。
+
 ```powershell
-.\scripts\build.ps1
-.\scripts\test.ps1
+.\scripts\build.ps1 -Configuration Release
+.\scripts\test.ps1 # 默认依次构建并测试 Debug、Release
+.\scripts\smoke-lifecycle.ps1
 .\scripts\smoke-portable.ps1
 .\scripts\measure-performance.ps1
 ```
 
-生成本地便携包：
+构建目录分别为 `build/debug` 和 `build/release`；程序位于 `bin`，链接 PDB 位于 `symbols`。生成本地未签名便携包：
 
 ```powershell
-.\scripts\package.ps1 -Version 0.2.3
+.\scripts\package.ps1
 ```
+
+默认版本来自仓库根目录的 `VERSION`。版本必须使用无前导零的规范 `X.Y.Z` 格式，不能是 `0.0.0`，且 major 不超过 9000、minor/patch 不超过 65535。`-Version X.Y.Z` 仅用于有意覆盖版本的本地验证；tag 发布要求 `vX.Y.Z` 与 `VERSION` 严格一致。
 
 ## 自动更新
 
@@ -54,17 +59,27 @@ git tag v0.2.3
 git push origin v0.2.3
 ```
 
-工作流会运行测试、准备 OCR 依赖、生成并验证签名 EXE、执行便携与 OCR 烟测、创建 GitHub Release，并更新 GitHub Pages 下载页、`latest.json`、`ocr-dependencies.json` 和 OCR 依赖文件。
+工作流将职责分为三个 job：无 secrets 的构建与 Debug/Release 测试、只有签名权限的打包验证、没有 PFX 的发布部署。签名证书只写入签名 runner 的临时目录，并在打包步骤结束时删除。所有版本共享同一个发布并发组；发布前会将 lightweight/annotated tag 解引用到 commit，核对 `GITHUB_SHA`，并拒绝不高于现有最高正式版本的发布。已有同名 GitHub Release 时流程会失败，不会覆盖资产。
 
-发布工作流使用以下仓库配置；为兼容旧配置，也会回退读取原 `MSIX_*` 名称：
+GitHub Release 包含 EXE、PDB、OCR manifest 及其签名、SHA256 校验和、SPDX JSON SBOM、完整许可证和第三方声明；GitHub artifact attestation 保存签名 EXE 的构建来源。GitHub Pages 提供下载页、`latest.json`、`ocr-dependencies.json` 和 OCR 依赖文件。
+
+发布工作流使用名为 `release-signing` 的 environment。为兼容现有仓库配置，证书 secrets 也会回退读取原 `MSIX_*` 名称：
 
 | 类型 | 名称 | 用途 |
 | --- | --- | --- |
 | Variable | `RELEASE_PUBLISHER` | 发布签名证书主题 |
+| Variable | `RELEASE_SIGNER_SHA256` | 可选；签名证书 SHA256 指纹，缺省时使用当前内置指纹 |
+| Variable | `RELEASE_TIMESTAMP_URL` | 可选；HTTPS RFC 3161 时间戳服务 |
+| Variable | `RELEASE_REQUIRE_TRUSTED_SIGNATURE` | 设为 `true` 时要求 Windows 信任链有效 |
+| Variable | `OCR_MANIFEST_KEY_ID` | OCR 清单 ECDSA 签名密钥标识 |
+| Variable | `OCR_MANIFEST_PUBLIC_KEY_HEX` | ECDSA P-256 公钥的 `x || y`，128 位十六进制 |
 | Secret | `CODE_SIGNING_PFX_BASE64` | Base64 编码的代码签名 PFX |
 | Secret | `CODE_SIGNING_PFX_PASSWORD` | 代码签名 PFX 密码 |
+| Secret | `OCR_MANIFEST_PRIVATE_KEY_PEM` | 与公开变量匹配的 PKCS#8 ECDSA P-256 私钥 |
 
-`scripts/create-release-cert.ps1` 可创建自签名发布证书并打印 SHA256 指纹；证书变化时必须同步更新程序内置指纹。
+正式发布前应给 `release-signing` environment 配置审批保护，使用受信任 CA 签发且允许代码签名的证书，并将 `RELEASE_REQUIRE_TRUSTED_SIGNATURE` 设为 `true`。同时必须为 `refs/tags/v*` 配置 tag ruleset，禁止更新和删除已创建的发布 tag，并在仓库设置中启用 immutable releases。workflow 的发布前 tag 检查不是 tag 与 Release 创建之间的原子 CAS，不能替代这些仓库保护。OCR 私钥只配置在该 environment 中；公钥和 key id 是非秘密仓库变量，会在构建时嵌入 EXE。`scripts/create-release-cert.ps1` 生成的自签名证书只适合开发和流程验证。
+
+更新器以程序内置证书指纹为最终信任锚，不依赖在线吊销检查。计划轮换证书时，必须在旧私钥仍安全时先发布一个由旧证书签名、同时信任新旧指纹的桥接版本；确认桥接版本已覆盖用户后，再切换发布签名并在后续版本移除旧指纹。当前单指纹版本若遇到旧私钥泄露，无法仅靠远端配置恢复自动更新，必须引导用户手工安装新信任锚版本。
 
 ## CLI
 
@@ -89,7 +104,9 @@ OCR 使用本地 RapidOCR / PP-OCRv5 / ONNX Runtime CPU 推理，设置中可切
 - 高精度 OCR：使用 PP-OCRv5 server 模型，适合小字、大图和复杂背景。
 - 兼容 OCR：使用 PP-OCRv4 mobile 模型，作为稳定兼容档。
 
-首次使用前在设置中点击“下载依赖”。依赖按清单校验 SHA256 后安装到 `%LOCALAPPDATA%\AirScreenshot\ocr\rapidocr-onnx`。OCR 识别在独立的自身子进程中完成；模型和 ONNX Runtime 不会常驻托盘进程，单次识别超时会停止子进程。源码发布前可运行 `.\scripts\prepare-ocr-dependencies.ps1` 准备 `dist\ocr-dependencies\rapidocr-onnx`，再由 `.\scripts\package.ps1` 基于真实文件生成下载清单。离线环境可提前把依赖目录放到程序同目录下的 `ocr\rapidocr-onnx`。
+首次使用前在设置中点击“下载依赖”。程序先用内置公钥验证版本化清单的 ECDSA 签名、有效期和防回滚序列，再校验每个文件的大小和 SHA256，最后安装到 `%LOCALAPPDATA%\AirScreenshot\ocr\rapidocr-onnx`。OCR 识别在独立的自身子进程中完成；模型和 ONNX Runtime 不会常驻托盘进程，单次识别超时会停止子进程。
+
+源码发布前可运行 `.\scripts\prepare-ocr-dependencies.ps1` 准备 `dist\ocr-dependencies\rapidocr-onnx`，再由 `.\scripts\package.ps1` 基于真实文件生成签名下载清单。普通本地构建如需走完整 OCR 入口，必须通过 `-OcrManifestKeyId` 和 `-OcrManifestPublicKeyHex` 嵌入与清单匹配的公钥。离线部署可以把 payload 放到程序同目录的 `ocr\rapidocr-onnx`，但目录内还必须包含同一发布的签名元数据：将 `ocr-dependencies.json` 保存为 `.airshot-manifest.json`，将其 `.sig` sidecar 保存为 `.airshot-manifest.sig`；裸依赖目录会被拒绝。
 
 ## 限制
 
@@ -98,4 +115,4 @@ OCR 使用本地 RapidOCR / PP-OCRv5 / ONNX Runtime CPU 推理，设置中可切
 - 本地 OCR 依赖需要单独下载；未安装依赖时会提示到设置中下载。
 - 旧 MSIX 版本不会自动迁移配置，需要用户自行卸载。
 
-项目采用 `LGPL-3.0-only`。完整许可证见 [LICENSE](LICENSE)，第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+项目采用 `LGPL-3.0-only`。标准许可证文本见 [LICENSE](LICENSE)，改编来源和可选 OCR payload 的许可证声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

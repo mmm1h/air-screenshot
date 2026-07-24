@@ -14,26 +14,84 @@ namespace airshot::overlay_detail {
 
 using Microsoft::WRL::ComPtr;
 
-ComPtr<ID2D1Factory>& d2d_factory() {
+namespace {
+
+ComPtr<ID2D1Factory>& d2d_factory_storage() {
     static ComPtr<ID2D1Factory> factory;
-    if (!factory) {
-        D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, factory.GetAddressOf());
-    }
     return factory;
 }
 
-ComPtr<IDWriteFactory>& dwrite_factory() {
+ComPtr<IDWriteFactory>& dwrite_factory_storage() {
     static ComPtr<IDWriteFactory> factory;
-    if (!factory) {
-        DWriteCreateFactory(
-            DWRITE_FACTORY_TYPE_ISOLATED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(factory.GetAddressOf()));
-    }
     return factory;
 }
+
+ID2D1Factory* acquire_d2d_factory() {
+    auto& factory = d2d_factory_storage();
+    if (!factory) {
+        if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, factory.GetAddressOf()))) {
+            factory.Reset();
+        }
+    }
+    return factory.Get();
+}
+
+IDWriteFactory* acquire_dwrite_factory() {
+    auto& factory = dwrite_factory_storage();
+    if (!factory) {
+        if (FAILED(DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_ISOLATED,
+                __uuidof(IDWriteFactory),
+                reinterpret_cast<IUnknown**>(factory.GetAddressOf())))) {
+            factory.Reset();
+        }
+    }
+    return factory.Get();
+}
+
+ComPtr<IDWriteTextFormat> create_text_format(const wchar_t* font_family,
+                                             DWRITE_FONT_WEIGHT weight,
+                                             DWRITE_FONT_STYLE style,
+                                             float size) {
+    ComPtr<IDWriteTextFormat> format;
+    auto* factory = acquire_dwrite_factory();
+    if (!factory ||
+        FAILED(factory->CreateTextFormat(font_family,
+                                         nullptr,
+                                         weight,
+                                         style,
+                                         DWRITE_FONT_STRETCH_NORMAL,
+                                         size,
+                                         L"zh-CN",
+                                         format.GetAddressOf()))) {
+        format.Reset();
+    }
+    return format;
+}
+
+ComPtr<IDWriteTextLayout> create_text_layout(std::wstring_view text,
+                                             IDWriteTextFormat* format,
+                                             float width,
+                                             float height) {
+    ComPtr<IDWriteTextLayout> layout;
+    auto* factory = acquire_dwrite_factory();
+    if (!factory || !format ||
+        FAILED(factory->CreateTextLayout(text.data(),
+                                         static_cast<UINT32>(text.size()),
+                                         format,
+                                         width,
+                                         height,
+                                         layout.GetAddressOf()))) {
+        layout.Reset();
+    }
+    return layout;
+}
+
+}  // namespace
 
 void release_overlay_factories() {
-    dwrite_factory().Reset();
-    d2d_factory().Reset();
+    dwrite_factory_storage().Reset();
+    d2d_factory_storage().Reset();
 }
 
 bool OverlayWindow::create() {
@@ -68,13 +126,29 @@ bool OverlayWindow::create() {
 }
 
 void OverlayWindow::destroy() {
-    background_.Reset();
-    render_target_.Reset();
-    round_stroke_style_.Reset();
+    discard_device_resources();
     if (hwnd_) {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
+}
+
+void OverlayWindow::discard_device_resources() noexcept {
+    dim_brush_.Reset();
+    blue_brush_.Reset();
+    white_brush_.Reset();
+    black_brush_.Reset();
+    toolbar_brush_.Reset();
+    toolbar_bg_brush_.Reset();
+    toolbar_border_brush_.Reset();
+    hover_bg_brush_.Reset();
+    active_bg_brush_.Reset();
+    true_white_brush_.Reset();
+    green_brush_.Reset();
+    red_brush_.Reset();
+    round_stroke_style_.Reset();
+    background_.Reset();
+    render_target_.Reset();
 }
 
 void OverlayWindow::invalidate() const {
@@ -87,36 +161,30 @@ bool OverlayWindow::create_render_target() {
     if (!hwnd_) {
         return false;
     }
-    bool current_theme_is_light = should_use_light_theme(session_.request_.config.theme);
+    const bool current_theme_is_light = should_use_light_theme(session_.request_.config.theme);
     if (render_target_) {
         if (is_light_theme_ == current_theme_is_light) {
             return true;
         }
-        render_target_.Reset();
-        background_.Reset();
-        dim_brush_.Reset();
-        blue_brush_.Reset();
-        white_brush_.Reset();
-        black_brush_.Reset();
-        toolbar_brush_.Reset();
-        toolbar_bg_brush_.Reset();
-        toolbar_border_brush_.Reset();
-        hover_bg_brush_.Reset();
-        active_bg_brush_.Reset();
-        true_white_brush_.Reset();
-        green_brush_.Reset();
-        red_brush_.Reset();
-        round_stroke_style_.Reset();
+        discard_device_resources();
     }
     is_light_theme_ = current_theme_is_light;
 
+    auto* d2d_factory = acquire_d2d_factory();
+    if (!d2d_factory || !acquire_dwrite_factory() ||
+        monitor_.bounds.width() <= 0 || monitor_.bounds.height() <= 0 ||
+        monitor_.bitmap.empty()) {
+        return false;
+    }
+
     const D2D1_SIZE_U size =
         D2D1::SizeU(static_cast<UINT>(monitor_.bounds.width()), static_cast<UINT>(monitor_.bounds.height()));
-    HRESULT result = d2d_factory()->CreateHwndRenderTarget(
+    HRESULT result = d2d_factory->CreateHwndRenderTarget(
         D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(), 96.0F, 96.0F),
         D2D1::HwndRenderTargetProperties(hwnd_, size, D2D1_PRESENT_OPTIONS_IMMEDIATELY),
         render_target_.GetAddressOf());
     if (FAILED(result)) {
+        discard_device_resources();
         return false;
     }
     const D2D1_BITMAP_PROPERTIES properties =
@@ -127,33 +195,50 @@ bool OverlayWindow::create_render_target() {
                                           properties,
                                           background_.GetAddressOf());
     if (FAILED(result)) {
+        discard_device_resources();
         return false;
     }
-    render_target_->CreateSolidColorBrush(D2D1::ColorF(0, 0.48F), dim_brush_.GetAddressOf());
-    render_target_->CreateSolidColorBrush(D2D1::ColorF(0x0066FF), blue_brush_.GetAddressOf());
-    render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), true_white_brush_.GetAddressOf());
-    render_target_->CreateSolidColorBrush(D2D1::ColorF(0x00B634), green_brush_.GetAddressOf());
-    render_target_->CreateSolidColorBrush(D2D1::ColorF(0xF54A45), red_brush_.GetAddressOf());
+
+    const auto create_brush = [this](const D2D1_COLOR_F& color,
+                                     ComPtr<ID2D1SolidColorBrush>& brush) {
+        return SUCCEEDED(render_target_->CreateSolidColorBrush(color, brush.GetAddressOf())) &&
+               brush != nullptr;
+    };
+
+    bool brushes_created =
+        create_brush(D2D1::ColorF(0, 0.48F), dim_brush_) &&
+        create_brush(D2D1::ColorF(0x0066FF), blue_brush_) &&
+        create_brush(D2D1::ColorF(D2D1::ColorF::White), true_white_brush_) &&
+        create_brush(D2D1::ColorF(0x00B634), green_brush_) &&
+        create_brush(D2D1::ColorF(0xF54A45), red_brush_);
 
     if (is_light_theme_) {
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x1F2329), white_brush_.GetAddressOf());
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), black_brush_.GetAddressOf());
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(1.0F, 1.0F, 1.0F, 0.96F), toolbar_brush_.GetAddressOf());
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(1.0F, 1.0F, 1.0F, 0.96F), toolbar_bg_brush_.GetAddressOf());
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(0xDCDFE6), toolbar_border_brush_.GetAddressOf());
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x1F2329, 0.08F), hover_bg_brush_.GetAddressOf());
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x0066FF, 0.15F), active_bg_brush_.GetAddressOf());
+        brushes_created =
+            brushes_created &&
+            create_brush(D2D1::ColorF(0x1F2329), white_brush_) &&
+            create_brush(D2D1::ColorF(D2D1::ColorF::Black), black_brush_) &&
+            create_brush(D2D1::ColorF(1.0F, 1.0F, 1.0F, 0.96F), toolbar_brush_) &&
+            create_brush(D2D1::ColorF(1.0F, 1.0F, 1.0F, 0.96F), toolbar_bg_brush_) &&
+            create_brush(D2D1::ColorF(0xDCDFE6), toolbar_border_brush_) &&
+            create_brush(D2D1::ColorF(0x1F2329, 0.08F), hover_bg_brush_) &&
+            create_brush(D2D1::ColorF(0x0066FF, 0.15F), active_bg_brush_);
     } else {
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), white_brush_.GetAddressOf());
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), black_brush_.GetAddressOf());
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x121316, 0.94F), toolbar_brush_.GetAddressOf());
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x121316, 0.94F), toolbar_bg_brush_.GetAddressOf());
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x0066FF, 0.20F), toolbar_border_brush_.GetAddressOf());
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White, 0.12F), hover_bg_brush_.GetAddressOf());
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(0x0066FF, 0.85F), active_bg_brush_.GetAddressOf());
+        brushes_created =
+            brushes_created &&
+            create_brush(D2D1::ColorF(D2D1::ColorF::White), white_brush_) &&
+            create_brush(D2D1::ColorF(D2D1::ColorF::Black), black_brush_) &&
+            create_brush(D2D1::ColorF(0x121316, 0.94F), toolbar_brush_) &&
+            create_brush(D2D1::ColorF(0x121316, 0.94F), toolbar_bg_brush_) &&
+            create_brush(D2D1::ColorF(0x0066FF, 0.20F), toolbar_border_brush_) &&
+            create_brush(D2D1::ColorF(D2D1::ColorF::White, 0.12F), hover_bg_brush_) &&
+            create_brush(D2D1::ColorF(0x0066FF, 0.85F), active_bg_brush_);
+    }
+    if (!brushes_created) {
+        discard_device_resources();
+        return false;
     }
 
-    D2D1_STROKE_STYLE_PROPERTIES stroke_properties = D2D1::StrokeStyleProperties(
+    const D2D1_STROKE_STYLE_PROPERTIES stroke_properties = D2D1::StrokeStyleProperties(
         D2D1_CAP_STYLE_ROUND,
         D2D1_CAP_STYLE_ROUND,
         D2D1_CAP_STYLE_ROUND,
@@ -162,8 +247,10 @@ bool OverlayWindow::create_render_target() {
         D2D1_DASH_STYLE_SOLID,
         0.0f
     );
-    HRESULT hr = d2d_factory()->CreateStrokeStyle(stroke_properties, nullptr, 0, round_stroke_style_.GetAddressOf());
-    if (FAILED(hr)) {
+    result = d2d_factory->CreateStrokeStyle(
+        stroke_properties, nullptr, 0, round_stroke_style_.GetAddressOf());
+    if (FAILED(result) || !round_stroke_style_) {
+        discard_device_resources();
         return false;
     }
     return true;
@@ -230,10 +317,15 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
     }
 
     ComPtr<ID2D1SolidColorBrush> brush;
-    render_target_->CreateSolidColorBrush(
-        D2D1::ColorF(GetRValue(color) / 255.0F, GetGValue(color) / 255.0F, GetBValue(color) / 255.0F, alpha),
-        brush.GetAddressOf()
-    );
+    if (FAILED(render_target_->CreateSolidColorBrush(
+            D2D1::ColorF(GetRValue(color) / 255.0F,
+                         GetGValue(color) / 255.0F,
+                         GetBValue(color) / 255.0F,
+                         alpha),
+            brush.GetAddressOf())) ||
+        !brush) {
+        return;
+    }
 
     if (annotation.tool == Tool::rectangle) {
         render_target_->DrawRectangle(local_rect(RectI{start.x, start.y, end.x, end.y}.normalized()), brush.Get(), draw_width);
@@ -277,8 +369,11 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
         }
     } else if (annotation.tool == Tool::mosaic) {
         if (annotation.points.empty()) {
-            render_target_->FillRectangle(local_rect(RectI{start.x, start.y, end.x, end.y}), dim_brush_.Get());
-            render_target_->DrawRectangle(local_rect(RectI{start.x, start.y, end.x, end.y}), white_brush_.Get(), 1.0F, round_stroke_style_.Get());
+            const D2D1_RECT_F bounds =
+                local_rect(RectI{start.x, start.y, end.x, end.y}.normalized());
+            render_target_->FillRectangle(bounds, dim_brush_.Get());
+            render_target_->DrawRectangle(
+                bounds, white_brush_.Get(), 1.0F, round_stroke_style_.Get());
         } else {
             for (const POINT relative : annotation.points) {
                 POINT point{selection.left + relative.x, selection.top + relative.y};
@@ -288,10 +383,18 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
         }
     } else if (annotation.tool == Tool::blur) {
         ComPtr<ID2D1SolidColorBrush> temp_blur_brush;
-        render_target_->CreateSolidColorBrush(D2D1::ColorF(0.7F, 0.7F, 0.7F, 0.45F), temp_blur_brush.GetAddressOf());
+        if (FAILED(render_target_->CreateSolidColorBrush(
+                D2D1::ColorF(0.7F, 0.7F, 0.7F, 0.45F),
+                temp_blur_brush.GetAddressOf())) ||
+            !temp_blur_brush) {
+            return;
+        }
         if (annotation.points.empty()) {
-            render_target_->FillRectangle(local_rect(RectI{start.x, start.y, end.x, end.y}), temp_blur_brush.Get());
-            render_target_->DrawRectangle(local_rect(RectI{start.x, start.y, end.x, end.y}), white_brush_.Get(), 1.0F, round_stroke_style_.Get());
+            const D2D1_RECT_F bounds =
+                local_rect(RectI{start.x, start.y, end.x, end.y}.normalized());
+            render_target_->FillRectangle(bounds, temp_blur_brush.Get());
+            render_target_->DrawRectangle(
+                bounds, white_brush_.Get(), 1.0F, round_stroke_style_.Get());
         } else {
             for (const POINT relative : annotation.points) {
                 POINT point{selection.left + relative.x, selection.top + relative.y};
@@ -305,41 +408,44 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
             }
         }
     } else if (annotation.tool == Tool::text) {
-        ComPtr<IDWriteTextFormat> format;
-        float fontSize = preview ? session_.active_text_size() : annotation.width;
-        TextStyle text_style = preview ? session_.active_text_style() : annotation.text_style;
-        dwrite_factory()->CreateTextFormat(session_.request_.config.text_font_family.c_str(),
-                                           nullptr,
-                                           session_.request_.config.text_font_bold ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL,
-                                           session_.request_.config.text_font_italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
-                                           DWRITE_FONT_STRETCH_NORMAL,
-                                           fontSize,
-                                           L"zh-CN",
-                                           format.GetAddressOf());
+        const float font_size = preview ? session_.active_text_size() : annotation.width;
+        const TextStyle text_style = preview ? session_.active_text_style() : annotation.text_style;
+        auto format = create_text_format(
+            session_.request_.config.text_font_family.c_str(),
+            session_.request_.config.text_font_bold
+                ? DWRITE_FONT_WEIGHT_BOLD
+                : DWRITE_FONT_WEIGHT_NORMAL,
+            session_.request_.config.text_font_italic
+                ? DWRITE_FONT_STYLE_ITALIC
+                : DWRITE_FONT_STYLE_NORMAL,
+            font_size);
+        if (!format) {
+            return;
+        }
         const D2D1_RECT_F bounds =
             D2D1::RectF(static_cast<float>(start.x - monitor_.bounds.left),
                         static_cast<float>(start.y - monitor_.bounds.top),
                         static_cast<float>(monitor_.bounds.width()),
                         static_cast<float>(monitor_.bounds.height()));
         if (text_style == TextStyle::dark) {
-            ComPtr<IDWriteTextLayout> layout;
-            dwrite_factory()->CreateTextLayout(annotation.text.c_str(),
-                                               static_cast<UINT32>(annotation.text.size()),
-                                               format.Get(),
-                                               800.0F,
-                                               160.0F,
-                                               layout.GetAddressOf());
+            auto layout = create_text_layout(annotation.text, format.Get(), 800.0F, 160.0F);
             DWRITE_TEXT_METRICS metrics{};
-            if (layout) {
-                layout->GetMetrics(&metrics);
+            if (layout && FAILED(layout->GetMetrics(&metrics))) {
+                metrics = {};
             }
             const D2D1_RECT_F background = D2D1::RectF(bounds.left - 4.0F,
                                                        bounds.top - 2.0F,
                                                        bounds.left + std::max(40.0F, metrics.widthIncludingTrailingWhitespace) + 8.0F,
-                                                       bounds.top + std::max(fontSize + 8.0F, metrics.height + 6.0F));
+                                                       bounds.top + std::max(font_size + 8.0F, metrics.height + 6.0F));
             ComPtr<ID2D1SolidColorBrush> dark_background;
-            render_target_->CreateSolidColorBrush(D2D1::ColorF(0x1F2329, 0.90F), dark_background.GetAddressOf());
-            render_target_->FillRoundedRectangle(D2D1::RoundedRect(background, 3.0F, 3.0F), dark_background.Get());
+            if (SUCCEEDED(render_target_->CreateSolidColorBrush(
+                    D2D1::ColorF(0x1F2329, 0.90F),
+                    dark_background.GetAddressOf())) &&
+                dark_background) {
+                render_target_->FillRoundedRectangle(
+                    D2D1::RoundedRect(background, 3.0F, 3.0F),
+                    dark_background.Get());
+            }
             render_target_->DrawTextW(annotation.text.c_str(),
                                       static_cast<UINT32>(annotation.text.size()),
                                       format.Get(),
@@ -379,26 +485,27 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
         if (annotation.text.empty()) {
             return;
         }
-        ComPtr<IDWriteTextFormat> format;
-        dwrite_factory()->CreateTextFormat(session_.request_.config.text_font_family.c_str(),
-                                           nullptr,
-                                           DWRITE_FONT_WEIGHT_NORMAL,
-                                           DWRITE_FONT_STYLE_NORMAL,
-                                           DWRITE_FONT_STRETCH_NORMAL,
-                                           annotation.width,
-                                           L"zh-CN",
-                                           format.GetAddressOf());
+        auto format = create_text_format(session_.request_.config.text_font_family.c_str(),
+                                         DWRITE_FONT_WEIGHT_NORMAL,
+                                         DWRITE_FONT_STYLE_NORMAL,
+                                         annotation.width);
+        if (!format) {
+            return;
+        }
         format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
 
         const float watermark_alpha = std::clamp(annotation.alpha / 255.0F, 0.08F, 0.86F);
         ComPtr<ID2D1SolidColorBrush> watermark_brush;
-        render_target_->CreateSolidColorBrush(
-            D2D1::ColorF(GetRValue(annotation.color) / 255.0F,
-                         GetGValue(annotation.color) / 255.0F,
-                         GetBValue(annotation.color) / 255.0F,
-                         watermark_alpha),
-            watermark_brush.GetAddressOf());
+        if (FAILED(render_target_->CreateSolidColorBrush(
+                D2D1::ColorF(GetRValue(annotation.color) / 255.0F,
+                             GetGValue(annotation.color) / 255.0F,
+                             GetBValue(annotation.color) / 255.0F,
+                             watermark_alpha),
+                watermark_brush.GetAddressOf())) ||
+            !watermark_brush) {
+            return;
+        }
 
         const RectI selected_rect = session_.selection();
         const float left = static_cast<float>(selected_rect.left - monitor_.bounds.left);
@@ -435,15 +542,11 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
         render_target_->FillEllipse(ellipse, brush.Get());
         render_target_->DrawEllipse(ellipse, white_brush_.Get(), 1.5F);
 
-        ComPtr<IDWriteTextFormat> format;
-        dwrite_factory()->CreateTextFormat(L"Consolas",
-                                           nullptr,
-                                           DWRITE_FONT_WEIGHT_BOLD,
-                                           DWRITE_FONT_STYLE_NORMAL,
-                                           DWRITE_FONT_STRETCH_NORMAL,
-                                           radius * 1.0F,
-                                           L"zh-CN",
-                                           format.GetAddressOf());
+        auto format = create_text_format(
+            L"Consolas", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, radius);
+        if (!format) {
+            return;
+        }
         format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         const std::wstring serial_text = std::to_wstring(annotation.serial);
@@ -461,11 +564,17 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
 }
 
 void OverlayWindow::paint() {
-    if (!create_render_target()) {
-        return;
-    }
     PAINTSTRUCT paint{};
     BeginPaint(hwnd_, &paint);
+    if (!create_render_target()) {
+        EndPaint(hwnd_, &paint);
+        return;
+    }
+    auto* d2d_factory = acquire_d2d_factory();
+    if (!d2d_factory) {
+        EndPaint(hwnd_, &paint);
+        return;
+    }
     render_target_->BeginDraw();
     render_target_->DrawBitmap(background_.Get());
 
@@ -590,17 +699,12 @@ void OverlayWindow::paint() {
             D2D1::Point2F(handle_left, mid_y)
         };
 
-        ComPtr<IDWriteTextFormat> format;
-        dwrite_factory()->CreateTextFormat(L"Consolas",
-                                           nullptr,
-                                           DWRITE_FONT_WEIGHT_NORMAL,
-                                           DWRITE_FONT_STYLE_NORMAL,
-                                           DWRITE_FONT_STRETCH_NORMAL,
-                                           12.0F,
-                                           L"zh-CN",
-                                           format.GetAddressOf());
-        format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        auto format = create_text_format(
+            L"Consolas", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, 12.0F);
+        if (format) {
+            format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
 
         // Draw main toolbar background rounded rectangle card
         if (!session_.toolbar().empty()) {
@@ -615,14 +719,17 @@ void OverlayWindow::paint() {
             float handle_cy = bg_rect.top + (bg_rect.bottom - bg_rect.top) / 2.0F;
 
             ComPtr<ID2D1SolidColorBrush> handle_brush;
-            render_target_->CreateSolidColorBrush(D2D1::ColorF(is_light_theme_ ? 0x1F2329 : 0xFFFFFF, 0.35F), handle_brush.GetAddressOf());
-
-            render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx - 1.5f, handle_cy - 4.0f), 1.0f, 1.0f), handle_brush.Get());
-            render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx + 1.5f, handle_cy - 4.0f), 1.0f, 1.0f), handle_brush.Get());
-            render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx - 1.5f, handle_cy), 1.0f, 1.0f), handle_brush.Get());
-            render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx + 1.5f, handle_cy), 1.0f, 1.0f), handle_brush.Get());
-            render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx - 1.5f, handle_cy + 4.0f), 1.0f, 1.0f), handle_brush.Get());
-            render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx + 1.5f, handle_cy + 4.0f), 1.0f, 1.0f), handle_brush.Get());
+            if (SUCCEEDED(render_target_->CreateSolidColorBrush(
+                    D2D1::ColorF(is_light_theme_ ? 0x1F2329 : 0xFFFFFF, 0.35F),
+                    handle_brush.GetAddressOf())) &&
+                handle_brush) {
+                render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx - 1.5f, handle_cy - 4.0f), 1.0f, 1.0f), handle_brush.Get());
+                render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx + 1.5f, handle_cy - 4.0f), 1.0f, 1.0f), handle_brush.Get());
+                render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx - 1.5f, handle_cy), 1.0f, 1.0f), handle_brush.Get());
+                render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx + 1.5f, handle_cy), 1.0f, 1.0f), handle_brush.Get());
+                render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx - 1.5f, handle_cy + 4.0f), 1.0f, 1.0f), handle_brush.Get());
+                render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handle_cx + 1.5f, handle_cy + 4.0f), 1.0f, 1.0f), handle_brush.Get());
+            }
 
             for (const auto& button : session_.toolbar()) {
                 if (!intersect(button.bounds, monitor_.bounds)) {
@@ -684,7 +791,7 @@ void OverlayWindow::paint() {
                     render_target_->DrawLine(D2D1::Point2F(cx - 4.5F, cy - 5.5F), D2D1::Point2F(cx + 4.5F, cy - 5.5F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                 } else if (button.id == L"select") {
                     ComPtr<ID2D1PathGeometry> select_geom;
-                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(select_geom.GetAddressOf()))) {
+                    if (SUCCEEDED(d2d_factory->CreatePathGeometry(select_geom.GetAddressOf()))) {
                         ComPtr<ID2D1GeometrySink> sink;
                         if (SUCCEEDED(select_geom->Open(sink.GetAddressOf()))) {
                             sink->BeginFigure(D2D1::Point2F(cx - 6.0F, cy - 8.0F), D2D1_FIGURE_BEGIN_HOLLOW);
@@ -716,7 +823,7 @@ void OverlayWindow::paint() {
                     render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy + 3.0F), D2D1::Point2F(cx - 8.0F, cy + 8.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                     render_target_->DrawLine(D2D1::Point2F(cx - 3.0F, cy + 5.0F), D2D1::Point2F(cx - 8.0F, cy + 8.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                     ComPtr<ID2D1PathGeometry> scribble_geom;
-                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(scribble_geom.GetAddressOf()))) {
+                    if (SUCCEEDED(d2d_factory->CreatePathGeometry(scribble_geom.GetAddressOf()))) {
                         ComPtr<ID2D1GeometrySink> sink;
                         if (SUCCEEDED(scribble_geom->Open(sink.GetAddressOf()))) {
                             sink->BeginFigure(D2D1::Point2F(cx - 7.0F, cy + 9.0F), D2D1_FIGURE_BEGIN_HOLLOW);
@@ -740,7 +847,7 @@ void OverlayWindow::paint() {
                     render_target_->DrawRectangle(D2D1::RectF(cx - 7.5F, cy - 7.5F, cx + 7.5F, cy + 7.5F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                 } else if (button.id == L"blur") {
                     ComPtr<ID2D1PathGeometry> drop_geom;
-                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(drop_geom.GetAddressOf()))) {
+                    if (SUCCEEDED(d2d_factory->CreatePathGeometry(drop_geom.GetAddressOf()))) {
                         ComPtr<ID2D1GeometrySink> sink;
                         if (SUCCEEDED(drop_geom->Open(sink.GetAddressOf()))) {
                             sink->BeginFigure(D2D1::Point2F(cx, cy - 8.0F), D2D1_FIGURE_BEGIN_HOLLOW);
@@ -771,8 +878,12 @@ void OverlayWindow::paint() {
                     render_target_->DrawLine(D2D1::Point2F(cx - 3.5F, cy + 3.5F), D2D1::Point2F(cx - 5.0F, cy + 5.0F), white_brush_.Get(), 2.0F, round_stroke_style_.Get());
                     render_target_->DrawLine(D2D1::Point2F(cx - 5.0F, cy + 5.0F), D2D1::Point2F(cx - 7.0F, cy + 5.5F), white_brush_.Get(), 3.0F, round_stroke_style_.Get());
                     ComPtr<ID2D1SolidColorBrush> hl_brush;
-                    render_target_->CreateSolidColorBrush(D2D1::ColorF(0xFADB14, 0.4F), hl_brush.GetAddressOf());
-                    render_target_->DrawLine(D2D1::Point2F(cx - 9.0F, cy + 8.0F), D2D1::Point2F(cx + 9.0F, cy + 8.0F), hl_brush.Get(), 3.0F, round_stroke_style_.Get());
+                    if (SUCCEEDED(render_target_->CreateSolidColorBrush(
+                            D2D1::ColorF(0xFADB14, 0.4F),
+                            hl_brush.GetAddressOf())) &&
+                        hl_brush) {
+                        render_target_->DrawLine(D2D1::Point2F(cx - 9.0F, cy + 8.0F), D2D1::Point2F(cx + 9.0F, cy + 8.0F), hl_brush.Get(), 3.0F, round_stroke_style_.Get());
+                    }
                 } else if (button.id == L"watermark") {
                     render_target_->DrawLine(D2D1::Point2F(cx - 9.0F, cy + 7.0F), D2D1::Point2F(cx + 8.0F, cy - 7.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                     render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy + 9.0F), D2D1::Point2F(cx + 9.0F, cy - 3.0F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
@@ -783,7 +894,7 @@ void OverlayWindow::paint() {
                     render_target_->DrawLine(D2D1::Point2F(cx, cy - 7.5F), D2D1::Point2F(cx, cy + 7.5F), white_brush_.Get(), 1.5F, round_stroke_style_.Get());
                 } else if (button.id == L"serial") {
                     ComPtr<ID2D1PathGeometry> tag_geom;
-                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(tag_geom.GetAddressOf()))) {
+                    if (SUCCEEDED(d2d_factory->CreatePathGeometry(tag_geom.GetAddressOf()))) {
                         ComPtr<ID2D1GeometrySink> sink;
                         if (SUCCEEDED(tag_geom->Open(sink.GetAddressOf()))) {
                             sink->BeginFigure(D2D1::Point2F(cx + 6.5F, cy - 6.5F), D2D1_FIGURE_BEGIN_HOLLOW);
@@ -800,7 +911,7 @@ void OverlayWindow::paint() {
                 } else if (button.id == L"eraser") {
                     render_target_->DrawLine(D2D1::Point2F(cx - 9.0F, cy + 7.5F), D2D1::Point2F(cx + 9.0F, cy + 7.5F), white_brush_.Get(), 1.2F, round_stroke_style_.Get());
                     ComPtr<ID2D1PathGeometry> eraser_geom;
-                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(eraser_geom.GetAddressOf()))) {
+                    if (SUCCEEDED(d2d_factory->CreatePathGeometry(eraser_geom.GetAddressOf()))) {
                         ComPtr<ID2D1GeometrySink> sink;
                         if (SUCCEEDED(eraser_geom->Open(sink.GetAddressOf()))) {
                             sink->BeginFigure(D2D1::Point2F(cx - 6.0F, cy - 3.0F), D2D1_FIGURE_BEGIN_HOLLOW);
@@ -816,7 +927,7 @@ void OverlayWindow::paint() {
                     render_target_->DrawLine(D2D1::Point2F(cx - 3.0F, cy + 2.5F), D2D1::Point2F(cx + 4.0F, cy + 0.5F), white_brush_.Get(), 1.0F, round_stroke_style_.Get());
                 } else if (button.id == L"undo") {
                     ComPtr<ID2D1PathGeometry> undo_geom;
-                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(undo_geom.GetAddressOf()))) {
+                    if (SUCCEEDED(d2d_factory->CreatePathGeometry(undo_geom.GetAddressOf()))) {
                         ComPtr<ID2D1GeometrySink> sink;
                         if (SUCCEEDED(undo_geom->Open(sink.GetAddressOf()))) {
                             sink->BeginFigure(D2D1::Point2F(cx + 6.5F, cy + 4.5F), D2D1_FIGURE_BEGIN_HOLLOW);
@@ -836,7 +947,7 @@ void OverlayWindow::paint() {
                     render_target_->DrawLine(D2D1::Point2F(cx - 3.5F, cy - 1.5F), D2D1::Point2F(cx + 1.0F, cy - 1.5F), white_brush_.Get(), 1.6F, round_stroke_style_.Get());
                 } else if (button.id == L"redo") {
                     ComPtr<ID2D1PathGeometry> redo_geom;
-                    if (SUCCEEDED(d2d_factory()->CreatePathGeometry(redo_geom.GetAddressOf()))) {
+                    if (SUCCEEDED(d2d_factory->CreatePathGeometry(redo_geom.GetAddressOf()))) {
                         ComPtr<ID2D1GeometrySink> sink;
                         if (SUCCEEDED(redo_geom->Open(sink.GetAddressOf()))) {
                             sink->BeginFigure(D2D1::Point2F(cx - 6.5F, cy + 4.5F), D2D1_FIGURE_BEGIN_HOLLOW);
@@ -855,17 +966,12 @@ void OverlayWindow::paint() {
                     render_target_->DrawLine(D2D1::Point2F(cx + 3.5F, cy - 1.5F), D2D1::Point2F(cx + 3.5F, cy - 6.0F), white_brush_.Get(), 1.6F, round_stroke_style_.Get());
                     render_target_->DrawLine(D2D1::Point2F(cx + 3.5F, cy - 1.5F), D2D1::Point2F(cx - 1.0F, cy - 1.5F), white_brush_.Get(), 1.6F, round_stroke_style_.Get());
                 } else if (button.id == L"ocr") {
-                    ComPtr<IDWriteTextFormat> ocr_format;
-                    dwrite_factory()->CreateTextFormat(L"Consolas",
-                                                       nullptr,
-                                                       DWRITE_FONT_WEIGHT_BOLD,
-                                                       DWRITE_FONT_STYLE_NORMAL,
-                                                       DWRITE_FONT_STRETCH_NORMAL,
-                                                       9.0F,
-                                                       L"zh-CN",
-                                                       ocr_format.GetAddressOf());
-                    ocr_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    ocr_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    auto ocr_format = create_text_format(
+                        L"Consolas", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, 9.0F);
+                    if (ocr_format) {
+                        ocr_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        ocr_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    }
 
                     constexpr float len = 5.0F;
                     constexpr float r = 9.0F;
@@ -878,7 +984,14 @@ void OverlayWindow::paint() {
                     render_target_->DrawLine(D2D1::Point2F(cx + r, cy + r), D2D1::Point2F(cx + r - len, cy + r), white_brush_.Get(), 1.4F, round_stroke_style_.Get());
                     render_target_->DrawLine(D2D1::Point2F(cx + r, cy + r), D2D1::Point2F(cx + r, cy + r - len), white_brush_.Get(), 1.4F, round_stroke_style_.Get());
 
-                    render_target_->DrawTextW(L"OCR", 3, ocr_format.Get(), D2D1::RectF(cx - 9.0F, cy - 9.0F, cx + 9.0F, cy + 9.0F), white_brush_.Get());
+                    if (ocr_format) {
+                        render_target_->DrawTextW(
+                            L"OCR",
+                            3,
+                            ocr_format.Get(),
+                            D2D1::RectF(cx - 9.0F, cy - 9.0F, cx + 9.0F, cy + 9.0F),
+                            white_brush_.Get());
+                    }
                 } else if (button.id == L"copy") {
                     render_target_->DrawLine(D2D1::Point2F(cx - 6.5F, cy + 0.5F), D2D1::Point2F(cx - 2.0F, cy + 5.0F), white_brush_.Get(), 2.0F, round_stroke_style_.Get());
                     render_target_->DrawLine(D2D1::Point2F(cx - 2.0F, cy + 5.0F), D2D1::Point2F(cx + 7.0F, cy - 5.0F), white_brush_.Get(), 2.0F, round_stroke_style_.Get());
@@ -986,7 +1099,14 @@ void OverlayWindow::paint() {
                     else if (button.id == L"color_custom") color = session_.custom_color();
 
                     ComPtr<ID2D1SolidColorBrush> brush;
-                    render_target_->CreateSolidColorBrush(D2D1::ColorF(GetRValue(color) / 255.0F, GetGValue(color) / 255.0F, GetBValue(color) / 255.0F), brush.GetAddressOf());
+                    if (FAILED(render_target_->CreateSolidColorBrush(
+                            D2D1::ColorF(GetRValue(color) / 255.0F,
+                                         GetGValue(color) / 255.0F,
+                                         GetBValue(color) / 255.0F),
+                            brush.GetAddressOf())) ||
+                        !brush) {
+                        brush = blue_brush_;
+                    }
 
                     const D2D1_RECT_F swatch = D2D1::RectF(cx - 10.0F, cy - 10.0F, cx + 10.0F, cy + 10.0F);
                     render_target_->FillRoundedRectangle(D2D1::RoundedRect(swatch, 3.0F, 3.0F), brush.Get());
@@ -999,7 +1119,16 @@ void OverlayWindow::paint() {
                             plus_color = RGB(0, 0, 0);
                         }
                         ComPtr<ID2D1SolidColorBrush> plus_brush;
-                        render_target_->CreateSolidColorBrush(D2D1::ColorF(GetRValue(plus_color) / 255.0F, GetGValue(plus_color) / 255.0F, GetBValue(plus_color) / 255.0F), plus_brush.GetAddressOf());
+                        if (FAILED(render_target_->CreateSolidColorBrush(
+                                D2D1::ColorF(GetRValue(plus_color) / 255.0F,
+                                             GetGValue(plus_color) / 255.0F,
+                                             GetBValue(plus_color) / 255.0F),
+                                plus_brush.GetAddressOf())) ||
+                            !plus_brush) {
+                            plus_brush = plus_color == RGB(0, 0, 0)
+                                             ? black_brush_
+                                             : true_white_brush_;
+                        }
                         render_target_->DrawLine(D2D1::Point2F(cx - 3.0F, cy), D2D1::Point2F(cx + 3.0F, cy), plus_brush.Get(), 1.5F);
                         render_target_->DrawLine(D2D1::Point2F(cx, cy - 3.0F), D2D1::Point2F(cx, cy + 3.0F), plus_brush.Get(), 1.5F);
                     }
@@ -1019,48 +1148,45 @@ void OverlayWindow::paint() {
 
                     render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), w / 2.0F + 1.0F, w / 2.0F + 1.0F), white_brush_.Get());
                 } else if (button.id.starts_with(L"text_style_")) {
-                    ComPtr<IDWriteTextFormat> style_format;
-                    dwrite_factory()->CreateTextFormat(L"Segoe UI",
-                                                       nullptr,
-                                                       DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                                                       DWRITE_FONT_STYLE_NORMAL,
-                                                       DWRITE_FONT_STRETCH_NORMAL,
-                                                       22.0F,
-                                                       L"zh-CN",
-                                                       style_format.GetAddressOf());
-                    style_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    style_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    auto style_format = create_text_format(
+                        L"Segoe UI",
+                        DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                        DWRITE_FONT_STYLE_NORMAL,
+                        22.0F);
+                    if (style_format) {
+                        style_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        style_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    }
 
                     ComPtr<ID2D1SolidColorBrush> icon_brush = (is_selected && is_light_theme_) ? blue_brush_ : white_brush_;
                     if (button.id == L"text_style_dark") {
                         render_target_->FillRoundedRectangle(
                             D2D1::RoundedRect(D2D1::RectF(cx - 11.0F, cy - 11.0F, cx + 11.0F, cy + 11.0F), 3.0F, 3.0F),
                             black_brush_.Get());
-                        render_target_->DrawTextW(L"T", 1, style_format.Get(), D2D1::RectF(cx - 11.0F, cy - 13.0F, cx + 11.0F, cy + 11.0F), true_white_brush_.Get());
-                    } else if (button.id == L"text_style_outline") {
+                        if (style_format) {
+                            render_target_->DrawTextW(L"T", 1, style_format.Get(), D2D1::RectF(cx - 11.0F, cy - 13.0F, cx + 11.0F, cy + 11.0F), true_white_brush_.Get());
+                        }
+                    } else if (button.id == L"text_style_outline" && style_format) {
                         for (float dy : {-1.5F, 1.5F}) {
                             for (float dx : {-1.5F, 1.5F}) {
                                 render_target_->DrawTextW(L"T", 1, style_format.Get(), D2D1::RectF(cx - 11.0F + dx, cy - 13.0F + dy, cx + 11.0F + dx, cy + 11.0F + dy), true_white_brush_.Get());
                             }
                         }
                         render_target_->DrawTextW(L"T", 1, style_format.Get(), D2D1::RectF(cx - 11.0F, cy - 13.0F, cx + 11.0F, cy + 11.0F), icon_brush.Get());
-                    } else {
+                    } else if (style_format) {
                         render_target_->DrawTextW(L"T", 1, style_format.Get(), D2D1::RectF(cx - 11.0F, cy - 13.0F, cx + 11.0F, cy + 11.0F), icon_brush.Get());
                     }
                 } else if (button.id == L"text_size_btn") {
-                    ComPtr<IDWriteTextFormat> dropdown_text_format;
-                    dwrite_factory()->CreateTextFormat(L"Segoe UI",
-                                                       nullptr,
-                                                       DWRITE_FONT_WEIGHT_NORMAL,
-                                                       DWRITE_FONT_STYLE_NORMAL,
-                                                       DWRITE_FONT_STRETCH_NORMAL,
-                                                       12.5F,
-                                                       L"zh-CN",
-                                                       dropdown_text_format.GetAddressOf());
-                    dropdown_text_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    dropdown_text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-
-                    render_target_->DrawTextW(button.label.c_str(), static_cast<UINT32>(button.label.size()), dropdown_text_format.Get(), D2D1::RectF(bounds.left, bounds.top, bounds.right - 14.0F, bounds.bottom), white_brush_.Get());
+                    auto dropdown_text_format = create_text_format(
+                        L"Segoe UI",
+                        DWRITE_FONT_WEIGHT_NORMAL,
+                        DWRITE_FONT_STYLE_NORMAL,
+                        12.5F);
+                    if (dropdown_text_format) {
+                        dropdown_text_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        dropdown_text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                        render_target_->DrawTextW(button.label.c_str(), static_cast<UINT32>(button.label.size()), dropdown_text_format.Get(), D2D1::RectF(bounds.left, bounds.top, bounds.right - 14.0F, bounds.bottom), white_brush_.Get());
+                    }
                     render_target_->DrawLine(D2D1::Point2F(cx + 14.0F, cy - 1.5F), D2D1::Point2F(cx + 17.0F, cy + 1.5F), white_brush_.Get(), 1.2F, round_stroke_style_.Get());
                     render_target_->DrawLine(D2D1::Point2F(cx + 17.0F, cy + 1.5F), D2D1::Point2F(cx + 20.0F, cy - 1.5F), white_brush_.Get(), 1.2F, round_stroke_style_.Get());
                 } else if (button.id == L"mosaic_strength_slider" || button.id == L"watermark_opacity_slider") {
@@ -1068,28 +1194,31 @@ void OverlayWindow::paint() {
                     const int value = watermark_slider ? session_.watermark_opacity() : session_.mosaic_strength();
                     const wchar_t* label = watermark_slider ? L"水印透明度" : L"模糊强度";
 
-                    ComPtr<IDWriteTextFormat> slider_format;
-                    dwrite_factory()->CreateTextFormat(L"Microsoft YaHei",
-                                                       nullptr,
-                                                       DWRITE_FONT_WEIGHT_NORMAL,
-                                                       DWRITE_FONT_STYLE_NORMAL,
-                                                       DWRITE_FONT_STRETCH_NORMAL,
-                                                       12.0F,
-                                                       L"zh-CN",
-                                                       slider_format.GetAddressOf());
-                    slider_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-                    slider_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-                    render_target_->DrawTextW(label,
-                                              static_cast<UINT32>(wcslen(label)),
-                                              slider_format.Get(),
-                                              D2D1::RectF(bounds.left + 6.0F, bounds.top, bounds.left + 86.0F, bounds.bottom),
-                                              white_brush_.Get());
+                    auto slider_format = create_text_format(
+                        L"Microsoft YaHei",
+                        DWRITE_FONT_WEIGHT_NORMAL,
+                        DWRITE_FONT_STYLE_NORMAL,
+                        12.0F);
+                    if (slider_format) {
+                        slider_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                        slider_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                        render_target_->DrawTextW(label,
+                                                  static_cast<UINT32>(wcslen(label)),
+                                                  slider_format.Get(),
+                                                  D2D1::RectF(bounds.left + 6.0F, bounds.top, bounds.left + 86.0F, bounds.bottom),
+                                                  white_brush_.Get());
+                    }
 
                     const float track_left = bounds.left + 88.0F;
                     const float track_right = bounds.right - 42.0F;
                     const float track_y = cy;
                     ComPtr<ID2D1SolidColorBrush> track_brush;
-                    render_target_->CreateSolidColorBrush(D2D1::ColorF(0xC9CDD4), track_brush.GetAddressOf());
+                    if (FAILED(render_target_->CreateSolidColorBrush(
+                            D2D1::ColorF(0xC9CDD4),
+                            track_brush.GetAddressOf())) ||
+                        !track_brush) {
+                        track_brush = toolbar_border_brush_;
+                    }
                     render_target_->DrawLine(D2D1::Point2F(track_left, track_y),
                                              D2D1::Point2F(track_right, track_y),
                                              track_brush.Get(),
@@ -1105,33 +1234,33 @@ void OverlayWindow::paint() {
                     render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(knob_x, track_y), 5.0F, 5.0F), blue_brush_.Get(), 2.0F);
 
                     const std::wstring value_text = std::format(L"{} %", value);
-                    slider_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                    render_target_->DrawTextW(value_text.c_str(),
-                                              static_cast<UINT32>(value_text.size()),
-                                              slider_format.Get(),
-                                              D2D1::RectF(bounds.right - 40.0F, bounds.top, bounds.right - 4.0F, bounds.bottom),
-                                              white_brush_.Get());
+                    if (slider_format) {
+                        slider_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                        render_target_->DrawTextW(value_text.c_str(),
+                                                  static_cast<UINT32>(value_text.size()),
+                                                  slider_format.Get(),
+                                                  D2D1::RectF(bounds.right - 40.0F, bounds.top, bounds.right - 4.0F, bounds.bottom),
+                                                  white_brush_.Get());
+                    }
                 } else if (button.id == L"watermark_text" || button.id == L"watermark_apply" || button.id == L"watermark_clear") {
-                    ComPtr<IDWriteTextFormat> label_format;
-                    dwrite_factory()->CreateTextFormat(L"Microsoft YaHei",
-                                                       nullptr,
-                                                       DWRITE_FONT_WEIGHT_NORMAL,
-                                                       DWRITE_FONT_STYLE_NORMAL,
-                                                       DWRITE_FONT_STRETCH_NORMAL,
-                                                       12.5F,
-                                                       L"zh-CN",
-                                                       label_format.GetAddressOf());
-                    label_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    label_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    auto label_format = create_text_format(
+                        L"Microsoft YaHei",
+                        DWRITE_FONT_WEIGHT_NORMAL,
+                        DWRITE_FONT_STYLE_NORMAL,
+                        12.5F);
                     std::wstring label = button.label;
                     if (button.id == L"watermark_text" && label.size() > 6) {
                         label = label.substr(0, 6) + L"...";
                     }
-                    render_target_->DrawTextW(label.c_str(),
-                                              static_cast<UINT32>(label.size()),
-                                              label_format.Get(),
-                                              bounds,
-                                              white_brush_.Get());
+                    if (label_format) {
+                        label_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                        label_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                        render_target_->DrawTextW(label.c_str(),
+                                                  static_cast<UINT32>(label.size()),
+                                                  label_format.Get(),
+                                                  bounds,
+                                                  white_brush_.Get());
+                    }
                 } else if (button.id.starts_with(L"effect_") || button.id.starts_with(L"mode_")) {
                     ComPtr<ID2D1SolidColorBrush> icon_brush = (is_selected && is_light_theme_) ? blue_brush_ : white_brush_;
                     if (button.id == L"effect_mosaic") {
@@ -1163,8 +1292,12 @@ void OverlayWindow::paint() {
                     if (button.id == L"alpha_medium") alpha = 0.55F;
                     else if (button.id == L"alpha_high") alpha = 0.85F;
                     ComPtr<ID2D1SolidColorBrush> alpha_brush;
-                    render_target_->CreateSolidColorBrush(D2D1::ColorF(0xFADB14, alpha), alpha_brush.GetAddressOf());
-                    render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 6.0F, 6.0F), alpha_brush.Get());
+                    if (SUCCEEDED(render_target_->CreateSolidColorBrush(
+                            D2D1::ColorF(0xFADB14, alpha),
+                            alpha_brush.GetAddressOf())) &&
+                        alpha_brush) {
+                        render_target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 6.0F, 6.0F), alpha_brush.Get());
+                    }
                     render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 6.0F, 6.0F), white_brush_.Get(), 1.2F, round_stroke_style_.Get());
                 }
             }
@@ -1187,7 +1320,7 @@ void OverlayWindow::paint() {
             text_bounds.top = session_.selection().top + 4;
             text_bounds.bottom = text_bounds.top + 24;
         }
-        if (intersect(text_bounds, monitor_.bounds)) {
+        if (format && intersect(text_bounds, monitor_.bounds)) {
             const auto bounds = local_rect(text_bounds);
             render_target_->FillRoundedRectangle(D2D1::RoundedRect(bounds, 12.f, 12.f), toolbar_bg_brush_.Get());
             render_target_->DrawRoundedRectangle(D2D1::RoundedRect(bounds, 12.f, 12.f), toolbar_border_brush_.Get(), 1.0f);
@@ -1237,10 +1370,14 @@ void OverlayWindow::paint() {
                     COLORREF color = session_.get_pixel_color(px, py);
 
                     ComPtr<ID2D1SolidColorBrush> cell_brush;
-                    render_target_->CreateSolidColorBrush(
-                        D2D1::ColorF(GetRValue(color) / 255.0f, GetGValue(color) / 255.0f, GetBValue(color) / 255.0f),
-                        cell_brush.GetAddressOf()
-                    );
+                    if (FAILED(render_target_->CreateSolidColorBrush(
+                            D2D1::ColorF(GetRValue(color) / 255.0f,
+                                         GetGValue(color) / 255.0f,
+                                         GetBValue(color) / 255.0f),
+                            cell_brush.GetAddressOf())) ||
+                        !cell_brush) {
+                        cell_brush = black_brush_;
+                    }
 
                     D2D1_RECT_F cell_rect = D2D1::RectF(
                         static_cast<float>(mx + (dx + grid_cells/2) * cell_size),
@@ -1254,7 +1391,12 @@ void OverlayWindow::paint() {
 
             // Draw faint grid lines between pixels
             ComPtr<ID2D1SolidColorBrush> grid_line_brush;
-            render_target_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.15f), grid_line_brush.GetAddressOf());
+            if (FAILED(render_target_->CreateSolidColorBrush(
+                    D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.15f),
+                    grid_line_brush.GetAddressOf())) ||
+                !grid_line_brush) {
+                grid_line_brush = true_white_brush_;
+            }
             for (int i = 0; i <= grid_cells; ++i) {
                 float line_coord = static_cast<float>(i * cell_size);
                 // Horizontal line
@@ -1319,17 +1461,12 @@ void OverlayWindow::paint() {
 
             std::wstring hint_text = L"C 复制 | Shift 切换";
 
-            ComPtr<IDWriteTextFormat> mag_format;
-            dwrite_factory()->CreateTextFormat(L"Consolas",
-                                               nullptr,
-                                               DWRITE_FONT_WEIGHT_NORMAL,
-                                               DWRITE_FONT_STYLE_NORMAL,
-                                               DWRITE_FONT_STRETCH_NORMAL,
-                                               12.0F,
-                                               L"zh-CN",
-                                               mag_format.GetAddressOf());
-            mag_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            mag_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            auto mag_format = create_text_format(
+                L"Consolas", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, 12.0F);
+            if (mag_format) {
+                mag_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                mag_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            }
 
             // Line 1: coordinates
             D2D1_RECT_F coord_rect = D2D1::RectF(
@@ -1338,7 +1475,9 @@ void OverlayWindow::paint() {
                 static_cast<float>(mx + mag_width),
                 static_cast<float>(my + grid_size + 24)
             );
-            render_target_->DrawTextW(coord_text.c_str(), static_cast<UINT32>(coord_text.size()), mag_format.Get(), coord_rect, white_brush_.Get());
+            if (mag_format) {
+                render_target_->DrawTextW(coord_text.c_str(), static_cast<UINT32>(coord_text.size()), mag_format.Get(), coord_rect, white_brush_.Get());
+            }
 
             // Line 2: color value (Hex or RGB)
             D2D1_RECT_F color_rect = D2D1::RectF(
@@ -1347,23 +1486,28 @@ void OverlayWindow::paint() {
                 static_cast<float>(mx + mag_width),
                 static_cast<float>(my + grid_size + 44)
             );
-            render_target_->DrawTextW(primary_color.c_str(), static_cast<UINT32>(primary_color.size()), mag_format.Get(), color_rect, white_brush_.Get());
+            if (mag_format) {
+                render_target_->DrawTextW(primary_color.c_str(), static_cast<UINT32>(primary_color.size()), mag_format.Get(), color_rect, white_brush_.Get());
+            }
 
             // Line 3: hint
-            ComPtr<IDWriteTextFormat> hint_format;
-            dwrite_factory()->CreateTextFormat(L"Microsoft YaHei",
-                                               nullptr,
-                                               DWRITE_FONT_WEIGHT_NORMAL,
-                                               DWRITE_FONT_STYLE_NORMAL,
-                                               DWRITE_FONT_STRETCH_NORMAL,
-                                               10.5F,
-                                               L"zh-CN",
-                                               hint_format.GetAddressOf());
-            hint_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            hint_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            auto hint_format = create_text_format(
+                L"Microsoft YaHei",
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                10.5F);
+            if (hint_format) {
+                hint_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                hint_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            }
 
             ComPtr<ID2D1SolidColorBrush> hint_brush;
-            render_target_->CreateSolidColorBrush(D2D1::ColorF(0.6f, 0.65f, 0.7f), hint_brush.GetAddressOf());
+            if (FAILED(render_target_->CreateSolidColorBrush(
+                    D2D1::ColorF(0.6f, 0.65f, 0.7f),
+                    hint_brush.GetAddressOf())) ||
+                !hint_brush) {
+                hint_brush = white_brush_;
+            }
 
             D2D1_RECT_F hint_rect = D2D1::RectF(
                 static_cast<float>(mx),
@@ -1371,7 +1515,9 @@ void OverlayWindow::paint() {
                 static_cast<float>(mx + mag_width),
                 static_cast<float>(my + mag_height - 4)
             );
-            render_target_->DrawTextW(hint_text.c_str(), static_cast<UINT32>(hint_text.size()), hint_format.Get(), hint_rect, hint_brush.Get());
+            if (hint_format) {
+                render_target_->DrawTextW(hint_text.c_str(), static_cast<UINT32>(hint_text.size()), hint_format.Get(), hint_rect, hint_brush.Get());
+            }
 
             render_target_->DrawRectangle(mag_rect, toolbar_border_brush_.Get(), 1.0f);
         }
@@ -1410,17 +1556,12 @@ void OverlayWindow::paint() {
         render_target_->FillRoundedRectangle(D2D1::RoundedRect(local_card, 6.f, 6.f), toolbar_bg_brush_.Get());
         render_target_->DrawRoundedRectangle(D2D1::RoundedRect(local_card, 6.f, 6.f), toolbar_border_brush_.Get(), 1.f);
 
-        ComPtr<IDWriteTextFormat> dropdown_text_format;
-        dwrite_factory()->CreateTextFormat(L"Segoe UI",
-                                           nullptr,
-                                           DWRITE_FONT_WEIGHT_NORMAL,
-                                           DWRITE_FONT_STYLE_NORMAL,
-                                           DWRITE_FONT_STRETCH_NORMAL,
-                                           12.5F,
-                                           L"zh-CN",
-                                           dropdown_text_format.GetAddressOf());
-        dropdown_text_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        dropdown_text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        auto dropdown_text_format = create_text_format(
+            L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, 12.5F);
+        if (dropdown_text_format) {
+            dropdown_text_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            dropdown_text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
 
         const std::array<std::pair<std::wstring_view, float>, 13> options{{
             {L"12pt", 12.0F},
@@ -1459,11 +1600,13 @@ void OverlayWindow::paint() {
                 render_target_->FillRoundedRectangle(D2D1::RoundedRect(item_rect_full, 4.f, 4.f), active_bg_brush_.Get());
             }
 
-            render_target_->DrawTextW(options[i].first.data(),
-                                      static_cast<UINT32>(options[i].first.size()),
-                                      dropdown_text_format.Get(),
-                                      item_rect_full,
-                                      text_brush.Get());
+            if (dropdown_text_format) {
+                render_target_->DrawTextW(options[i].first.data(),
+                                          static_cast<UINT32>(options[i].first.size()),
+                                          dropdown_text_format.Get(),
+                                          item_rect_full,
+                                          text_brush.Get());
+            }
         }
     }
 
@@ -1511,11 +1654,21 @@ void OverlayWindow::paint() {
                 if (id == L"eraser") return std::format(L"橡皮擦 ({})", config.tool_shortcut_eraser);
                 if (id == L"undo") return L"撤销 (Ctrl+Z)";
                 if (id == L"redo") return L"重做 (Ctrl+Y)";
-                if (id == L"ocr") return L"屏幕识图 (Shift+C)";
+                if (id == L"ocr") {
+                    return std::format(L"屏幕识字 ({})", config.capture_ocr_shortcut);
+                }
                 if (id == L"scroll") return L"滚动截图";
                 if (id == L"pin") return L"贴图";
-                if (id == L"copy") return L"复制 (Enter)";
-                if (id == L"save") return L"保存 (Ctrl+S)";
+                if (id == L"copy") {
+                    return _wcsicmp(config.default_output.c_str(), L"file") == 0
+                               ? L"复制 (Ctrl+C)"
+                               : L"复制 (Ctrl+C / Enter)";
+                }
+                if (id == L"save") {
+                    return _wcsicmp(config.default_output.c_str(), L"file") == 0
+                               ? L"保存 (Ctrl+S / Enter)"
+                               : L"保存 (Ctrl+S)";
+                }
                 if (id == L"close") return L"关闭 (Esc)";
 
                 if (id == L"effect_mosaic") return L"马赛克效果";
@@ -1534,29 +1687,27 @@ void OverlayWindow::paint() {
 
             std::wstring tooltip_str = get_tooltip_text(hovered_id);
             if (!tooltip_str.empty()) {
-                ComPtr<IDWriteTextFormat> tooltip_format;
-                dwrite_factory()->CreateTextFormat(L"Microsoft YaHei",
-                                                   nullptr,
-                                                   DWRITE_FONT_WEIGHT_NORMAL,
-                                                   DWRITE_FONT_STYLE_NORMAL,
-                                                   DWRITE_FONT_STRETCH_NORMAL,
-                                                   13.0F,
-                                                   L"zh-CN",
-                                                   tooltip_format.GetAddressOf());
-                tooltip_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                tooltip_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                auto tooltip_format = create_text_format(
+                    L"Microsoft YaHei",
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    13.0F);
+                if (tooltip_format) {
+                    tooltip_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    tooltip_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                }
 
-                ComPtr<IDWriteTextLayout> layout;
-                dwrite_factory()->CreateTextLayout(tooltip_str.c_str(),
-                                                   static_cast<UINT32>(tooltip_str.size()),
-                                                   tooltip_format.Get(),
-                                                   400.0F,
-                                                   100.0F,
-                                                   layout.GetAddressOf());
+                auto layout =
+                    create_text_layout(tooltip_str, tooltip_format.Get(), 400.0F, 100.0F);
                 DWRITE_TEXT_METRICS metrics{};
-                layout->GetMetrics(&metrics);
-                float text_width = metrics.width;
-                float text_height = metrics.height;
+                if (layout && FAILED(layout->GetMetrics(&metrics))) {
+                    metrics = {};
+                }
+                const float text_width =
+                    metrics.width > 0.0F
+                        ? metrics.width
+                        : static_cast<float>(tooltip_str.size()) * 13.0F;
+                const float text_height = metrics.height > 0.0F ? metrics.height : 18.0F;
 
                 float bubble_width = text_width + 20.0F;
                 float bubble_height = text_height + 12.0F;
@@ -1575,14 +1726,24 @@ void OverlayWindow::paint() {
                 }
 
                 ComPtr<ID2D1SolidColorBrush> tooltip_bg_brush;
-                render_target_->CreateSolidColorBrush(D2D1::ColorF(0x1F2329, 0.95F), tooltip_bg_brush.GetAddressOf());
+                if (FAILED(render_target_->CreateSolidColorBrush(
+                        D2D1::ColorF(0x1F2329, 0.95F),
+                        tooltip_bg_brush.GetAddressOf())) ||
+                    !tooltip_bg_brush) {
+                    tooltip_bg_brush = toolbar_bg_brush_;
+                }
                 ComPtr<ID2D1SolidColorBrush> tooltip_fg_brush;
-                render_target_->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), tooltip_fg_brush.GetAddressOf());
+                if (FAILED(render_target_->CreateSolidColorBrush(
+                        D2D1::ColorF(D2D1::ColorF::White),
+                        tooltip_fg_brush.GetAddressOf())) ||
+                    !tooltip_fg_brush) {
+                    tooltip_fg_brush = true_white_brush_;
+                }
 
                 render_target_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bubble_left, bubble_top, bubble_left + bubble_width, bubble_bottom), 4.0F, 4.0F), tooltip_bg_brush.Get());
 
                 ComPtr<ID2D1PathGeometry> tri_geom;
-                if (SUCCEEDED(d2d_factory()->CreatePathGeometry(tri_geom.GetAddressOf()))) {
+                if (SUCCEEDED(d2d_factory->CreatePathGeometry(tri_geom.GetAddressOf()))) {
                     ComPtr<ID2D1GeometrySink> sink;
                     if (SUCCEEDED(tri_geom->Open(sink.GetAddressOf()))) {
                         if (bubble_top > btn_bottom) {
@@ -1600,17 +1761,22 @@ void OverlayWindow::paint() {
                     }
                 }
 
-                render_target_->DrawTextW(tooltip_str.c_str(), static_cast<UINT32>(tooltip_str.size()), tooltip_format.Get(), D2D1::RectF(bubble_left, bubble_top, bubble_left + bubble_width, bubble_bottom), tooltip_fg_brush.Get());
+                if (tooltip_format) {
+                    render_target_->DrawTextW(tooltip_str.c_str(), static_cast<UINT32>(tooltip_str.size()), tooltip_format.Get(), D2D1::RectF(bubble_left, bubble_top, bubble_left + bubble_width, bubble_bottom), tooltip_fg_brush.Get());
+                }
             }
         }
     }
 
-    const HRESULT result = render_target_->EndDraw();
-    if (result == D2DERR_RECREATE_TARGET) {
-        background_.Reset();
-        render_target_.Reset();
+    const HRESULT draw_result = render_target_->EndDraw();
+    const bool recreate_target = draw_result == D2DERR_RECREATE_TARGET;
+    if (FAILED(draw_result)) {
+        discard_device_resources();
     }
     EndPaint(hwnd_, &paint);
+    if (recreate_target && hwnd_ && IsWindow(hwnd_)) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
 }
 
 LRESULT CALLBACK OverlayWindow::window_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_param) {
@@ -1630,6 +1796,16 @@ LRESULT CALLBACK OverlayWindow::window_proc(HWND window, UINT message, WPARAM w_
     }
     if (message == WM_ERASEBKGND) {
         return 1;
+    }
+    if (message == WM_CLOSE) {
+        self->session_.cancel();
+        return 0;
+    }
+    if (message == WM_NCDESTROY) {
+        self->discard_device_resources();
+        self->hwnd_ = nullptr;
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        return DefWindowProcW(window, message, w_param, l_param);
     }
     if (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN) {
         POINT point{};
@@ -1652,7 +1828,7 @@ LRESULT CALLBACK OverlayWindow::window_proc(HWND window, UINT message, WPARAM w_
     if (message == WM_LBUTTONUP) {
         POINT point{};
         GetCursorPos(&point);
-        self->session_.on_mouse_up(point);
+        self->session_.on_mouse_up(window, point);
         return 0;
     }
     if (message == WM_KEYDOWN) {

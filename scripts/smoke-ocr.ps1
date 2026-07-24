@@ -1,4 +1,6 @@
-﻿[CmdletBinding()]
+#requires -Version 7.0
+
+[CmdletBinding()]
 param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",
@@ -7,21 +9,25 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $true
 $root = Split-Path -Parent $PSScriptRoot
 $helper = if ([string]::IsNullOrWhiteSpace($HelperPath)) {
-    Join-Path $root "build\AirScreenshot.exe"
+    Join-Path $root "build\$($Configuration.ToLowerInvariant())\bin\AirScreenshot.exe"
 } else {
     $HelperPath
 }
-if (-not (Test-Path -LiteralPath $helper)) {
+if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
     & (Join-Path $PSScriptRoot "build.ps1") -Configuration $Configuration
 }
-if (-not (Test-Path -LiteralPath $helper)) {
-    throw "鏈壘鍒?OCR helper锛?helper"
+if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+    throw "未找到 OCR helper：$helper"
 }
 
 if ([string]::IsNullOrWhiteSpace($OcrRoot)) {
     $OcrRoot = Join-Path $root "dist\ocr-dependencies\rapidocr-onnx"
+}
+if (-not (Test-Path -LiteralPath $OcrRoot -PathType Container)) {
+    throw "未找到 OCR 依赖目录：$OcrRoot"
 }
 $OcrRoot = (Resolve-Path -LiteralPath $OcrRoot).Path
 $helper = (Resolve-Path -LiteralPath $helper).Path
@@ -31,51 +37,66 @@ $profiles = @(
     "rapidocr-v5-accurate",
     "rapidocr-v4-compat"
 )
-$required = @(
-    "rapidocr_api.dll",
-    "onnxruntime.dll",
-    "rapidocr_runner.exe"
-)
+$required = @("rapidocr_runner.exe")
 foreach ($profile in $profiles) {
-    $required += "models\$profile\det.onnx"
-    $required += "models\$profile\rec.onnx"
-    $required += "models\$profile\cls.onnx"
-    $required += "models\$profile\dict.txt"
+    foreach ($file in @("det.onnx", "rec.onnx", "cls.onnx", "dict.txt")) {
+        $required += "models\$profile\$file"
+    }
 }
 
 $missing = @()
 foreach ($relative in $required) {
     $path = Join-Path $OcrRoot $relative
-    if (-not (Test-Path -LiteralPath $path)) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+        (Get-Item -LiteralPath $path).Length -le 0) {
         $missing += $relative
     }
 }
 if ($missing.Count -gt 0) {
-    throw "OCR 渚濊禆涓嶅畬鏁达細$($missing -join ', ')"
+    throw "OCR 依赖不完整：$($missing -join ', ')"
 }
 
 Add-Type -AssemblyName System.Drawing
-$image = Join-Path ([IO.Path]::GetTempPath()) "airshot-ocr-smoke-$PID.png"
-$stdout = Join-Path ([IO.Path]::GetTempPath()) "airshot-ocr-smoke-$PID.out"
-$stderr = Join-Path ([IO.Path]::GetTempPath()) "airshot-ocr-smoke-$PID.err"
+$temporaryDirectory = Join-Path (
+    [IO.Path]::GetTempPath()
+) ("airshot-ocr-smoke-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+$image = Join-Path $temporaryDirectory "input.png"
+$expectedText = "AirOCR123中文测试"
 
 try {
-    $bitmap = New-Object Drawing.Bitmap 640, 180
+    $bitmap = [Drawing.Bitmap]::new(1000, 240)
     $graphics = [Drawing.Graphics]::FromImage($bitmap)
-    $graphics.Clear([Drawing.Color]::White)
-    $graphics.TextRenderingHint = [Drawing.Text.TextRenderingHint]::ClearTypeGridFit
-    $font = New-Object Drawing.Font "Microsoft YaHei", 34, ([Drawing.FontStyle]::Regular)
-    $brush = [Drawing.Brushes]::Black
-    $graphics.DrawString("Air OCR 123 涓枃娴嬭瘯", $font, $brush, 24, 52)
-    $bitmap.Save($image, [Drawing.Imaging.ImageFormat]::Png)
-    $graphics.Dispose()
-    $font.Dispose()
-    $bitmap.Dispose()
+    $font = [Drawing.Font]::new(
+        "Microsoft YaHei",
+        52,
+        [Drawing.FontStyle]::Regular,
+        [Drawing.GraphicsUnit]::Pixel
+    )
+    try {
+        $graphics.Clear([Drawing.Color]::White)
+        $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::HighQuality
+        $graphics.TextRenderingHint = [Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+        $graphics.DrawString(
+            "Air OCR 123 中文测试",
+            $font,
+            [Drawing.Brushes]::Black,
+            32,
+            72
+        )
+        $bitmap.Save($image, [Drawing.Imaging.ImageFormat]::Png)
+    }
+    finally {
+        $graphics.Dispose()
+        $font.Dispose()
+        $bitmap.Dispose()
+    }
 
     foreach ($profile in $profiles) {
-        Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+        $stdout = Join-Path $temporaryDirectory "$profile.out"
+        $stderr = Join-Path $temporaryDirectory "$profile.err"
         $modelDir = Join-Path $OcrRoot "models\$profile"
-        $args = @(
+        $arguments = @(
             "--ocr-internal",
             "--engine", "onnx",
             "--image", "`"$image`"",
@@ -84,23 +105,41 @@ try {
             "--ocr-profile", $profile,
             "--ort-threads", "2"
         )
-        $process = Start-Process -FilePath $helper `
-            -ArgumentList $args `
-            -Wait -PassThru -WindowStyle Hidden `
+        $process = Start-Process `
+            -FilePath $helper `
+            -ArgumentList $arguments `
+            -PassThru `
+            -WindowStyle Hidden `
             -RedirectStandardOutput $stdout `
             -RedirectStandardError $stderr
-        $outText = if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout -Raw -Encoding Unicode } else { "" }
-        $errText = if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -Raw -Encoding Unicode } else { "" }
-        if ($process.ExitCode -ne 0) {
-            throw "$profile OCR 澶辫触锛?errText"
+        if (-not $process.WaitForExit(120000)) {
+            $process.Kill($true)
+            throw "$profile OCR smoke timed out after 120 seconds."
         }
-        if ($outText -notmatch "Air" -or $outText -notmatch "123") {
-            throw "$profile OCR 杈撳嚭鏈寘鍚鏈熸枃鏈細$outText"
+        # Ensure redirected output has been fully flushed after process exit.
+        $process.WaitForExit()
+
+        $outText = if (Test-Path -LiteralPath $stdout) {
+            Get-Content -LiteralPath $stdout -Raw -Encoding utf8
+        } else {
+            ""
+        }
+        $errText = if (Test-Path -LiteralPath $stderr) {
+            Get-Content -LiteralPath $stderr -Raw -Encoding utf8
+        } else {
+            ""
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "$profile OCR 失败：$errText"
+        }
+
+        $normalized = [Regex]::Replace($outText, "[^\p{L}\p{Nd}]", "")
+        if ($normalized -cne $expectedText) {
+            throw "$profile OCR 输出不匹配。期望：$expectedText；实际：$normalized；原始：$outText"
         }
         Write-Host "$profile OCR smoke passed: $($outText.Trim())"
     }
 }
 finally {
-    Remove-Item -LiteralPath $image, $stdout, $stderr -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }
-

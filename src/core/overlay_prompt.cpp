@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <new>
 #include <commctrl.h>
 #include <imm.h>
 
@@ -19,6 +20,7 @@ struct PromptState {
     HFONT font{};
     HBRUSH bg_brush{};
     bool is_light_theme{};
+    TextPromptCompletion completion;
 };
 
 LRESULT CALLBACK edit_subclass_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_param, UINT_PTR subclass_id, DWORD_PTR ref_data) {
@@ -123,7 +125,7 @@ LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPA
     }
     if (message == WM_ACTIVATE) {
         if (LOWORD(w_param) == WA_INACTIVE) {
-            PostMessageW(window, WM_COMMAND, MAKEWPARAM(IDOK, 0), 0);
+            PostMessageW(window, WM_COMMAND, MAKEWPARAM(IDCANCEL, 0), 0);
             return 0;
         }
     }
@@ -151,6 +153,20 @@ LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPA
         if (state->font) DeleteObject(state->font);
         if (state->bg_brush) DeleteObject(state->bg_brush);
     }
+    if (message == WM_NCDESTROY) {
+        auto completion = std::move(state->completion);
+        std::optional<std::wstring> result;
+        if (state->accepted) {
+            result = std::move(state->text);
+        }
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        const LRESULT default_result = DefWindowProcW(window, message, w_param, l_param);
+        delete state;
+        if (completion) {
+            completion(std::move(result));
+        }
+        return default_result;
+    }
     if (message == WM_CLOSE) {
         DestroyWindow(window);
         return 0;
@@ -158,7 +174,12 @@ LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPA
     return DefWindowProcW(window, message, w_param, l_param);
 }
 
-std::optional<std::wstring> prompt_text(HWND owner, POINT position, COLORREF color, float text_size, bool is_light_theme) {
+HWND show_text_prompt(HWND owner,
+                      POINT position,
+                      COLORREF color,
+                      float text_size,
+                      bool is_light_theme,
+                      TextPromptCompletion completion) {
     static std::once_flag class_flag;
     std::call_once(class_flag, [] {
         WNDCLASSEXW window_class{sizeof(window_class)};
@@ -169,10 +190,17 @@ std::optional<std::wstring> prompt_text(HWND owner, POINT position, COLORREF col
         RegisterClassExW(&window_class);
     });
 
-    PromptState state;
-    state.color = color;
-    state.text_size = text_size;
-    state.is_light_theme = is_light_theme;
+    auto* state = new (std::nothrow) PromptState;
+    if (!state) {
+        if (completion) {
+            completion(std::nullopt);
+        }
+        return nullptr;
+    }
+    state->color = color;
+    state->text_size = text_size;
+    state->is_light_theme = is_light_theme;
+    state->completion = std::move(completion);
 
     int text_height = static_cast<int>(text_size);
     int window_height = text_height + 14;
@@ -209,19 +237,53 @@ std::optional<std::wstring> prompt_text(HWND owner, POINT position, COLORREF col
                                   owner,
                                   nullptr,
                                   GetModuleHandleW(nullptr),
-                                  &state);
+                                  state);
     if (!window) {
-        return std::nullopt;
+        auto failed_completion = std::move(state->completion);
+        delete state;
+        if (failed_completion) {
+            failed_completion(std::nullopt);
+        }
+        return nullptr;
     }
     ShowWindow(window, SW_SHOW);
     UpdateWindow(window);
+    return window;
+}
+
+std::optional<std::wstring> prompt_text(HWND owner, POINT position, COLORREF color, float text_size, bool is_light_theme) {
+    bool completed = false;
+    std::optional<std::wstring> result;
+    HWND window = show_text_prompt(
+        owner,
+        position,
+        color,
+        text_size,
+        is_light_theme,
+        [&](std::optional<std::wstring> text) {
+            result = std::move(text);
+            completed = true;
+        });
+    if (!window && !completed) {
+        return std::nullopt;
+    }
 
     MSG message{};
-    while (IsWindow(window) && GetMessageW(&message, nullptr, 0, 0) > 0) {
+    while (!completed) {
+        const BOOL status = GetMessageW(&message, nullptr, 0, 0);
+        if (status <= 0) {
+            if (status == 0) {
+                PostQuitMessage(static_cast<int>(message.wParam));
+            }
+            if (window && IsWindow(window)) {
+                DestroyWindow(window);
+            }
+            break;
+        }
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
-    return state.accepted ? std::optional(state.text) : std::nullopt;
+    return result;
 }
 
 }  // namespace airshot::overlay_detail

@@ -8,6 +8,7 @@ struct MonitorSnapshot {
     HMONITOR handle{};
     RectI bounds;
     bool primary{};
+    std::wstring device_name;
     Bitmap bitmap;
 };
 

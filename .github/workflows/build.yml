@@ -4,14 +4,31 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   windows:
-    runs-on: windows-latest
+    name: Windows ${{ matrix.configuration }}
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration:
+          - Debug
+          - Release
     steps:
-      - uses: actions/checkout@v6
-      - name: Configure
-        run: cmake -S . -B build -A x64 -DBUILD_TESTING=ON
-      - name: Build
-        run: cmake --build build --config Release --parallel
-      - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Build and test
+        shell: pwsh
+        env:
+          CONFIGURATION: ${{ matrix.configuration }}
+        run: .\scripts\test.ps1 -Configuration $env:CONFIGURATION
+
+      - name: Exercise host lifecycle
+        if: matrix.configuration == 'Release'
+        shell: pwsh
+        run: .\scripts\smoke-lifecycle.ps1

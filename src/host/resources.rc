@@ -7,11 +7,20 @@ IDI_APP_ICON ICON "app.ico"
 IDR_LICENSE_TEXT RCDATA "../../LICENSE"
 IDR_THIRD_PARTY_TEXT RCDATA "../../THIRD_PARTY_NOTICES.md"
 
+#if !defined(AIRSHOT_VERSION) || !defined(AIRSHOT_VERSION_MAJOR) || \
+    !defined(AIRSHOT_VERSION_MINOR) || !defined(AIRSHOT_VERSION_PATCH)
+#error Version definitions must be provided by CMake.
+#endif
+
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION AIRSHOT_VERSION_MAJOR,AIRSHOT_VERSION_MINOR,AIRSHOT_VERSION_PATCH,0
  PRODUCTVERSION AIRSHOT_VERSION_MAJOR,AIRSHOT_VERSION_MINOR,AIRSHOT_VERSION_PATCH,0
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
  FILEFLAGS 0x0L
+#endif
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_APP
  FILESUBTYPE VFT2_UNKNOWN
@@ -24,6 +33,7 @@ BEGIN
             VALUE "FileDescription", "Air Screenshot\0"
             VALUE "FileVersion", AIRSHOT_VERSION "\0"
             VALUE "InternalName", "AirScreenshot.exe\0"
+            VALUE "LegalCopyright", "Air Screenshot contributors\0"
             VALUE "OriginalFilename", "AirScreenshot.exe\0"
             VALUE "ProductName", "Air Screenshot\0"
             VALUE "ProductVersion", AIRSHOT_VERSION "\0"

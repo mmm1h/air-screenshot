@@ -29,6 +29,7 @@ public:
 
 private:
     bool create_render_target();
+    void discard_device_resources() noexcept;
     D2D1_RECT_F local_rect(const RectI& rect) const;
     void draw_annotation(const Annotation& annotation, bool preview);
     void draw_arrow(POINT start, POINT end, ID2D1Brush* brush, float width);

@@ -1,5 +1,7 @@
 #include "overlay_session.h"
 
+#include <dwmapi.h>
+
 #include <array>
 
 namespace airshot::overlay_detail {
@@ -20,6 +22,58 @@ void add_separator(std::vector<std::pair<std::wstring, std::wstring>>& items) {
         items.push_back({L"|", L""});
     }
 }
+
+class CaptureWindowHider {
+public:
+    CaptureWindowHider(HWND border, HWND control)
+        : border_(border), control_(control) {
+        border_hidden_ = hide_if_needed(border_);
+        control_hidden_ = hide_if_needed(control_);
+        if (border_hidden_ || control_hidden_) {
+            DwmFlush();
+        }
+    }
+
+    ~CaptureWindowHider() {
+        restore();
+    }
+
+    CaptureWindowHider(const CaptureWindowHider&) = delete;
+    CaptureWindowHider& operator=(const CaptureWindowHider&) = delete;
+
+    void restore() noexcept {
+        if (restored_) {
+            return;
+        }
+        restored_ = true;
+        if (border_hidden_ && border_ && IsWindow(border_)) {
+            ShowWindow(border_, SW_SHOWNOACTIVATE);
+        }
+        if (control_hidden_ && control_ && IsWindow(control_)) {
+            ShowWindow(control_, SW_SHOWNOACTIVATE);
+        }
+    }
+
+private:
+    static bool hide_if_needed(HWND window) noexcept {
+        if (!window || !IsWindow(window) || !IsWindowVisible(window)) {
+            return false;
+        }
+        DWORD affinity = WDA_NONE;
+        if (GetWindowDisplayAffinity(window, &affinity) &&
+            affinity == WDA_EXCLUDEFROMCAPTURE) {
+            return false;
+        }
+        ShowWindow(window, SW_HIDE);
+        return true;
+    }
+
+    HWND border_{};
+    HWND control_{};
+    bool border_hidden_{};
+    bool control_hidden_{};
+    bool restored_{};
+};
 
 struct ToolbarMetrics {
     int button_width;
@@ -114,6 +168,27 @@ int clamp_axis(int value, int size, int minimum, int maximum) {
         return minimum;
     }
     return std::clamp(value, minimum, maximum - size);
+}
+
+RectI toolbar_host_bounds(const std::vector<MonitorSnapshot>& monitors,
+                          const RectI& selection,
+                          const RectI& fallback) {
+    const MonitorSnapshot* best = nullptr;
+    std::int64_t best_area = -1;
+    for (const auto& monitor : monitors) {
+        const int left = std::max(selection.left, monitor.bounds.left);
+        const int top = std::max(selection.top, monitor.bounds.top);
+        const int right = std::min(selection.right, monitor.bounds.right);
+        const int bottom = std::min(selection.bottom, monitor.bounds.bottom);
+        const std::int64_t width = std::max(0, right - left);
+        const std::int64_t height = std::max(0, bottom - top);
+        const std::int64_t area = width * height;
+        if (area > best_area) {
+            best = &monitor;
+            best_area = area;
+        }
+    }
+    return best ? best->bounds : fallback;
 }
 
 void place_toolbar_rows(std::vector<ToolbarButton>& target,
@@ -216,51 +291,266 @@ void add_feishu_palette(std::vector<std::pair<std::wstring, std::wstring>>& item
     items.push_back({L"color_white", L""});
 }
 
-void blend_pixel(Bitmap& bitmap, int x, int y, COLORREF color, int alpha) {
-    if (x < 0 || y < 0 || x >= bitmap.width || y >= bitmap.height) {
-        return;
-    }
-    alpha = std::clamp(alpha, 0, 255);
-    const std::size_t index = static_cast<std::size_t>(y * bitmap.width + x) * 4U;
-    auto blend = [alpha](std::uint8_t dst, std::uint8_t src) {
-        return static_cast<std::uint8_t>((static_cast<int>(src) * alpha + static_cast<int>(dst) * (255 - alpha)) / 255);
-    };
-    bitmap.pixels[index] = blend(bitmap.pixels[index], GetBValue(color));
-    bitmap.pixels[index + 1] = blend(bitmap.pixels[index + 1], GetGValue(color));
-    bitmap.pixels[index + 2] = blend(bitmap.pixels[index + 2], GetRValue(color));
-    bitmap.pixels[index + 3] = 255;
-}
+class HighlightCoverage {
+public:
+    HighlightCoverage(const Bitmap& bitmap, std::span<const POINT> points, int radius)
+        : radius_(radius) {
+        if (!bitmap.valid() || points.empty() || radius <= 0) {
+            return;
+        }
 
-void blend_circle(Bitmap& bitmap, POINT center, int radius, COLORREF color, int alpha) {
-    const int radius_sq = radius * radius;
-    for (int y = center.y - radius; y <= center.y + radius; ++y) {
-        for (int x = center.x - radius; x <= center.x + radius; ++x) {
-            const int dx = x - center.x;
-            const int dy = y - center.y;
-            if (dx * dx + dy * dy <= radius_sq) {
-                blend_pixel(bitmap, x, y, color, alpha);
+        std::int64_t minimum_x = points.front().x;
+        std::int64_t minimum_y = points.front().y;
+        std::int64_t maximum_x = points.front().x;
+        std::int64_t maximum_y = points.front().y;
+        for (const POINT point : points.subspan(1)) {
+            minimum_x = std::min<std::int64_t>(minimum_x, point.x);
+            minimum_y = std::min<std::int64_t>(minimum_y, point.y);
+            maximum_x = std::max<std::int64_t>(maximum_x, point.x);
+            maximum_y = std::max<std::int64_t>(maximum_y, point.y);
+        }
+
+        left_ = static_cast<int>(
+            std::max<std::int64_t>(0, minimum_x - radius_));
+        top_ = static_cast<int>(
+            std::max<std::int64_t>(0, minimum_y - radius_));
+        const int right = static_cast<int>(std::min<std::int64_t>(
+            bitmap.width,
+            maximum_x + static_cast<std::int64_t>(radius_) + 1));
+        const int bottom = static_cast<int>(std::min<std::int64_t>(
+            bitmap.height,
+            maximum_y + static_cast<std::int64_t>(radius_) + 1));
+        width_ = right - left_;
+        height_ = bottom - top_;
+        if (width_ <= 0 || height_ <= 0) {
+            return;
+        }
+
+        const std::size_t row_width = static_cast<std::size_t>(width_);
+        const std::size_t row_count = static_cast<std::size_t>(height_);
+        if (row_count > std::numeric_limits<std::size_t>::max() / row_width) {
+            width_ = 0;
+            height_ = 0;
+            allocation_failed_ = true;
+            return;
+        }
+        try {
+            pixels_.resize(row_width * row_count);
+        } catch (const std::bad_alloc&) {
+            width_ = 0;
+            height_ = 0;
+            allocation_failed_ = true;
+        } catch (const std::length_error&) {
+            width_ = 0;
+            height_ = 0;
+            allocation_failed_ = true;
+        }
+    }
+
+    [[nodiscard]] bool valid() const noexcept {
+        return width_ > 0 && height_ > 0 && !pixels_.empty();
+    }
+
+    [[nodiscard]] bool allocation_failed() const noexcept {
+        return allocation_failed_;
+    }
+
+    void cover_line(POINT start, POINT end) noexcept {
+        std::int64_t x = start.x;
+        std::int64_t y = start.y;
+        const std::int64_t target_x = end.x;
+        const std::int64_t target_y = end.y;
+        const std::int64_t dx = std::abs(target_x - x);
+        const std::int64_t step_x = x < target_x ? 1 : -1;
+        const std::int64_t dy = -std::abs(target_y - y);
+        const std::int64_t step_y = y < target_y ? 1 : -1;
+        std::int64_t error = dx + dy;
+
+        while (true) {
+            cover_circle(x, y);
+            if (x == target_x && y == target_y) {
+                break;
+            }
+            const std::int64_t doubled_error = error * 2;
+            if (doubled_error >= dy) {
+                error += dy;
+                x += step_x;
+            }
+            if (doubled_error <= dx) {
+                error += dx;
+                y += step_y;
             }
         }
     }
+
+    void blend(Bitmap& bitmap, COLORREF color, int alpha) const noexcept {
+        alpha = std::clamp(alpha, 0, 255);
+        if (!valid() || alpha == 0) {
+            return;
+        }
+        const std::array<std::uint8_t, 3> source{
+            GetBValue(color),
+            GetGValue(color),
+            GetRValue(color),
+        };
+        for (int local_y = 0; local_y < height_; ++local_y) {
+            auto row = bitmap.row(top_ + local_y);
+            const std::size_t coverage_offset =
+                static_cast<std::size_t>(local_y) * static_cast<std::size_t>(width_);
+            for (int local_x = 0; local_x < width_; ++local_x) {
+                if (pixels_[coverage_offset + static_cast<std::size_t>(local_x)] == 0) {
+                    continue;
+                }
+                auto* destination =
+                    row.data() +
+                    static_cast<std::size_t>(left_ + local_x) * Bitmap::bytes_per_pixel;
+                for (std::size_t channel = 0; channel < source.size(); ++channel) {
+                    destination[channel] = static_cast<std::uint8_t>(
+                        (static_cast<int>(source[channel]) * alpha +
+                         static_cast<int>(destination[channel]) * (255 - alpha) + 127) /
+                        255);
+                }
+                destination[3] = 255;
+            }
+        }
+    }
+
+private:
+    void cover_circle(std::int64_t center_x, std::int64_t center_y) noexcept {
+        if (!valid()) {
+            return;
+        }
+        const std::int64_t start_x =
+            std::max<std::int64_t>(left_, center_x - radius_);
+        const std::int64_t start_y =
+            std::max<std::int64_t>(top_, center_y - radius_);
+        const std::int64_t end_x =
+            std::min<std::int64_t>(left_ + width_ - 1, center_x + radius_);
+        const std::int64_t end_y =
+            std::min<std::int64_t>(top_ + height_ - 1, center_y + radius_);
+        const std::int64_t radius_squared =
+            static_cast<std::int64_t>(radius_) * radius_;
+        for (std::int64_t y = start_y; y <= end_y; ++y) {
+            const std::int64_t delta_y = y - center_y;
+            const std::size_t row_offset =
+                static_cast<std::size_t>(y - top_) * static_cast<std::size_t>(width_);
+            for (std::int64_t x = start_x; x <= end_x; ++x) {
+                const std::int64_t delta_x = x - center_x;
+                if (delta_x * delta_x + delta_y * delta_y <= radius_squared) {
+                    pixels_[row_offset + static_cast<std::size_t>(x - left_)] = 255;
+                }
+            }
+        }
+    }
+
+    int left_{};
+    int top_{};
+    int width_{};
+    int height_{};
+    int radius_{};
+    bool allocation_failed_{};
+    std::vector<std::uint8_t> pixels_;
+};
+
+[[nodiscard]] bool blend_highlight(Bitmap& bitmap, const Annotation& annotation) {
+    const double requested_radius =
+        std::isfinite(annotation.width)
+            ? std::round(static_cast<double>(annotation.width) * 1.6)
+            : 4.0;
+    const int radius = static_cast<int>(
+        std::clamp(requested_radius, 4.0, 4096.0));
+
+    std::array<POINT, 2> endpoints{annotation.start, annotation.end};
+    const std::span<const POINT> points =
+        annotation.points.size() > 1
+            ? std::span<const POINT>(annotation.points)
+            : std::span<const POINT>(endpoints);
+    HighlightCoverage coverage(bitmap, points, radius);
+    if (!coverage.valid()) {
+        return !coverage.allocation_failed();
+    }
+
+    for (std::size_t index = 1; index < points.size(); ++index) {
+        coverage.cover_line(points[index - 1], points[index]);
+    }
+    if (points.size() == 1) {
+        coverage.cover_line(points.front(), points.front());
+    }
+    coverage.blend(bitmap, annotation.color, annotation.alpha);
+    return true;
 }
 
-void blend_line(Bitmap& bitmap, POINT start, POINT end, int radius, COLORREF color, int alpha) {
-    const int dx = end.x - start.x;
-    const int dy = end.y - start.y;
-    const int steps = std::max(std::abs(dx), std::abs(dy));
-    if (steps <= 0) {
-        blend_circle(bitmap, start, radius, color, alpha);
-        return;
+class ScreenDc {
+public:
+    ScreenDc() noexcept : value_(GetDC(nullptr)) {}
+    ~ScreenDc() {
+        if (value_) {
+            ReleaseDC(nullptr, value_);
+        }
     }
-    for (int index = 0; index <= steps; ++index) {
-        const double t = static_cast<double>(index) / static_cast<double>(steps);
-        POINT point{
-            static_cast<LONG>(std::lround(start.x + dx * t)),
-            static_cast<LONG>(std::lround(start.y + dy * t)),
-        };
-        blend_circle(bitmap, point, radius, color, alpha);
+    ScreenDc(const ScreenDc&) = delete;
+    ScreenDc& operator=(const ScreenDc&) = delete;
+
+    [[nodiscard]] HDC get() const noexcept { return value_; }
+
+private:
+    HDC value_{};
+};
+
+class MemoryDc {
+public:
+    explicit MemoryDc(HDC compatible_with) noexcept : value_(CreateCompatibleDC(compatible_with)) {}
+    ~MemoryDc() {
+        if (value_) {
+            DeleteDC(value_);
+        }
     }
-}
+    MemoryDc(const MemoryDc&) = delete;
+    MemoryDc& operator=(const MemoryDc&) = delete;
+
+    [[nodiscard]] HDC get() const noexcept { return value_; }
+
+private:
+    HDC value_{};
+};
+
+class OwnedGdiObject {
+public:
+    explicit OwnedGdiObject(HGDIOBJ value = nullptr) noexcept : value_(value) {}
+    ~OwnedGdiObject() {
+        if (value_) {
+            DeleteObject(value_);
+        }
+    }
+    OwnedGdiObject(const OwnedGdiObject&) = delete;
+    OwnedGdiObject& operator=(const OwnedGdiObject&) = delete;
+
+    [[nodiscard]] HGDIOBJ get() const noexcept { return value_; }
+
+private:
+    HGDIOBJ value_{};
+};
+
+class SelectedObject {
+public:
+    SelectedObject(HDC dc, HGDIOBJ object) noexcept
+        : dc_(dc), previous_(dc && object ? SelectObject(dc, object) : nullptr) {}
+    ~SelectedObject() {
+        if (valid()) {
+            SelectObject(dc_, previous_);
+        }
+    }
+    SelectedObject(const SelectedObject&) = delete;
+    SelectedObject& operator=(const SelectedObject&) = delete;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return previous_ != nullptr && previous_ != HGDI_ERROR;
+    }
+
+private:
+    HDC dc_{};
+    HGDIOBJ previous_{};
+};
 
 void draw_polyline(HDC dc, const std::vector<POINT>& points) {
     if (points.empty()) {
@@ -272,14 +562,17 @@ void draw_polyline(HDC dc, const std::vector<POINT>& points) {
     }
 }
 
-void draw_text_with_style(
+bool draw_text_with_style(
     HDC dc,
     const std::wstring& text,
     RECT bounds,
     COLORREF color,
     TextStyle style,
     HFONT font) {
-    HGDIOBJ previous_font = SelectObject(dc, font);
+    SelectedObject selected_font(dc, font);
+    if (!selected_font.valid()) {
+        return false;
+    }
     SetBkMode(dc, TRANSPARENT);
 
     RECT measured = bounds;
@@ -288,9 +581,11 @@ void draw_text_with_style(
     measured.bottom += 6;
 
     if (style == TextStyle::dark) {
-        HBRUSH background = CreateSolidBrush(RGB(31, 35, 41));
-        FillRect(dc, &measured, background);
-        DeleteObject(background);
+        OwnedGdiObject background(CreateSolidBrush(RGB(31, 35, 41)));
+        if (!background.get()) {
+            return false;
+        }
+        FillRect(dc, &measured, reinterpret_cast<HBRUSH>(background.get()));
         SetTextColor(dc, RGB(255, 255, 255));
         DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &bounds, DT_LEFT | DT_TOP);
     } else if (style == TextStyle::outline) {
@@ -312,42 +607,108 @@ void draw_text_with_style(
         DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &bounds, DT_LEFT | DT_TOP);
     }
 
-    SelectObject(dc, previous_font);
+    return true;
 }
 
-void draw_watermark_gdi(HDC dc, const Annotation& annotation, const AppConfig& config, int width, int height) {
+bool blend_watermark(HDC compatible_dc,
+                     std::uint8_t* target_bits,
+                     const Annotation& annotation,
+                     const AppConfig& config,
+                     int width,
+                     int height) {
     if (annotation.text.empty() || width <= 0 || height <= 0) {
-        return;
+        return true;
+    }
+    const int annotation_alpha = std::clamp(annotation.alpha, 0, 255);
+    if (annotation_alpha == 0 || !compatible_dc || !target_bits) {
+        return annotation_alpha == 0;
     }
 
-    HFONT font = CreateFontW(-static_cast<int>(std::max(12.0F, annotation.width)),
-                             0,
-                             -180,
-                             -180,
-                             FW_NORMAL,
-                             FALSE,
-                             FALSE,
-                             FALSE,
-                             DEFAULT_CHARSET,
-                             OUT_DEFAULT_PRECIS,
-                             CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY,
-                             DEFAULT_PITCH,
-                             config.text_font_family.c_str());
-    HGDIOBJ previous_font = SelectObject(dc, font);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, annotation.color);
+    MemoryDc mask_dc(compatible_dc);
+    if (!mask_dc.get()) {
+        return false;
+    }
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* mask_bits = nullptr;
+    OwnedGdiObject mask_dib(
+        CreateDIBSection(compatible_dc, &info, DIB_RGB_COLORS, &mask_bits, nullptr, 0));
+    if (!mask_dib.get() || !mask_bits) {
+        return false;
+    }
+    SelectedObject selected_bitmap(mask_dc.get(), mask_dib.get());
+    if (!selected_bitmap.valid()) {
+        return false;
+    }
+    const std::size_t byte_count =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * Bitmap::bytes_per_pixel;
+    std::memset(mask_bits, 0, byte_count);
+
+    OwnedGdiObject font(CreateFontW(-static_cast<int>(std::max(12.0F, annotation.width)),
+                                    0,
+                                    -180,
+                                    -180,
+                                    FW_NORMAL,
+                                    FALSE,
+                                    FALSE,
+                                    FALSE,
+                                    DEFAULT_CHARSET,
+                                    OUT_DEFAULT_PRECIS,
+                                    CLIP_DEFAULT_PRECIS,
+                                    ANTIALIASED_QUALITY,
+                                    DEFAULT_PITCH,
+                                    config.text_font_family.c_str()));
+    SelectedObject selected_font(mask_dc.get(), font.get());
+    if (!font.get() || !selected_font.valid()) {
+        return false;
+    }
+    SetBkMode(mask_dc.get(), TRANSPARENT);
+    SetTextColor(mask_dc.get(), RGB(255, 255, 255));
 
     const int step_x = std::max(120, static_cast<int>(annotation.text.size()) * 24 + 80);
     const int step_y = std::max(70, static_cast<int>(annotation.width * 3.2F));
     for (int y = -step_y; y < height + step_y; y += step_y) {
         for (int x = -step_x; x < width + step_x; x += step_x) {
-            TextOutW(dc, x, y, annotation.text.c_str(), static_cast<int>(annotation.text.size()));
+            if (!TextOutW(mask_dc.get(),
+                          x,
+                          y,
+                          annotation.text.c_str(),
+                          static_cast<int>(annotation.text.size()))) {
+                return false;
+            }
         }
     }
+    if (!GdiFlush()) {
+        return false;
+    }
 
-    SelectObject(dc, previous_font);
-    DeleteObject(font);
+    const auto* mask = static_cast<const std::uint8_t*>(mask_bits);
+    const std::uint8_t source_channels[]{
+        GetBValue(annotation.color),
+        GetGValue(annotation.color),
+        GetRValue(annotation.color),
+    };
+    for (std::size_t offset = 0; offset < byte_count; offset += Bitmap::bytes_per_pixel) {
+        const int coverage = std::max({mask[offset], mask[offset + 1], mask[offset + 2]});
+        const int alpha = (coverage * annotation_alpha + 127) / 255;
+        if (alpha == 0) {
+            continue;
+        }
+        for (std::size_t channel_index = 0; channel_index < 3; ++channel_index) {
+            target_bits[offset + channel_index] = static_cast<std::uint8_t>(
+                (static_cast<int>(source_channels[channel_index]) * alpha +
+                 static_cast<int>(target_bits[offset + channel_index]) * (255 - alpha) + 127) /
+                255);
+        }
+        target_bits[offset + 3] = 255;
+    }
+
+    return true;
 }
 
 }  // namespace
@@ -440,8 +801,9 @@ void OverlaySession::build_toolbar() {
     }
     trim_trailing_separators(items);
 
+    const RectI host_bounds = toolbar_host_bounds(monitors_, selection_, virtual_bounds_);
     const ToolbarMetrics metrics{40, 38, 5, 7};
-    const auto rows = wrap_toolbar_items(items, metrics, virtual_bounds_);
+    const auto rows = wrap_toolbar_items(items, metrics, host_bounds);
     const int total_width = toolbar_width(rows, metrics);
     const int total_height = toolbar_height(rows, metrics);
     if (rows.empty()) {
@@ -451,14 +813,14 @@ void OverlaySession::build_toolbar() {
     }
 
     const int preferred_left = selection_.right - total_width;
-    const int left = clamp_axis(preferred_left, total_width, virtual_bounds_.left, virtual_bounds_.right);
+    const int left = clamp_axis(preferred_left, total_width, host_bounds.left, host_bounds.right);
     const int below_top = selection_.bottom + 6;
     const int above_top = selection_.top - total_height - 6;
     int top = below_top;
-    if (below_top + total_height > virtual_bounds_.bottom && above_top >= virtual_bounds_.top) {
+    if (below_top + total_height > host_bounds.bottom && above_top >= host_bounds.top) {
         top = above_top;
     }
-    top = clamp_axis(top, total_height, virtual_bounds_.top, virtual_bounds_.bottom);
+    top = clamp_axis(top, total_height, host_bounds.top, host_bounds.bottom);
 
     place_toolbar_rows(toolbar_, rows, metrics, left, top);
     build_sub_toolbar();
@@ -528,8 +890,9 @@ void OverlaySession::build_sub_toolbar() {
     }
 
     if (toolbar_.empty()) return;
+    const RectI host_bounds = toolbar_host_bounds(monitors_, selection_, virtual_bounds_);
     const ToolbarMetrics metrics{34, 32, 5, 7};
-    const auto rows = wrap_toolbar_items(items, metrics, virtual_bounds_);
+    const auto rows = wrap_toolbar_items(items, metrics, host_bounds);
     const int total_width = toolbar_width(rows, metrics);
     const int total_height = toolbar_height(rows, metrics);
     if (rows.empty()) {
@@ -537,16 +900,17 @@ void OverlaySession::build_sub_toolbar() {
     }
 
     const RectI anchor = buttons_bounds(toolbar_);
-    const int left = clamp_axis(anchor.left - metrics.padding, total_width, virtual_bounds_.left, virtual_bounds_.right);
+    const int left =
+        clamp_axis(anchor.left - metrics.padding, total_width, host_bounds.left, host_bounds.right);
     const bool main_above = anchor.top < selection_.top;
     const int preferred_top = main_above ? anchor.top - total_height - 6 : anchor.bottom + 6;
     const int fallback_top = main_above ? anchor.bottom + 6 : anchor.top - total_height - 6;
     int top = preferred_top;
-    if ((top < virtual_bounds_.top || top + total_height > virtual_bounds_.bottom) &&
-        fallback_top >= virtual_bounds_.top && fallback_top + total_height <= virtual_bounds_.bottom) {
+    if ((top < host_bounds.top || top + total_height > host_bounds.bottom) &&
+        fallback_top >= host_bounds.top && fallback_top + total_height <= host_bounds.bottom) {
         top = fallback_top;
     }
-    top = clamp_axis(top, total_height, virtual_bounds_.top, virtual_bounds_.bottom);
+    top = clamp_axis(top, total_height, host_bounds.top, host_bounds.bottom);
 
     place_toolbar_rows(sub_toolbar_, rows, metrics, left, top);
 }
@@ -604,6 +968,10 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
     } else if (id == L"text_size_btn") {
         text_size_dropdown_open_ = !text_size_dropdown_open_;
     } else if (id == L"watermark_text") {
+        if (prompt_window_ && IsWindow(prompt_window_)) {
+            SetForegroundWindow(prompt_window_);
+            return;
+        }
         POINT position{};
         for (const auto& button : sub_toolbar_) {
             if (button.id == L"watermark_text") {
@@ -612,9 +980,19 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
             }
         }
         bool is_light = should_use_light_theme(request_.config.theme);
-        if (auto text = prompt_text(source, position, active_color_, active_text_size_, is_light)) {
-            watermark_text_ = *text;
-        }
+        prompt_window_ = show_text_prompt(
+            source,
+            position,
+            active_color_,
+            active_text_size_,
+            is_light,
+            [this](std::optional<std::wstring> text) {
+                prompt_window_ = nullptr;
+                if (!done_ && text) {
+                    watermark_text_ = std::move(*text);
+                    invalidate_all();
+                }
+            });
     } else if (id == L"watermark_apply") {
         apply_watermark();
     } else if (id == L"watermark_clear") {
@@ -740,46 +1118,21 @@ Bitmap OverlaySession::original_selection() const {
     return compose_selection(monitors_, selection_);
 }
 
-Bitmap OverlaySession::rendered_selection() const {
-    Bitmap result = original_selection();
-    for (const auto& annotation : annotations_) {
-        if (annotation.tool == Tool::mosaic) {
-            const int strength = std::clamp(annotation.alpha, 0, 100);
-            const int block_size = std::clamp(4 + strength / 8, 4, 18);
-            if (annotation.points.empty()) {
-                pixelate_rect(result, RectI{annotation.start.x, annotation.start.y, annotation.end.x, annotation.end.y}, block_size);
-            } else {
-                for (const POINT point : annotation.points) {
-                    pixelate_circle(result, point, 14, block_size);
-                }
-            }
-        } else if (annotation.tool == Tool::blur) {
-            const int strength = std::clamp(annotation.alpha, 0, 100);
-            const int rect_radius = std::clamp(3 + strength / 5, 3, 23);
-            const int circle_radius = std::clamp(2 + strength / 12, 2, 10);
-            if (annotation.points.empty()) {
-                blur_rect(result, RectI{annotation.start.x, annotation.start.y, annotation.end.x, annotation.end.y}, rect_radius);
-            } else {
-                for (const POINT point : annotation.points) {
-                    int radius = static_cast<int>(annotation.width * 3.5F);
-                    if (radius < 5) radius = 5;
-                    blur_circle(result, point, radius, circle_radius);
-                }
-            }
-        } else if (annotation.tool == Tool::highlight) {
-            const int radius = std::max(4, static_cast<int>(std::lround(annotation.width * 1.6F)));
-            if (annotation.points.size() > 1) {
-                for (std::size_t index = 1; index < annotation.points.size(); ++index) {
-                    blend_line(result, annotation.points[index - 1], annotation.points[index], radius, annotation.color, annotation.alpha);
-                }
-            } else {
-                blend_line(result, annotation.start, annotation.end, radius, annotation.color, annotation.alpha);
-            }
-        }
+Bitmap render_annotations(Bitmap result,
+                          const std::vector<Annotation>& annotations,
+                          const AppConfig& config) {
+    if (!result.valid()) {
+        return {};
     }
 
-    HDC screen = GetDC(nullptr);
-    HDC dc = CreateCompatibleDC(screen);
+    ScreenDc screen;
+    if (!screen.get()) {
+        return {};
+    }
+    MemoryDc dc(screen.get());
+    if (!dc.get()) {
+        return {};
+    }
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     info.bmiHeader.biWidth = result.width;
@@ -788,97 +1141,136 @@ Bitmap OverlaySession::rendered_selection() const {
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
     void* bits = nullptr;
-    HBITMAP dib = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-    HGDIOBJ previous_bitmap = SelectObject(dc, dib);
+    OwnedGdiObject dib(
+        CreateDIBSection(screen.get(), &info, DIB_RGB_COLORS, &bits, nullptr, 0));
+    if (!dib.get() || !bits) {
+        return {};
+    }
+    SelectedObject selected_bitmap(dc.get(), dib.get());
+    if (!selected_bitmap.valid()) {
+        return {};
+    }
     std::memcpy(bits, result.pixels.data(), result.pixels.size());
-    SetBkMode(dc, TRANSPARENT);
-    HGDIOBJ previous_brush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
-    HFONT font = CreateFontW(22,
-                             0,
-                             0,
-                             0,
-                             FW_NORMAL,
-                             FALSE,
-                             FALSE,
-                             FALSE,
-                             DEFAULT_CHARSET,
-                             OUT_DEFAULT_PRECIS,
-                             CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY,
-                             DEFAULT_PITCH,
-                             L"Microsoft YaHei");
-    HGDIOBJ previous_font = SelectObject(dc, font);
-    for (const auto& annotation : annotations_) {
-        HPEN pen = CreatePen(PS_SOLID, static_cast<int>(annotation.width), annotation.color);
-        HGDIOBJ previous_pen = SelectObject(dc, pen);
-        SetTextColor(dc, annotation.color);
+    SetBkMode(dc.get(), TRANSPARENT);
+    SelectedObject selected_brush(dc.get(), GetStockObject(HOLLOW_BRUSH));
+    if (!selected_brush.valid()) {
+        return {};
+    }
+    const auto sync_from_dib = [&]() {
+        if (!GdiFlush()) {
+            return false;
+        }
+        std::memcpy(result.pixels.data(), bits, result.pixels.size());
+        return true;
+    };
+    const auto sync_to_dib = [&]() {
+        std::memcpy(bits, result.pixels.data(), result.pixels.size());
+    };
 
-        if (annotation.tool == Tool::rectangle) {
-            const RectI bounds{annotation.start.x, annotation.start.y, annotation.end.x, annotation.end.y};
-            const RectI normalized = bounds.normalized();
-            Rectangle(dc, normalized.left, normalized.top, normalized.right, normalized.bottom);
-        } else if (annotation.tool == Tool::ellipse) {
-            const RectI bounds{annotation.start.x, annotation.start.y, annotation.end.x, annotation.end.y};
-            const RectI normalized = bounds.normalized();
-            Ellipse(dc, normalized.left, normalized.top, normalized.right, normalized.bottom);
-        } else if (annotation.tool == Tool::line) {
-            MoveToEx(dc, annotation.start.x, annotation.start.y, nullptr);
-            LineTo(dc, annotation.end.x, annotation.end.y);
-        } else if (annotation.tool == Tool::arrow) {
-            MoveToEx(dc, annotation.start.x, annotation.start.y, nullptr);
-            LineTo(dc, annotation.end.x, annotation.end.y);
-            const double angle = std::atan2(
-                static_cast<double>(annotation.end.y - annotation.start.y),
-                static_cast<double>(annotation.end.x - annotation.start.x));
-            const double length = 10.0 + annotation.width * 2.0;
-            for (double offset : {0.45, -0.45}) {
-                MoveToEx(dc, annotation.end.x, annotation.end.y, nullptr);
-                LineTo(dc,
-                       annotation.end.x - static_cast<int>(std::cos(angle + offset) * length),
-                       annotation.end.y - static_cast<int>(std::sin(angle + offset) * length));
+    for (const auto& annotation : annotations) {
+        if (annotation.tool == Tool::mosaic || annotation.tool == Tool::blur ||
+            annotation.tool == Tool::highlight) {
+            if (!sync_from_dib()) {
+                return {};
             }
-        } else if (annotation.tool == Tool::pen) {
-            draw_polyline(dc, annotation.points);
-        } else if (annotation.tool == Tool::text) {
-            HFONT text_font = CreateFontW(static_cast<int>(annotation.width),
-                                         0,
-                                         0,
-                                         0,
-                                         request_.config.text_font_bold ? FW_BOLD : FW_NORMAL,
-                                         request_.config.text_font_italic ? TRUE : FALSE,
-                                         FALSE,
-                                         FALSE,
-                                         DEFAULT_CHARSET,
-                                         OUT_DEFAULT_PRECIS,
-                                         CLIP_DEFAULT_PRECIS,
-                                         CLEARTYPE_QUALITY,
-                                         DEFAULT_PITCH,
-                                         request_.config.text_font_family.c_str());
+            if (annotation.tool == Tool::mosaic) {
+                const int strength = std::clamp(annotation.alpha, 0, 100);
+                const int block_size = std::clamp(4 + strength / 8, 4, 18);
+                if (annotation.points.empty()) {
+                    pixelate_rect(
+                        result,
+                        RectI{
+                            annotation.start.x,
+                            annotation.start.y,
+                            annotation.end.x,
+                            annotation.end.y,
+                        },
+                        block_size);
+                } else {
+                    for (const POINT point : annotation.points) {
+                        pixelate_circle(result, point, 14, block_size);
+                    }
+                }
+            } else if (annotation.tool == Tool::blur) {
+                const int strength = std::clamp(annotation.alpha, 0, 100);
+                const int rect_radius = std::clamp(3 + strength / 5, 3, 23);
+                const int circle_radius = std::clamp(2 + strength / 12, 2, 10);
+                if (annotation.points.empty()) {
+                    blur_rect(
+                        result,
+                        RectI{
+                            annotation.start.x,
+                            annotation.start.y,
+                            annotation.end.x,
+                            annotation.end.y,
+                        },
+                        rect_radius);
+                } else {
+                    for (const POINT point : annotation.points) {
+                        const int radius =
+                            std::max(5, static_cast<int>(annotation.width * 3.5F));
+                        blur_circle(result, point, radius, circle_radius);
+                    }
+                }
+            } else {
+                if (!blend_highlight(result, annotation)) {
+                    return {};
+                }
+            }
+            sync_to_dib();
+            continue;
+        }
+        if (annotation.tool == Tool::text) {
+            OwnedGdiObject text_font(
+                CreateFontW(static_cast<int>(annotation.width),
+                            0,
+                            0,
+                            0,
+                            config.text_font_bold ? FW_BOLD : FW_NORMAL,
+                            config.text_font_italic ? TRUE : FALSE,
+                            FALSE,
+                            FALSE,
+                            DEFAULT_CHARSET,
+                            OUT_DEFAULT_PRECIS,
+                            CLIP_DEFAULT_PRECIS,
+                            CLEARTYPE_QUALITY,
+                            DEFAULT_PITCH,
+                            config.text_font_family.c_str()));
+            if (!text_font.get()) {
+                return {};
+            }
             RECT text_rect{
                 annotation.start.x,
                 annotation.start.y,
                 result.width,
                 result.height,
             };
-            draw_text_with_style(dc, annotation.text, text_rect, annotation.color, annotation.text_style, text_font);
-            DeleteObject(text_font);
-        } else if (annotation.tool == Tool::serial) {
-            int radius = static_cast<int>(std::round(8.0F + annotation.width * 1.5F));
-            HBRUSH fill_brush = CreateSolidBrush(annotation.color);
-            HGDIOBJ old_fill = SelectObject(dc, fill_brush);
-            HPEN white_pen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
-            HGDIOBJ old_pen_in_bubble = SelectObject(dc, white_pen);
+            if (!draw_text_with_style(dc.get(),
+                                      annotation.text,
+                                      text_rect,
+                                      annotation.color,
+                                      annotation.text_style,
+                                      reinterpret_cast<HFONT>(text_font.get()))) {
+                return {};
+            }
+            continue;
+        }
+        if (annotation.tool == Tool::serial) {
+            const int radius = static_cast<int>(std::round(8.0F + annotation.width * 1.5F));
+            OwnedGdiObject fill_brush(CreateSolidBrush(annotation.color));
+            SelectedObject selected_fill(dc.get(), fill_brush.get());
+            OwnedGdiObject white_pen(CreatePen(PS_SOLID, 1, RGB(255, 255, 255)));
+            SelectedObject selected_white_pen(dc.get(), white_pen.get());
+            if (!fill_brush.get() || !selected_fill.valid() || !white_pen.get() ||
+                !selected_white_pen.valid()) {
+                return {};
+            }
 
-            Ellipse(dc,
+            Ellipse(dc.get(),
                     annotation.start.x - radius,
                     annotation.start.y - radius,
                     annotation.start.x + radius,
                     annotation.start.y + radius);
-
-            SelectObject(dc, old_fill);
-            DeleteObject(fill_brush);
-            SelectObject(dc, old_pen_in_bubble);
-            DeleteObject(white_pen);
 
             const std::wstring serial_text = std::to_wstring(annotation.serial);
             RECT text_rect{
@@ -887,60 +1279,145 @@ Bitmap OverlaySession::rendered_selection() const {
                 annotation.start.x + radius,
                 annotation.start.y + radius,
             };
-            int font_height = static_cast<int>(std::round(radius * 1.0F));
-            HFONT serial_font = CreateFontW(font_height,
-                                          0, 0, 0,
-                                          FW_BOLD,
-                                          FALSE, FALSE, FALSE,
-                                          DEFAULT_CHARSET,
-                                          OUT_DEFAULT_PRECIS,
-                                          CLIP_DEFAULT_PRECIS,
-                                          CLEARTYPE_QUALITY,
-                                          DEFAULT_PITCH,
-                                          L"Consolas");
-            HGDIOBJ old_font_in_bubble = SelectObject(dc, serial_font);
-            SetTextColor(dc, RGB(255, 255, 255));
-            DrawTextW(dc, serial_text.c_str(), static_cast<int>(serial_text.size()), &text_rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(dc, old_font_in_bubble);
-            DeleteObject(serial_font);
-        } else if (annotation.tool == Tool::watermark) {
-            draw_watermark_gdi(dc, annotation, request_.config, result.width, result.height);
+            const int font_height = static_cast<int>(std::round(radius * 1.0F));
+            OwnedGdiObject serial_font(CreateFontW(font_height,
+                                                   0,
+                                                   0,
+                                                   0,
+                                                   FW_BOLD,
+                                                   FALSE,
+                                                   FALSE,
+                                                   FALSE,
+                                                   DEFAULT_CHARSET,
+                                                   OUT_DEFAULT_PRECIS,
+                                                   CLIP_DEFAULT_PRECIS,
+                                                   CLEARTYPE_QUALITY,
+                                                   DEFAULT_PITCH,
+                                                   L"Consolas"));
+            SelectedObject selected_serial_font(dc.get(), serial_font.get());
+            if (!serial_font.get() || !selected_serial_font.valid()) {
+                return {};
+            }
+            SetTextColor(dc.get(), RGB(255, 255, 255));
+            DrawTextW(dc.get(),
+                      serial_text.c_str(),
+                      static_cast<int>(serial_text.size()),
+                      &text_rect,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            continue;
         }
-        SelectObject(dc, previous_pen);
-        DeleteObject(pen);
+        if (annotation.tool == Tool::watermark) {
+            if (!GdiFlush() ||
+                !blend_watermark(
+                    dc.get(),
+                    static_cast<std::uint8_t*>(bits),
+                    annotation,
+                    config,
+                    result.width,
+                    result.height)) {
+                return {};
+            }
+            continue;
+        }
+        if (annotation.tool != Tool::rectangle && annotation.tool != Tool::ellipse &&
+            annotation.tool != Tool::line && annotation.tool != Tool::arrow &&
+            annotation.tool != Tool::pen) {
+            continue;
+        }
+
+        const int pen_width =
+            std::clamp(static_cast<int>(std::lround(annotation.width)), 1, 1024);
+        OwnedGdiObject pen(CreatePen(PS_SOLID, pen_width, annotation.color));
+        SelectedObject selected_pen(dc.get(), pen.get());
+        if (!pen.get() || !selected_pen.valid()) {
+            return {};
+        }
+        SetTextColor(dc.get(), annotation.color);
+
+        if (annotation.tool == Tool::rectangle) {
+            const RectI bounds{annotation.start.x, annotation.start.y, annotation.end.x, annotation.end.y};
+            const RectI normalized = bounds.normalized();
+            Rectangle(dc.get(), normalized.left, normalized.top, normalized.right, normalized.bottom);
+        } else if (annotation.tool == Tool::ellipse) {
+            const RectI bounds{annotation.start.x, annotation.start.y, annotation.end.x, annotation.end.y};
+            const RectI normalized = bounds.normalized();
+            Ellipse(dc.get(), normalized.left, normalized.top, normalized.right, normalized.bottom);
+        } else if (annotation.tool == Tool::line) {
+            MoveToEx(dc.get(), annotation.start.x, annotation.start.y, nullptr);
+            LineTo(dc.get(), annotation.end.x, annotation.end.y);
+        } else if (annotation.tool == Tool::arrow) {
+            MoveToEx(dc.get(), annotation.start.x, annotation.start.y, nullptr);
+            LineTo(dc.get(), annotation.end.x, annotation.end.y);
+            const double angle = std::atan2(
+                static_cast<double>(annotation.end.y - annotation.start.y),
+                static_cast<double>(annotation.end.x - annotation.start.x));
+            const double length = 10.0 + annotation.width * 2.0;
+            for (double offset : {0.45, -0.45}) {
+                MoveToEx(dc.get(), annotation.end.x, annotation.end.y, nullptr);
+                LineTo(dc.get(),
+                       annotation.end.x - static_cast<int>(std::cos(angle + offset) * length),
+                       annotation.end.y - static_cast<int>(std::sin(angle + offset) * length));
+            }
+        } else if (annotation.tool == Tool::pen) {
+            draw_polyline(dc.get(), annotation.points);
+        }
     }
-    std::memcpy(result.pixels.data(), bits, result.pixels.size());
-    SelectObject(dc, previous_font);
-    SelectObject(dc, previous_brush);
-    SelectObject(dc, previous_bitmap);
-    DeleteObject(font);
-    DeleteObject(dib);
-    DeleteDC(dc);
-    ReleaseDC(nullptr, screen);
+    if (!sync_from_dib()) {
+        return {};
+    }
+    result.make_opaque();
     return result;
 }
 
+Bitmap OverlaySession::rendered_selection() const {
+    return render_annotations(original_selection(), annotations_, request_.config);
+}
+
 void OverlaySession::complete_clipboard() {
+    Bitmap rendered = rendered_selection();
+    if (rendered.empty()) {
+        finish({ExitCode::operation_failed, L"无法生成截图图像。"});
+        return;
+    }
     std::wstring error;
-    if (!copy_bitmap_to_clipboard(rendered_selection(), &error)) {
+    if (!copy_bitmap_to_clipboard(rendered, &error)) {
         finish({ExitCode::operation_failed, std::move(error)});
         return;
     }
     finish({ExitCode::success, L"截图已复制到剪贴板。"});
 }
 
+void OverlaySession::complete_default(HWND owner) {
+    if (_wcsicmp(request_.config.default_output.c_str(), L"file") == 0) {
+        complete_file({}, owner);
+    } else {
+        complete_clipboard();
+    }
+}
+
 void OverlaySession::complete_file(std::wstring_view requested_path, HWND owner) {
     std::optional<std::filesystem::path> path;
     if (requested_path.empty() && request_.action == RegionAction::interactive) {
+        enter_modal();
         path = prompt_png_path(owner);
+        if (done_) {
+            leave_modal();
+            return;
+        }
+        leave_modal();
         if (!path) {
             return;
         }
     } else {
         path = resolve_output_path(requested_path);
     }
+    Bitmap rendered = rendered_selection();
+    if (rendered.empty()) {
+        finish({ExitCode::operation_failed, L"无法生成截图图像。"});
+        return;
+    }
     std::wstring error;
-    if (!save_png(rendered_selection(), *path, &error)) {
+    if (!save_png(rendered, *path, &error)) {
         finish({ExitCode::operation_failed, std::move(error)});
         return;
     }
@@ -972,128 +1449,235 @@ void OverlaySession::complete_ocr() {
 }
 
 void OverlaySession::complete_pin() {
+    Bitmap rendered = rendered_selection();
+    if (rendered.empty()) {
+        finish({ExitCode::operation_failed, L"无法生成贴图图像。"});
+        return;
+    }
     RegionResult result{ExitCode::success, L"贴图已创建。"};
     result.action = RegionAction::pin;
-    result.bitmap = rendered_selection();
+    result.bitmap = std::move(rendered);
     finish(std::move(result));
 }
 
 void OverlaySession::complete_scroll(HWND source) {
+    if (selection_.width() < 64 || selection_.height() < 64) {
+        enter_modal();
+        MessageBoxW(source, L"长截图选区至少需要 64 x 64 像素。", kAppName, MB_OK | MB_ICONINFORMATION);
+        leave_modal();
+        return;
+    }
+    if (!annotations_.empty()) {
+        enter_modal();
+        MessageBoxW(source, L"请先撤销标注，再开始长截图。", kAppName, MB_OK | MB_ICONINFORMATION);
+        leave_modal();
+        return;
+    }
     for (const auto& window : windows_) {
         ShowWindow(window->hwnd(), SW_HIDE);
     }
+    DwmFlush();
     run_scroll_capture(source);
 }
 
 void OverlaySession::run_scroll_capture(HWND source) {
-    Bitmap stitched = compose_selection(monitors_, selection_);
-    if (stitched.empty()) {
+    Bitmap first_frame = capture_rect(selection_);
+    if (first_frame.empty()) {
         finish({ExitCode::operation_failed, L"长截图初始化失败。"});
         return;
     }
-    Bitmap last_stitched_frame = stitched;
-    Bitmap last_cap = stitched;
+
+    auto active = std::make_unique<ActiveScrollCapture>();
+    active->last_frame = first_frame;
+    active->stitcher = std::make_unique<ScrollStitcher>(std::move(first_frame));
+    if (!active->stitcher->valid()) {
+        finish({ExitCode::operation_failed, L"长截图选区过大或初始化失败。"});
+        return;
+    }
 
     HINSTANCE instance = GetModuleHandleW(nullptr);
-    HWND border_wnd = create_scroll_border_window(instance, source, selection_);
-    ScrollControlState control_state;
-    HWND control_wnd = create_scroll_control_window(instance, source, selection_, &control_state);
-    if (control_wnd) {
-        std::wstring progress = std::format(L"{} px", stitched.height);
-        SetWindowTextW(control_wnd, progress.c_str());
+    active->border_window = create_scroll_border_window(instance, source, selection_);
+    active->control_state.on_tick = [this] { capture_scroll_frame(); };
+    active->control_state.on_finish = [this] { finish_scroll_capture(false); };
+    active->control_state.on_cancel = [this] { finish_scroll_capture(true); };
+    active->control_window =
+        create_scroll_control_window(instance, source, selection_, &active->control_state);
+    if (!active->control_window) {
+        if (active->border_window) {
+            DestroyWindow(active->border_window);
+        }
+        finish({ExitCode::operation_failed, L"无法创建长截图控制窗口。"});
+        return;
+    }
+    std::wstring progress = std::format(L"{} px", active->stitcher->height());
+    SetWindowTextW(active->control_window, progress.c_str());
+    scroll_capture_ = std::move(active);
+}
+
+void OverlaySession::capture_scroll_frame() {
+    if (!scroll_capture_ || scroll_capture_->processing || scroll_capture_->paused || done_) {
+        return;
     }
 
-    UINT_PTR timer_id = SetTimer(source, 999, 80, nullptr);
-    int locked_direction = 0; // 0 = undecided, 1 = down, -1 = up
-    int consecutive_failures = 0;
+    ActiveScrollCapture& active = *scroll_capture_;
+    active.processing = true;
+    const HWND control = active.control_window;
+    CaptureWindowHider hidden_windows(active.border_window, control);
+    Bitmap new_frame = capture_rect(selection_);
+    hidden_windows.restore();
 
-    MSG msg{};
-    while (IsWindow(control_wnd) && !control_state.finished && !control_state.cancelled) {
-        if (GetAsyncKeyState(VK_RETURN) & 0x8000) {
-            control_state.finished = true;
-            break;
-        }
-        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
-            control_state.cancelled = true;
-            break;
-        }
-        if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_TIMER && msg.wParam == 999) {
-                Bitmap new_frame = capture_rect(selection_);
-                if (!new_frame.empty()) {
-                    ScrollResult res = detect_scroll(last_stitched_frame, new_frame, locked_direction);
-                    if (res.matched) {
-                        consecutive_failures = 0;
-                        if (res.direction != 0 && res.offset > 0) {
-                            if (locked_direction == 0) {
-                                locked_direction = res.direction;
-                            }
-                            if (res.direction == locked_direction) {
-                                if (locked_direction == 1) {
-                                    append_to_stitched(stitched, new_frame, res.offset);
-                                } else {
-                                    prepend_to_stitched(stitched, new_frame, res.offset);
-                                }
-                                last_stitched_frame = new_frame;
-                            }
-                        }
-                    } else {
-                        if (locked_direction != 0) {
-                            consecutive_failures++;
-                            if (consecutive_failures >= 4) {
-                                // Lost matching anchor. Re-anchor to current frame.
-                                last_stitched_frame = new_frame;
-                                consecutive_failures = 0;
-                            }
-                        }
-                    }
-
-                    std::wstring progress = std::format(L"{} px", stitched.height);
-                    SetWindowTextW(control_wnd, progress.c_str());
-                    last_cap = new_frame;
-                }
-            }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+    if (new_frame.empty()) {
+        ++active.consecutive_failures;
+    } else {
+        const ScrollResult detected =
+            detect_scroll(active.last_frame, new_frame, active.locked_direction);
+        if (detected.status() == ScrollResult::Status::unchanged) {
+            active.consecutive_failures = 0;
+        } else if (detected.status() == ScrollResult::Status::mismatch) {
+            ++active.consecutive_failures;
+        } else if (active.locked_direction != 0 &&
+                   detected.direction != active.locked_direction) {
+            active.paused = true;
+            active.pause_text = L"反向暂停";
         } else {
-            Sleep(10);
+            if (active.locked_direction == 0) {
+                active.locked_direction = detected.direction;
+            }
+            const StitchStatus status =
+                detected.direction > 0
+                    ? active.stitcher->append(new_frame, detected.offset)
+                    : active.stitcher->prepend(new_frame, detected.offset);
+            if (status == StitchStatus::success) {
+                active.last_frame = std::move(new_frame);
+                active.consecutive_failures = 0;
+            } else if (status == StitchStatus::limit_reached) {
+                active.paused = true;
+                active.pause_text = L"已达上限";
+            } else {
+                active.paused = true;
+                active.pause_text =
+                    status == StitchStatus::allocation_failed ? L"内存不足" : L"拼接已暂停";
+            }
         }
     }
 
-    KillTimer(source, timer_id);
-    if (border_wnd) DestroyWindow(border_wnd);
-    if (control_wnd) DestroyWindow(control_wnd);
+    if (!active.paused && active.consecutive_failures >= 4) {
+        active.paused = true;
+        active.pause_text = L"匹配暂停";
+    }
 
-    if (control_state.cancelled) {
+    if (control && IsWindow(control)) {
+        if (active.paused) {
+            KillTimer(control, kScrollCaptureTimer);
+        }
+        const std::wstring progress =
+            active.paused ? active.pause_text : std::format(L"{} px", active.stitcher->height());
+        SetWindowTextW(control, progress.c_str());
+    }
+    active.processing = false;
+}
+
+void OverlaySession::finish_scroll_capture(bool cancelled) {
+    if (!scroll_capture_ || done_) {
+        return;
+    }
+    if (scroll_capture_->control_window && IsWindow(scroll_capture_->control_window)) {
+        KillTimer(scroll_capture_->control_window, kScrollCaptureTimer);
+    }
+    if (cancelled) {
+        destroy_scroll_windows();
         finish({ExitCode::user_cancelled, L"长截图已取消。"});
         return;
     }
 
-    std::wstring error;
-    bool saved = false;
-    std::wstring path_msg;
-    if (request_.action == RegionAction::file || request_.config.default_output == L"file") {
-        auto path = prompt_png_path(source);
-        if (path) {
-            if (save_png(stitched, *path, &error)) {
-                saved = true;
-                path_msg = path->wstring();
-            }
-        }
+    Bitmap stitched;
+    const StitchStatus materialized = scroll_capture_->stitcher->materialize(stitched);
+    destroy_scroll_windows();
+    if (materialized != StitchStatus::success || stitched.empty()) {
+        finish({ExitCode::operation_failed, L"长截图合并失败。"});
+        return;
     }
-    if (!saved) {
+    std::wstring error;
+    const bool save_to_file =
+        request_.action == RegionAction::file ||
+        _wcsicmp(request_.config.default_output.c_str(), L"file") == 0;
+    if (save_to_file) {
+        HWND owner = windows_.empty() ? nullptr : windows_.front()->hwnd();
+        std::optional<std::filesystem::path> path;
+        if (request_.action == RegionAction::file && !request_.path.empty()) {
+            path = resolve_output_path(request_.path);
+        } else {
+            enter_modal();
+            path = prompt_png_path(owner);
+            if (done_) {
+                leave_modal();
+                return;
+            }
+            leave_modal();
+        }
+        if (!path) {
+            finish({ExitCode::user_cancelled, L"已取消保存。"});
+            return;
+        }
+        if (!save_png(stitched, *path, &error)) {
+            finish({ExitCode::operation_failed, std::move(error)});
+            return;
+        }
+        RegionResult result{ExitCode::success, L"长截图已保存。"};
+        result.path = path->wstring();
+        result.bitmap = std::move(stitched);
+        finish(std::move(result));
+    } else {
         if (!copy_bitmap_to_clipboard(stitched, &error)) {
             finish({ExitCode::operation_failed, std::move(error)});
             return;
         }
+        RegionResult result{ExitCode::success, L"长截图已复制到剪贴板。"};
+        result.bitmap = std::move(stitched);
+        finish(std::move(result));
     }
+}
 
-    RegionResult result{ExitCode::success, saved ? L"长截图已保存。" : L"长截图已复制到剪贴板。"};
-    if (saved) {
-        result.path = path_msg;
+void OverlaySession::destroy_scroll_windows() {
+    if (!scroll_capture_) {
+        return;
     }
-    result.bitmap = stitched;
-    finish(std::move(result));
+    const HWND border = scroll_capture_->border_window;
+    const HWND control = scroll_capture_->control_window;
+    scroll_capture_->border_window = nullptr;
+    scroll_capture_->control_window = nullptr;
+    scroll_capture_->control_state.on_tick = {};
+    scroll_capture_->control_state.on_finish = {};
+    scroll_capture_->control_state.on_cancel = {};
+    if (control && IsWindow(control)) {
+        KillTimer(control, kScrollBlinkTimer);
+        KillTimer(control, kScrollCaptureTimer);
+        DestroyWindow(control);
+    }
+    if (border && IsWindow(border)) DestroyWindow(border);
+    scroll_capture_.reset();
+}
+
+void OverlaySession::enter_modal() noexcept {
+    ++modal_depth_;
+}
+
+void OverlaySession::leave_modal() {
+    if (modal_depth_ == 0) {
+        return;
+    }
+    --modal_depth_;
+    if (modal_depth_ == 0 && completion_pending_) {
+        completion_pending_ = false;
+        deliver_completion();
+    }
+}
+
+void OverlaySession::deliver_completion() {
+    if (completion_) {
+        auto completion = std::move(completion_);
+        completion(std::move(result_));
+    }
 }
 
 void OverlaySession::finish(RegionResult result) {
@@ -1109,8 +1693,18 @@ void OverlaySession::finish(RegionResult result) {
     }
     result_.config = request_.config;
     done_ = true;
+    if (prompt_window_ && IsWindow(prompt_window_)) {
+        DestroyWindow(prompt_window_);
+    }
+    prompt_window_ = nullptr;
+    destroy_scroll_windows();
     for (const auto& window : windows_) {
         ShowWindow(window->hwnd(), SW_HIDE);
+    }
+    if (modal_depth_ != 0) {
+        completion_pending_ = true;
+    } else {
+        deliver_completion();
     }
 }
 

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Executable = (Join-Path (Split-Path -Parent $PSScriptRoot) "build\AirScreenshot.exe")
+    [string]$Executable = (Join-Path (Split-Path -Parent $PSScriptRoot) "build\release\bin\AirScreenshot.exe")
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,7 +27,10 @@ function Invoke-AirScreenshot {
     try {
         $process = Start-Process -FilePath $Path -ArgumentList $Arguments -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-        $process.WaitForExit()
+        if (-not $process.WaitForExit(30000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            throw "Air Screenshot command timed out after 30 seconds: $Path $($Arguments -join ' ')"
+        }
         [pscustomobject]@{
             ExitCode = $process.ExitCode
             Output = if (Test-Path $stdout) { ((Get-Content $stdout -ErrorAction SilentlyContinue) -join "`n").Trim() } else { "" }
@@ -39,12 +42,108 @@ function Invoke-AirScreenshot {
     }
 }
 
+function Wait-AirScreenshotProcessesExited {
+    param([int]$TimeoutMilliseconds = 5000)
+
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $remaining = @(
+            Get-Process AirScreenshot -ErrorAction SilentlyContinue |
+                Where-Object {
+                    try {
+                        $_.Path -and $_.Path.StartsWith(
+                            $temporary,
+                            [StringComparison]::OrdinalIgnoreCase
+                        )
+                    }
+                    catch {
+                        $false
+                    }
+                }
+        )
+        if ($remaining.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 50
+    } while ($watch.ElapsedMilliseconds -lt $TimeoutMilliseconds)
+
+    $details = ($remaining | Select-Object Id, Path | Out-String).Trim()
+    throw "Air Screenshot processes did not exit within $TimeoutMilliseconds ms: $details"
+}
+
+function Stop-AirScreenshot {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $stop = Invoke-AirScreenshot $Path @("app", "stop")
+    if ($stop.ExitCode -ne 0) {
+        throw "宿主停止失败：$($stop.Output) $($stop.Error)"
+    }
+    Wait-AirScreenshotProcessesExited
+}
+
+function Test-PngSignature {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $signature = [byte[]]::new(8)
+        if ($stream.Read($signature, 0, $signature.Length) -ne $signature.Length) {
+            return $false
+        }
+        return [Convert]::ToHexString($signature) -eq "89504E470D0A1A0A"
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Invoke-DirectoryCapture {
+    param(
+        [Parameter(Mandatory)][string]$ExecutablePath,
+        [Parameter(Mandatory)][string]$RequestedPath,
+        [Parameter(Mandatory)][string]$ExpectedDirectory
+    )
+
+    $capture = Invoke-AirScreenshot $ExecutablePath @(
+        "capture", "screen", "--monitor", "primary", "--output", "file",
+        "--path", "`"$RequestedPath`"", "--json"
+    )
+    if ($capture.ExitCode -ne 0) {
+        throw "目录截图失败：$($capture.Output) $($capture.Error)"
+    }
+    try {
+        $response = $capture.Output | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "目录截图未返回有效 JSON：$($capture.Output)"
+    }
+    if (-not $response.ok -or $response.code -ne 0 -or [string]::IsNullOrWhiteSpace($response.path)) {
+        throw "目录截图响应不完整：$($capture.Output)"
+    }
+
+    $actualPath = [IO.Path]::GetFullPath([string]$response.path)
+    $actualDirectory = [IO.Path]::GetDirectoryName($actualPath)
+    $expectedFullDirectory = [IO.Path]::GetFullPath($ExpectedDirectory).TrimEnd('\', '/')
+    if (-not $actualDirectory.Equals($expectedFullDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "截图未保存到请求目录。请求：$expectedFullDirectory；实际：$actualPath"
+    }
+    if ([IO.Path]::GetExtension($actualPath) -ine ".png" -or -not (Test-PngSignature $actualPath)) {
+        throw "目录截图不是有效 PNG：$actualPath"
+    }
+    return $actualPath
+}
+
 try {
     $existing = Get-Process AirScreenshot -ErrorAction SilentlyContinue
     if ($existing) {
         throw "运行便携烟测前请先退出现有 Air Screenshot 进程。"
     }
     New-Item -ItemType Directory -Path $firstDirectory, $movedDirectory -Force | Out-Null
+    New-Item -ItemType Directory -Path $env:AIRSHOT_DATA_DIR -Force | Out-Null
     $firstExecutable = Join-Path $firstDirectory "AirScreenshot.exe"
     $movedExecutable = Join-Path $movedDirectory "AirScreenshot.exe"
     Copy-Item -LiteralPath $Executable -Destination $firstExecutable
@@ -64,28 +163,58 @@ try {
     if ($capture.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $capturePath) -or (Get-Item $capturePath).Length -eq 0) {
         throw "全屏截图与文件保存失败：$($capture.Output) $($capture.Error)"
     }
+    if (-not (Test-PngSignature $capturePath)) {
+        throw "全屏截图文件没有有效 PNG 签名：$capturePath"
+    }
+
+    $existingOutputDirectory = Join-Path $temporary "existing-output"
+    New-Item -ItemType Directory -Path $existingOutputDirectory | Out-Null
+    $existingDirectoryCapture = Invoke-DirectoryCapture `
+        -ExecutablePath $firstExecutable `
+        -RequestedPath $existingOutputDirectory `
+        -ExpectedDirectory $existingOutputDirectory
+
+    $trailingOutputDirectory = Join-Path $temporary "trailing-output"
+    $trailingDirectoryArgument = ($trailingOutputDirectory -replace '\\', '/') + "/"
+    $trailingDirectoryCapture = Invoke-DirectoryCapture `
+        -ExecutablePath $firstExecutable `
+        -RequestedPath $trailingDirectoryArgument `
+        -ExpectedDirectory $trailingOutputDirectory
+    if (-not (Test-Path -LiteralPath $trailingOutputDirectory -PathType Container)) {
+        throw "尾部分隔符指定的不存在目录未被创建。"
+    }
+    if ($existingDirectoryCapture -eq $trailingDirectoryCapture) {
+        throw "两个目录截图意外返回同一路径。"
+    }
+
+    if ((Get-ItemProperty -LiteralPath $runKey -Name AirScreenshot -ErrorAction SilentlyContinue).AirScreenshot) {
+        throw "全新配置不应默认创建开机启动项。"
+    }
+    Stop-AirScreenshot -Path $firstExecutable
+
+    Set-Content -LiteralPath (Join-Path $env:AIRSHOT_DATA_DIR "config.v2.json") `
+        -Value '{"schemaVersion":2,"shell":{"enabled":true,"startAtLogin":true}}' -Encoding utf8NoBOM
+    Invoke-AirScreenshot $firstExecutable @("app", "start") | Out-Null
+    Start-Sleep -Milliseconds 500
     $runValue = (Get-ItemProperty -LiteralPath $runKey -Name AirScreenshot).AirScreenshot
-    if ($runValue -ne "`"$firstExecutable`"") { throw "首次启动未写入正确启动项：$runValue" }
-    Invoke-AirScreenshot $firstExecutable @("app", "stop") | Out-Null
-    Get-Process AirScreenshot -ErrorAction SilentlyContinue | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+    if ($runValue -ne "`"$firstExecutable`"") { throw "显式启用开机启动后路径不正确：$runValue" }
+    Stop-AirScreenshot -Path $firstExecutable
 
     Move-Item -LiteralPath $firstExecutable -Destination $movedExecutable
     Invoke-AirScreenshot $movedExecutable @("app", "start") | Out-Null
     Start-Sleep -Milliseconds 500
     $runValue = (Get-ItemProperty -LiteralPath $runKey -Name AirScreenshot).AirScreenshot
     if ($runValue -ne "`"$movedExecutable`"") { throw "移动后未修复启动项：$runValue" }
-    Invoke-AirScreenshot $movedExecutable @("app", "stop") | Out-Null
-    Get-Process AirScreenshot -ErrorAction SilentlyContinue | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+    Stop-AirScreenshot -Path $movedExecutable
 
-    Set-Content -LiteralPath (Join-Path $env:AIRSHOT_DATA_DIR "config.json") `
-        -Value '{"shell":{"enabled":true,"startAtLogin":false}}' -Encoding utf8NoBOM
+    Set-Content -LiteralPath (Join-Path $env:AIRSHOT_DATA_DIR "config.v2.json") `
+        -Value '{"schemaVersion":2,"shell":{"enabled":true,"startAtLogin":false}}' -Encoding utf8NoBOM
     Invoke-AirScreenshot $movedExecutable @("app", "start") | Out-Null
     Start-Sleep -Milliseconds 500
     if ((Get-ItemProperty -LiteralPath $runKey -Name AirScreenshot -ErrorAction SilentlyContinue).AirScreenshot) {
         throw "关闭开机启动后未删除启动项。"
     }
-    Invoke-AirScreenshot $movedExecutable @("app", "stop") | Out-Null
-    Get-Process AirScreenshot -ErrorAction SilentlyContinue | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+    Stop-AirScreenshot -Path $movedExecutable
 
     Set-ItemProperty -LiteralPath $movedExecutable -Name IsReadOnly -Value $true
     $readOnlyCheck = Invoke-AirScreenshot $movedExecutable @("--check-update-target")
@@ -96,12 +225,17 @@ try {
 
     $replacementTarget = Join-Path $temporary "replacement.exe"
     Set-Content -LiteralPath $replacementTarget -Value "old"
+    $replacementHash = (Get-FileHash $replacementTarget -Algorithm SHA256).Hash
+    $unusedProcessId = [int]::MaxValue
+    while (Get-Process -Id $unusedProcessId -ErrorAction SilentlyContinue) {
+        $unusedProcessId--
+    }
     $updater = Start-Process -FilePath $movedExecutable `
-        -ArgumentList @("--apply-update", "`"$replacementTarget`"", "0", "no-restart") `
+        -ArgumentList @("--apply-update", "`"$replacementTarget`"", "$unusedProcessId", "no-restart") `
         -Wait -PassThru -WindowStyle Hidden
-    if ($updater.ExitCode -ne 0 -or
-        (Get-FileHash $replacementTarget -Algorithm SHA256).Hash -ne (Get-FileHash $movedExecutable -Algorithm SHA256).Hash) {
-        throw "便携更新替换器未正确覆盖目标文件。"
+    if ($updater.ExitCode -eq 0 -or
+        (Get-FileHash $replacementTarget -Algorithm SHA256).Hash -ne $replacementHash) {
+        throw "便携更新替换器未拒绝不存在的非零父进程。"
     }
 
     Write-Host "便携版烟测通过。"

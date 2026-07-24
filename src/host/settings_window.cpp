@@ -7,18 +7,57 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdint>
 #include <mutex>
 #include <vector>
 #include <string>
 #include <format>
 #include <cwctype>
+#include <iterator>
 #include <windowsx.h>
 #include <thread>
 #include <filesystem>
 #include <dwmapi.h>
+#include <new>
 
 namespace airshot {
 namespace {
+
+constexpr int kSettingsWidth = 740;
+constexpr int kSettingsHeight = 760;
+constexpr int kWorkAreaMargin = 8;
+constexpr int kGeneralSwitchCount = 7;
+constexpr int kGeneralRowHeight = 34;
+
+enum class SettingsFocusKind {
+    tab,
+    general_switch,
+    font_family,
+    reset_serial,
+    text_bold,
+    text_italic,
+    ocr_engine,
+    download_ocr,
+    theme,
+    toolbar_item,
+    toolbar_visibility,
+    toolbar_move_up,
+    toolbar_move_down,
+    shortcut,
+    output_clipboard,
+    output_file,
+    save,
+    cancel,
+    close,
+};
+
+struct SettingsFocusTarget {
+    SettingsFocusKind kind{};
+    int index{-1};
+
+    bool operator==(const SettingsFocusTarget&) const = default;
+};
 
 enum ShortcutIdx {
     idx_capture_hotkey = 0,
@@ -43,6 +82,8 @@ struct SettingsState {
     AppConfig config;
     bool accepted{};
     HWND window{};
+    HWND owner{};
+    SettingsWindowCompletion completion;
     bool is_light_theme{};
     
     // UI state
@@ -50,6 +91,8 @@ struct SettingsState {
     int capturing_idx_{-1}; // capturing hotkey index
     int selected_tool_idx{-1};
     POINT mouse_pos{};
+    std::optional<SettingsFocusTarget> keyboard_focus;
+    bool keyboard_focus_visible{};
 
     // D2D Resources
     Microsoft::WRL::ComPtr<ID2D1Factory> d2d_factory;
@@ -89,7 +132,59 @@ struct SettingsState {
     bool is_downloading{false};
     int download_progress{0};
     std::wstring download_error;
+    OcrDependencyStatus ocr_dependency;
+    UINT_PTR download_subscription{};
+    unsigned int modal_depth{};
+    bool nc_destroyed{};
+    bool finalized{};
 };
+
+float settings_layout_scale(HWND window) noexcept {
+    RECT client{};
+    if (!window || !GetClientRect(window, &client)) {
+        return 1.0f;
+    }
+    const float width_scale =
+        static_cast<float>(client.right - client.left) / static_cast<float>(kSettingsWidth);
+    const float height_scale =
+        static_cast<float>(client.bottom - client.top) / static_cast<float>(kSettingsHeight);
+    const float scale = std::min(width_scale, height_scale);
+    return std::isfinite(scale) && scale > 0.0f ? scale : 1.0f;
+}
+
+int settings_scale_dip(HWND window, int value) noexcept {
+    return static_cast<int>(std::lround(value * settings_layout_scale(window)));
+}
+
+RECT settings_work_area(HMONITOR monitor) noexcept {
+    MONITORINFO info{sizeof(info)};
+    if (monitor && GetMonitorInfoW(monitor, &info)) {
+        return info.rcWork;
+    }
+    return {
+        GetSystemMetrics(SM_XVIRTUALSCREEN),
+        GetSystemMetrics(SM_YVIRTUALSCREEN),
+        GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+        GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN),
+    };
+}
+
+SIZE fitted_settings_size(UINT dpi, const RECT& work_area) noexcept {
+    const float desired_scale = static_cast<float>(dpi == 0 ? 96 : dpi) / 96.0f;
+    const int available_width =
+        std::max(1L, work_area.right - work_area.left - 2L * kWorkAreaMargin);
+    const int available_height =
+        std::max(1L, work_area.bottom - work_area.top - 2L * kWorkAreaMargin);
+    const float scale = std::min({
+        desired_scale,
+        static_cast<float>(available_width) / static_cast<float>(kSettingsWidth),
+        static_cast<float>(available_height) / static_cast<float>(kSettingsHeight),
+    });
+    return {
+        std::max(1, static_cast<int>(std::floor(kSettingsWidth * scale))),
+        std::max(1, static_cast<int>(std::floor(kSettingsHeight * scale))),
+    };
+}
 
 std::wstring* get_shortcut_ptr(AppConfig& config, int idx) {
     switch (idx) {
@@ -112,12 +207,327 @@ std::wstring* get_shortcut_ptr(AppConfig& config, int idx) {
     }
 }
 
-struct OcrDownloadContext {
-    std::mutex mutex;
-    bool is_downloading{false};
-    int progress{0};
+const std::wstring* get_shortcut_ptr(const AppConfig& config, int idx) {
+    switch (idx) {
+        case idx_capture_hotkey: return &config.capture_hotkey;
+        case idx_global_ocr_hotkey: return &config.global_ocr_hotkey;
+        case idx_capture_ocr_shortcut: return &config.capture_ocr_shortcut;
+        case idx_tool_shortcut_select: return &config.tool_shortcut_select;
+        case idx_tool_shortcut_rectangle: return &config.tool_shortcut_rectangle;
+        case idx_tool_shortcut_ellipse: return &config.tool_shortcut_ellipse;
+        case idx_tool_shortcut_line: return &config.tool_shortcut_line;
+        case idx_tool_shortcut_arrow: return &config.tool_shortcut_arrow;
+        case idx_tool_shortcut_pen: return &config.tool_shortcut_pen;
+        case idx_tool_shortcut_mosaic: return &config.tool_shortcut_mosaic;
+        case idx_tool_shortcut_blur: return &config.tool_shortcut_blur;
+        case idx_tool_shortcut_highlight: return &config.tool_shortcut_highlight;
+        case idx_tool_shortcut_text: return &config.tool_shortcut_text;
+        case idx_tool_shortcut_serial: return &config.tool_shortcut_serial;
+        case idx_tool_shortcut_eraser: return &config.tool_shortcut_eraser;
+        default: return nullptr;
+    }
+}
+
+constexpr std::array<std::wstring_view, shortcut_count> kShortcutLabels{
+    L"截图",
+    L"全局 OCR",
+    L"选区 OCR",
+    L"选择工具",
+    L"矩形工具",
+    L"椭圆工具",
+    L"直线工具",
+    L"箭头工具",
+    L"画笔工具",
+    L"马赛克工具",
+    L"模糊工具",
+    L"高亮工具",
+    L"文本工具",
+    L"序号工具",
+    L"橡皮擦工具",
+};
+
+bool same_hotkey(const Hotkey& left, const Hotkey& right) noexcept {
+    constexpr UINT modifier_mask = MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN;
+    return left.virtual_key == right.virtual_key &&
+           (left.modifiers & modifier_mask) == (right.modifiers & modifier_mask);
+}
+
+std::optional<std::wstring> shortcut_validation_error(const AppConfig& config) {
+    std::array<std::optional<Hotkey>, shortcut_count> parsed;
+    for (int index = 0; index < shortcut_count; ++index) {
+        const std::wstring* value = get_shortcut_ptr(config, index);
+        if (!value || value->empty()) {
+            continue;
+        }
+        parsed[static_cast<std::size_t>(index)] = parse_hotkey(*value);
+        if (!parsed[static_cast<std::size_t>(index)]) {
+            return std::format(L"“{}”的快捷键格式无效。", kShortcutLabels[static_cast<std::size_t>(index)]);
+        }
+        if (index <= idx_global_ocr_hotkey &&
+            (parsed[static_cast<std::size_t>(index)]->modifiers &
+             (MOD_CONTROL | MOD_ALT | MOD_WIN)) == 0) {
+            return std::format(
+                L"“{}”必须包含 Ctrl、Alt 或 Win 修饰键。",
+                kShortcutLabels[static_cast<std::size_t>(index)]);
+        }
+        for (int previous = 0; previous < index; ++previous) {
+            const auto& other = parsed[static_cast<std::size_t>(previous)];
+            if (other && same_hotkey(*parsed[static_cast<std::size_t>(index)], *other)) {
+                return std::format(L"“{}”与“{}”使用了相同的快捷键。",
+                                   kShortcutLabels[static_cast<std::size_t>(index)],
+                                   kShortcutLabels[static_cast<std::size_t>(previous)]);
+            }
+        }
+    }
+
+    constexpr std::array<std::wstring_view, 4> reserved{
+        L"Ctrl+C",
+        L"Ctrl+S",
+        L"Ctrl+Z",
+        L"Ctrl+Y",
+    };
+    for (int index = idx_capture_ocr_shortcut; index < shortcut_count; ++index) {
+        const auto& value = parsed[static_cast<std::size_t>(index)];
+        if (!value) {
+            continue;
+        }
+        for (const auto command : reserved) {
+            const auto built_in = parse_hotkey(command);
+            if (built_in && same_hotkey(*value, *built_in)) {
+                return std::format(L"“{}”不能使用截图编辑命令保留的快捷键 {}。",
+                                   kShortcutLabels[static_cast<std::size_t>(index)],
+                                   command);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+constexpr UINT kOcrDownloadStateChanged = WM_APP + 0x120;
+
+struct OcrDownloadSnapshot {
+    bool is_downloading{};
+    int progress{};
     std::wstring error;
-} g_ocr_download;
+};
+
+class OcrDownloadContext {
+public:
+    OcrDownloadContext() = default;
+
+    ~OcrDownloadContext() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            subscribers_.clear();
+        }
+        if (worker_.joinable()) {
+            worker_.request_stop();
+            worker_.join();
+        }
+    }
+
+    OcrDownloadContext(const OcrDownloadContext&) = delete;
+    OcrDownloadContext& operator=(const OcrDownloadContext&) = delete;
+
+    [[nodiscard]] OcrDownloadSnapshot snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {is_downloading_, progress_, error_};
+    }
+
+    [[nodiscard]] UINT_PTR subscribe(HWND window) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++next_subscription_;
+        if (next_subscription_ == 0) {
+            ++next_subscription_;
+        }
+        subscribers_.push_back({window, next_subscription_});
+        return next_subscription_;
+    }
+
+    void unsubscribe(HWND window, UINT_PTR subscription) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::erase_if(
+            subscribers_,
+            [window, subscription](const Subscription& item) {
+                return item.window == window && item.id == subscription;
+            });
+    }
+
+    void clear_error() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (error_.empty()) {
+            return;
+        }
+        error_.clear();
+        post_update_locked();
+    }
+
+    [[nodiscard]] bool start(std::wstring manifest_url) {
+        std::jthread completed_worker;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (is_downloading_) {
+                return false;
+            }
+            is_downloading_ = true;
+            progress_ = 0;
+            error_.clear();
+            completed_worker = std::move(worker_);
+            post_update_locked();
+        }
+
+        if (completed_worker.joinable()) {
+            completed_worker.join();
+        }
+
+        try {
+            std::jthread worker(
+                [this, manifest_url = std::move(manifest_url)](
+                    std::stop_token stop_token) {
+                    std::wstring error;
+                    const bool ok = download_ocr_dependencies(
+                        manifest_url,
+                        [this, stop_token](int progress) {
+                            update_progress(progress, stop_token);
+                        },
+                        &error,
+                        stop_token);
+                    finish(ok, std::move(error), stop_token);
+                });
+            std::lock_guard<std::mutex> lock(mutex_);
+            worker_ = std::move(worker);
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            is_downloading_ = false;
+            error_ = L"无法启动 OCR 下载任务。";
+            post_update_locked();
+            return false;
+        }
+        return true;
+    }
+
+private:
+    struct Subscription {
+        HWND window{};
+        UINT_PTR id{};
+    };
+
+    void post_update_locked() const {
+        for (const auto& subscriber : subscribers_) {
+            PostMessageW(
+                subscriber.window,
+                kOcrDownloadStateChanged,
+                static_cast<WPARAM>(subscriber.id),
+                0);
+        }
+    }
+
+    void update_progress(int progress, std::stop_token stop_token) {
+        if (stop_token.stop_requested()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!is_downloading_) {
+            return;
+        }
+        progress_ = std::clamp(progress, 0, 100);
+        post_update_locked();
+    }
+
+    void finish(bool ok, std::wstring error, std::stop_token stop_token) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        is_downloading_ = false;
+        progress_ = ok ? 100 : progress_;
+        error_ = ok ? std::wstring{} : std::move(error);
+        if (!stop_token.stop_requested()) {
+            post_update_locked();
+        }
+    }
+
+    mutable std::mutex mutex_;
+    bool is_downloading_{};
+    int progress_{};
+    std::wstring error_;
+    std::vector<Subscription> subscribers_;
+    UINT_PTR next_subscription_{};
+    std::jthread worker_;
+};
+
+OcrDownloadContext g_ocr_download;
+
+void refresh_ocr_download_state(
+    SettingsState* state,
+    bool force_dependency_refresh = false) {
+    const bool was_downloading = state->is_downloading;
+    OcrDownloadSnapshot snapshot = g_ocr_download.snapshot();
+    state->is_downloading = snapshot.is_downloading;
+    state->download_progress = snapshot.progress;
+    state->download_error = std::move(snapshot.error);
+    if (force_dependency_refresh ||
+        (was_downloading && !state->is_downloading)) {
+        state->ocr_dependency =
+            ocr_dependency_status(state->config.ocr_engine);
+    }
+}
+
+void restore_settings_owner(SettingsState* state) {
+    if (state->owner && IsWindow(state->owner)) {
+        EnableWindow(state->owner, TRUE);
+        SetForegroundWindow(state->owner);
+    }
+    state->owner = nullptr;
+}
+
+void finalize_settings_state(SettingsState* state) {
+    if (state->finalized) {
+        return;
+    }
+    state->finalized = true;
+    auto completion = std::move(state->completion);
+    std::optional<AppConfig> result;
+    if (state->accepted) {
+        result = std::move(state->config);
+    }
+    restore_settings_owner(state);
+    delete state;
+    if (completion) {
+        completion(std::move(result));
+    }
+}
+
+void enter_settings_modal(SettingsState* state) noexcept {
+    ++state->modal_depth;
+}
+
+bool leave_settings_modal(SettingsState* state) {
+    if (state->modal_depth > 0) {
+        --state->modal_depth;
+    }
+    if (state->modal_depth == 0 && state->nc_destroyed) {
+        finalize_settings_state(state);
+        return false;
+    }
+    return true;
+}
+
+bool accept_settings(SettingsState* state) {
+    if (const auto validation_error = shortcut_validation_error(state->config)) {
+        state->active_tab = 2;
+        enter_settings_modal(state);
+        MessageBoxW(state->window,
+                    validation_error->c_str(),
+                    L"快捷键冲突",
+                    MB_OK | MB_ICONWARNING);
+        if (!leave_settings_modal(state)) {
+            return false;
+        }
+        InvalidateRect(state->window, nullptr, TRUE);
+        return true;
+    }
+    state->accepted = true;
+    PostMessageW(state->window, WM_CLOSE, 0, 0);
+    return true;
+}
 
 struct OcrEngineButton {
     std::wstring_view engine;
@@ -142,47 +552,6 @@ const OcrEngineButton* hit_test_ocr_engine_button(POINT pt) {
         }
     }
     return nullptr;
-}
-
-void start_ocr_download(HWND hwnd, std::wstring_view manifest_url) {
-    {
-        std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
-        if (g_ocr_download.is_downloading) return;
-        g_ocr_download.is_downloading = true;
-        g_ocr_download.progress = 0;
-        g_ocr_download.error.clear();
-    }
-    if (IsWindow(hwnd)) {
-        InvalidateRect(hwnd, nullptr, TRUE);
-    }
-
-    std::wstring manifest_url_str(manifest_url);
-    
-    std::thread([manifest_url_str, hwnd]() {
-        std::wstring error;
-        const bool ok = download_ocr_dependencies(
-            manifest_url_str,
-            [hwnd](int progress) {
-                {
-                    std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
-                    g_ocr_download.progress = progress;
-                }
-                if (IsWindow(hwnd)) {
-                    InvalidateRect(hwnd, nullptr, TRUE);
-                }
-            },
-            &error);
-
-        {
-            std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
-            g_ocr_download.is_downloading = false;
-            g_ocr_download.progress = ok ? 100 : g_ocr_download.progress;
-            g_ocr_download.error = ok ? std::wstring{} : error;
-        }
-        if (IsWindow(hwnd)) {
-            InvalidateRect(hwnd, nullptr, TRUE);
-        }
-    }).detach();
 }
 
 std::vector<std::wstring> split_hidden_tools(std::wstring_view value) {
@@ -280,15 +649,25 @@ std::wstring get_tool_display_name(std::wstring_view id) {
 
 void discard_resources(SettingsState* state);
 
-bool ensure_resources(SettingsState* state) {
-    const bool current_theme_is_light = should_use_light_theme(state->config.theme);
-    if (state->render_target) {
-        if (state->is_light_theme == current_theme_is_light) {
-            return true;
-        }
-        discard_resources(state);
+void refresh_settings_theme(SettingsState* state) {
+    const bool light = should_use_light_theme(state->config.theme);
+    if (state->is_light_theme == light) {
+        return;
     }
-    state->is_light_theme = current_theme_is_light;
+    state->is_light_theme = light;
+    discard_resources(state);
+    if (state->window) {
+        BOOL use_dark = !light;
+        DwmSetWindowAttribute(state->window, 20, &use_dark, sizeof(use_dark));
+        DwmSetWindowAttribute(state->window, 19, &use_dark, sizeof(use_dark));
+        InvalidateRect(state->window, nullptr, TRUE);
+    }
+}
+
+bool ensure_resources(SettingsState* state) {
+    if (state->render_target) {
+        return true;
+    }
 
     if (state->window) {
         BOOL use_dark = !state->is_light_theme;
@@ -297,27 +676,30 @@ bool ensure_resources(SettingsState* state) {
     }
 
     RECT rect{};
-    GetClientRect(state->window, &rect);
+    if (!GetClientRect(state->window, &rect) || rect.right <= rect.left || rect.bottom <= rect.top) {
+        return false;
+    }
     const D2D1_SIZE_U size = D2D1::SizeU(static_cast<UINT32>(rect.right - rect.left),
                                          static_cast<UINT32>(rect.bottom - rect.top));
+    const auto fail = [state] {
+        discard_resources(state);
+        return false;
+    };
 
     HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory), nullptr, reinterpret_cast<void**>(state->d2d_factory.GetAddressOf()));
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
     hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(state->dwrite_factory.GetAddressOf()));
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
     hr = state->d2d_factory->CreateHwndRenderTarget(
         D2D1::RenderTargetProperties(),
         D2D1::HwndRenderTargetProperties(state->window, size),
         state->render_target.GetAddressOf()
     );
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return fail();
 
-    float dpi = static_cast<float>(GetDpiForWindow(state->window));
-    if (dpi == 0.0f) {
-        dpi = 96.0f;
-    }
+    const float dpi = 96.0f * settings_layout_scale(state->window);
     state->render_target->SetDpi(dpi, dpi);
 
     // Create Brushes
@@ -364,6 +746,15 @@ bool ensure_resources(SettingsState* state) {
         state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x401515), state->close_btn_hover_bg_brush.GetAddressOf());
         state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xE81123), state->red_brush.GetAddressOf());
     }
+    if (!state->bg_brush || !state->sidebar_bg_brush || !state->text_white_brush ||
+        !state->text_grey_brush || !state->blue_brush || !state->hover_blue_brush ||
+        !state->border_brush || !state->active_tab_brush || !state->control_bg_brush ||
+        !state->switch_track_off_brush || !state->card_bg_brush || !state->card_border_brush ||
+        !state->separator_brush || !state->hover_bg_brush || !state->cancel_btn_border_brush ||
+        !state->accent_indicator_brush || !state->keycap_shadow_brush ||
+        !state->switch_glow_brush || !state->close_btn_hover_bg_brush || !state->red_brush) {
+        return fail();
+    }
 
     // Create Text Formats
     state->dwrite_factory->CreateTextFormat(L"Microsoft YaHei", nullptr, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16.0f, L"zh-CN", state->title_format.GetAddressOf());
@@ -371,6 +762,10 @@ bool ensure_resources(SettingsState* state) {
     state->dwrite_factory->CreateTextFormat(L"Microsoft YaHei", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"zh-CN", state->small_format.GetAddressOf());
     state->dwrite_factory->CreateTextFormat(L"Consolas", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"zh-CN", state->hotkey_format.GetAddressOf());
     state->dwrite_factory->CreateTextFormat(L"Microsoft YaHei", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"zh-CN", state->btn_text_format.GetAddressOf());
+    if (!state->title_format || !state->text_format || !state->small_format ||
+        !state->hotkey_format || !state->btn_text_format) {
+        return fail();
+    }
 
     state->title_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     state->text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -408,6 +803,10 @@ void discard_resources(SettingsState* state) {
     state->switch_glow_brush.Reset();
     state->close_btn_hover_bg_brush.Reset();
     state->red_brush.Reset();
+    state->title_format.Reset();
+    state->text_format.Reset();
+    state->small_format.Reset();
+    state->hotkey_format.Reset();
     state->btn_text_format.Reset();
 }
 
@@ -515,12 +914,446 @@ void draw_hotkey_box(SettingsState* state, int x1, int y1, int x2, int y2, const
     }
 }
 
+std::vector<SettingsFocusTarget> settings_focus_targets(const SettingsState* state) {
+    std::vector<SettingsFocusTarget> targets;
+    targets.reserve(32);
+
+    for (int index = 0; index < 3; ++index) {
+        targets.push_back({SettingsFocusKind::tab, index});
+    }
+
+    if (state->active_tab == 0) {
+        for (int index = 0; index < kGeneralSwitchCount; ++index) {
+            if (index != 2 || state->config.ocr_enabled) {
+                targets.push_back({SettingsFocusKind::general_switch, index});
+            }
+        }
+        targets.push_back({SettingsFocusKind::font_family});
+        targets.push_back({SettingsFocusKind::reset_serial});
+        targets.push_back({SettingsFocusKind::text_bold});
+        targets.push_back({SettingsFocusKind::text_italic});
+        if (!state->is_downloading) {
+            for (int index = 0; index < static_cast<int>(kOcrEngineButtons.size()); ++index) {
+                targets.push_back({SettingsFocusKind::ocr_engine, index});
+            }
+            if (state->ocr_dependency.can_download) {
+                targets.push_back({SettingsFocusKind::download_ocr});
+            }
+        }
+        for (int index = 0; index < 3; ++index) {
+            targets.push_back({SettingsFocusKind::theme, index});
+        }
+    } else if (state->active_tab == 1) {
+        const auto tools = split_by_comma(state->config.toolbar_order);
+        for (int index = 0; index < static_cast<int>(tools.size()); ++index) {
+            targets.push_back({SettingsFocusKind::toolbar_item, index});
+        }
+        if (state->selected_tool_idx >= 0 &&
+            state->selected_tool_idx < static_cast<int>(tools.size())) {
+            targets.push_back({SettingsFocusKind::toolbar_visibility});
+            if (state->selected_tool_idx > 0) {
+                targets.push_back({SettingsFocusKind::toolbar_move_up});
+            }
+            if (state->selected_tool_idx + 1 < static_cast<int>(tools.size())) {
+                targets.push_back({SettingsFocusKind::toolbar_move_down});
+            }
+        }
+    } else if (state->active_tab == 2) {
+        for (int index = 0; index < shortcut_count; ++index) {
+            targets.push_back({SettingsFocusKind::shortcut, index});
+        }
+    }
+
+    targets.push_back({SettingsFocusKind::output_clipboard});
+    targets.push_back({SettingsFocusKind::output_file});
+    targets.push_back({SettingsFocusKind::save});
+    targets.push_back({SettingsFocusKind::cancel});
+    targets.push_back({SettingsFocusKind::close});
+    return targets;
+}
+
+bool settings_focus_target_available(
+    const SettingsState* state,
+    const SettingsFocusTarget& target) {
+    const auto targets = settings_focus_targets(state);
+    return std::ranges::find(targets, target) != targets.end();
+}
+
+std::optional<D2D1_ROUNDED_RECT> settings_focus_bounds(
+    const SettingsFocusTarget& target) {
+    D2D1_RECT_F rect{};
+    float radius = 6.0f;
+    switch (target.kind) {
+        case SettingsFocusKind::tab: {
+            const float top = 60.0f + target.index * 50.0f;
+            rect = D2D1::RectF(10.0f, top, 190.0f, top + 38.0f);
+            break;
+        }
+        case SettingsFocusKind::general_switch: {
+            const float top = 110.0f + target.index * static_cast<float>(kGeneralRowHeight);
+            rect = D2D1::RectF(232.0f, top + 2.0f, 708.0f, top + kGeneralRowHeight - 2.0f);
+            break;
+        }
+        case SettingsFocusKind::font_family:
+            rect = D2D1::RectF(250.0f, 405.0f, 450.0f, 435.0f);
+            break;
+        case SettingsFocusKind::reset_serial:
+            rect = D2D1::RectF(530.0f, 405.0f, 690.0f, 435.0f);
+            break;
+        case SettingsFocusKind::text_bold:
+            rect = D2D1::RectF(347.0f, 449.0f, 397.0f, 477.0f);
+            radius = 14.0f;
+            break;
+        case SettingsFocusKind::text_italic:
+            rect = D2D1::RectF(587.0f, 449.0f, 637.0f, 477.0f);
+            radius = 14.0f;
+            break;
+        case SettingsFocusKind::ocr_engine:
+            if (target.index < 0 ||
+                target.index >= static_cast<int>(kOcrEngineButtons.size())) {
+                return std::nullopt;
+            }
+            rect = D2D1::RectF(
+                static_cast<float>(kOcrEngineButtons[static_cast<std::size_t>(target.index)].left),
+                525.0f,
+                static_cast<float>(kOcrEngineButtons[static_cast<std::size_t>(target.index)].right),
+                555.0f);
+            break;
+        case SettingsFocusKind::download_ocr:
+            rect = D2D1::RectF(530.0f, 565.0f, 650.0f, 595.0f);
+            break;
+        case SettingsFocusKind::theme: {
+            constexpr std::array<std::pair<int, int>, 3> bounds{{
+                {250, 380},
+                {390, 520},
+                {530, 660},
+            }};
+            if (target.index < 0 || target.index >= static_cast<int>(bounds.size())) {
+                return std::nullopt;
+            }
+            const auto [left, right] = bounds[static_cast<std::size_t>(target.index)];
+            rect = D2D1::RectF(
+                static_cast<float>(left), 635.0f, static_cast<float>(right), 665.0f);
+            break;
+        }
+        case SettingsFocusKind::toolbar_item: {
+            const float top = 85.0f + target.index * 27.0f;
+            rect = D2D1::RectF(232.0f, top, 478.0f, top + 26.0f);
+            radius = 4.0f;
+            break;
+        }
+        case SettingsFocusKind::toolbar_visibility:
+            rect = D2D1::RectF(517.0f, 157.0f, 687.0f, 193.0f);
+            break;
+        case SettingsFocusKind::toolbar_move_up:
+            rect = D2D1::RectF(520.0f, 220.0f, 690.0f, 255.0f);
+            break;
+        case SettingsFocusKind::toolbar_move_down:
+            rect = D2D1::RectF(520.0f, 275.0f, 690.0f, 310.0f);
+            break;
+        case SettingsFocusKind::shortcut: {
+            if (target.index < 0 || target.index >= shortcut_count) {
+                return std::nullopt;
+            }
+            const bool first_column = target.index < 8;
+            const int row = first_column ? target.index : target.index - 8;
+            const float top = 95.0f + row * 65.0f;
+            rect = D2D1::RectF(
+                first_column ? 355.0f : 595.0f,
+                top,
+                first_column ? 455.0f : 695.0f,
+                top + 26.0f);
+            break;
+        }
+        case SettingsFocusKind::output_clipboard:
+            rect = D2D1::RectF(230.0f, 715.0f, 350.0f, 745.0f);
+            break;
+        case SettingsFocusKind::output_file:
+            rect = D2D1::RectF(360.0f, 715.0f, 490.0f, 745.0f);
+            break;
+        case SettingsFocusKind::save:
+            rect = D2D1::RectF(500.0f, 715.0f, 600.0f, 745.0f);
+            break;
+        case SettingsFocusKind::cancel:
+            rect = D2D1::RectF(615.0f, 715.0f, 715.0f, 745.0f);
+            break;
+        case SettingsFocusKind::close:
+            rect = D2D1::RectF(697.0f, 2.0f, 738.0f, 48.0f);
+            radius = 2.0f;
+            break;
+    }
+    return D2D1::RoundedRect(rect, radius, radius);
+}
+
+void draw_settings_keyboard_focus(SettingsState* state) {
+    if (!state->keyboard_focus_visible || !state->keyboard_focus ||
+        !settings_focus_target_available(state, *state->keyboard_focus)) {
+        return;
+    }
+    auto bounds = settings_focus_bounds(*state->keyboard_focus);
+    if (!bounds) {
+        return;
+    }
+    bounds->rect.left = std::max(2.0f, bounds->rect.left - 2.0f);
+    bounds->rect.top = std::max(2.0f, bounds->rect.top - 2.0f);
+    bounds->rect.right = std::min(738.0f, bounds->rect.right + 2.0f);
+    bounds->rect.bottom = std::min(758.0f, bounds->rect.bottom + 2.0f);
+    bounds->radiusX += 2.0f;
+    bounds->radiusY += 2.0f;
+    state->render_target->DrawRoundedRectangle(
+        *bounds, state->accent_indicator_brush.Get(), 2.0f);
+}
+
+void move_settings_keyboard_focus(SettingsState* state, bool backwards) {
+    const auto targets = settings_focus_targets(state);
+    if (targets.empty()) {
+        state->keyboard_focus.reset();
+        state->keyboard_focus_visible = false;
+        return;
+    }
+
+    auto current = targets.end();
+    if (state->keyboard_focus) {
+        current = std::ranges::find(targets, *state->keyboard_focus);
+    }
+    if (current == targets.end()) {
+        state->keyboard_focus = backwards ? targets.back() : targets.front();
+    } else if (backwards) {
+        state->keyboard_focus =
+            current == targets.begin() ? targets.back() : *std::prev(current);
+    } else {
+        state->keyboard_focus =
+            std::next(current) == targets.end() ? targets.front() : *std::next(current);
+    }
+    state->keyboard_focus_visible = true;
+    state->capturing_idx_ = -1;
+    InvalidateRect(state->window, nullptr, FALSE);
+}
+
+bool show_font_family_menu(SettingsState* state) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) {
+        return true;
+    }
+    constexpr std::array<const wchar_t*, 7> fonts{
+        L"Microsoft YaHei",
+        L"Consolas",
+        L"SimSun",
+        L"SimHei",
+        L"KaiTi",
+        L"Arial",
+        L"Segoe UI",
+    };
+    for (int index = 0; index < static_cast<int>(fonts.size()); ++index) {
+        UINT flags = MF_STRING;
+        if (state->config.text_font_family == fonts[static_cast<std::size_t>(index)]) {
+            flags |= MF_CHECKED;
+        }
+        AppendMenuW(menu, flags, 1000 + index, fonts[static_cast<std::size_t>(index)]);
+    }
+
+    POINT screen_point{
+        settings_scale_dip(state->window, 250),
+        settings_scale_dip(state->window, 435),
+    };
+    ClientToScreen(state->window, &screen_point);
+    enter_settings_modal(state);
+    const int selection = TrackPopupMenu(
+        menu,
+        TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY,
+        screen_point.x,
+        screen_point.y,
+        0,
+        state->window,
+        nullptr);
+    DestroyMenu(menu);
+    if (!leave_settings_modal(state)) {
+        return false;
+    }
+    if (selection >= 1000 &&
+        selection < 1000 + static_cast<int>(fonts.size())) {
+        state->config.text_font_family =
+            fonts[static_cast<std::size_t>(selection - 1000)];
+        InvalidateRect(state->window, nullptr, TRUE);
+    }
+    return true;
+}
+
+bool activate_settings_focus(
+    SettingsState* state,
+    const SettingsFocusTarget& target) {
+    switch (target.kind) {
+        case SettingsFocusKind::tab:
+            if (target.index >= 0 && target.index < 3) {
+                state->active_tab = target.index;
+                state->capturing_idx_ = -1;
+            }
+            break;
+        case SettingsFocusKind::general_switch:
+            switch (target.index) {
+                case 0:
+                    state->config.annotation_enabled = !state->config.annotation_enabled;
+                    break;
+                case 1:
+                    state->config.ocr_enabled = !state->config.ocr_enabled;
+                    if (!state->config.ocr_enabled) {
+                        state->config.global_ocr_enabled = false;
+                    }
+                    break;
+                case 2:
+                    if (state->config.ocr_enabled) {
+                        state->config.global_ocr_enabled =
+                            !state->config.global_ocr_enabled;
+                    }
+                    break;
+                case 3:
+                    state->config.shell_enabled = !state->config.shell_enabled;
+                    break;
+                case 4:
+                    state->config.start_at_login = !state->config.start_at_login;
+                    break;
+                case 5:
+                    state->config.notifications_enabled =
+                        !state->config.notifications_enabled;
+                    break;
+                case 6:
+                    state->config.annotation_locked_tool =
+                        !state->config.annotation_locked_tool;
+                    break;
+                default:
+                    break;
+            }
+            break;
+        case SettingsFocusKind::font_family:
+            return show_font_family_menu(state);
+        case SettingsFocusKind::reset_serial:
+            state->config.annotation_next_serial = 1;
+            enter_settings_modal(state);
+            MessageBoxW(
+                state->window,
+                L"标注序号计数器已成功重置为 1。",
+                L"设置",
+                MB_OK | MB_ICONINFORMATION);
+            if (!leave_settings_modal(state)) {
+                return false;
+            }
+            break;
+        case SettingsFocusKind::text_bold:
+            state->config.text_font_bold = !state->config.text_font_bold;
+            break;
+        case SettingsFocusKind::text_italic:
+            state->config.text_font_italic = !state->config.text_font_italic;
+            break;
+        case SettingsFocusKind::ocr_engine:
+            if (!state->is_downloading && target.index >= 0 &&
+                target.index < static_cast<int>(kOcrEngineButtons.size())) {
+                state->config.ocr_engine = std::wstring(
+                    kOcrEngineButtons[static_cast<std::size_t>(target.index)].engine);
+                g_ocr_download.clear_error();
+                refresh_ocr_download_state(state, true);
+            }
+            break;
+        case SettingsFocusKind::download_ocr: {
+            const OcrDependencyStatus status =
+                ocr_dependency_status(state->config.ocr_engine);
+            state->ocr_dependency = status;
+            if (status.can_download && !state->is_downloading) {
+                const bool started =
+                    g_ocr_download.start(state->config.ocr_download_url);
+                refresh_ocr_download_state(state);
+                if (!started && state->download_error.empty()) {
+                    state->download_error = L"OCR 下载任务已在运行。";
+                }
+            }
+            break;
+        }
+        case SettingsFocusKind::theme: {
+            constexpr std::array<std::wstring_view, 3> themes{
+                L"system",
+                L"light",
+                L"dark",
+            };
+            if (target.index >= 0 && target.index < static_cast<int>(themes.size())) {
+                state->config.theme =
+                    std::wstring(themes[static_cast<std::size_t>(target.index)]);
+                refresh_settings_theme(state);
+            }
+            break;
+        }
+        case SettingsFocusKind::toolbar_item: {
+            const auto tools = split_by_comma(state->config.toolbar_order);
+            if (target.index >= 0 && target.index < static_cast<int>(tools.size())) {
+                state->selected_tool_idx = target.index;
+            }
+            break;
+        }
+        case SettingsFocusKind::toolbar_visibility: {
+            const auto tools = split_by_comma(state->config.toolbar_order);
+            if (state->selected_tool_idx >= 0 &&
+                state->selected_tool_idx < static_cast<int>(tools.size())) {
+                toggle_hidden_tool(
+                    state->config.annotation_hidden_tools,
+                    tools[static_cast<std::size_t>(state->selected_tool_idx)]);
+            }
+            break;
+        }
+        case SettingsFocusKind::toolbar_move_up:
+        case SettingsFocusKind::toolbar_move_down: {
+            auto tools = split_by_comma(state->config.toolbar_order);
+            const int selected = state->selected_tool_idx;
+            const int delta =
+                target.kind == SettingsFocusKind::toolbar_move_up ? -1 : 1;
+            const int destination = selected + delta;
+            if (selected >= 0 && destination >= 0 &&
+                selected < static_cast<int>(tools.size()) &&
+                destination < static_cast<int>(tools.size())) {
+                std::swap(
+                    tools[static_cast<std::size_t>(selected)],
+                    tools[static_cast<std::size_t>(destination)]);
+                state->config.toolbar_order = join_by_comma(tools);
+                state->selected_tool_idx = destination;
+                const bool reached_boundary =
+                    (target.kind == SettingsFocusKind::toolbar_move_up &&
+                     destination == 0) ||
+                    (target.kind == SettingsFocusKind::toolbar_move_down &&
+                     destination + 1 == static_cast<int>(tools.size()));
+                if (reached_boundary) {
+                    state->keyboard_focus =
+                        SettingsFocusTarget{SettingsFocusKind::toolbar_item, destination};
+                }
+            }
+            break;
+        }
+        case SettingsFocusKind::shortcut:
+            if (target.index >= 0 && target.index < shortcut_count) {
+                state->capturing_idx_ = target.index;
+            }
+            break;
+        case SettingsFocusKind::output_clipboard:
+            state->config.default_output = L"clipboard";
+            break;
+        case SettingsFocusKind::output_file:
+            state->config.default_output = L"file";
+            break;
+        case SettingsFocusKind::save:
+            return accept_settings(state);
+        case SettingsFocusKind::cancel:
+        case SettingsFocusKind::close:
+            PostMessageW(state->window, WM_CLOSE, 0, 0);
+            return true;
+    }
+    InvalidateRect(state->window, nullptr, TRUE);
+    return true;
+}
+
 LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_param) {
     auto* state = reinterpret_cast<SettingsState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (message == WM_NCCREATE) {
         const auto* create = reinterpret_cast<CREATESTRUCTW*>(l_param);
         state = static_cast<SettingsState*>(create->lpCreateParams);
         state->window = window;
+        state->download_subscription = g_ocr_download.subscribe(window);
+        refresh_ocr_download_state(state, true);
         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
     }
     if (!state) {
@@ -529,6 +1362,22 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
 
     switch (message) {
         case WM_CREATE: {
+            return 0;
+        }
+
+        case kOcrDownloadStateChanged: {
+            if (static_cast<UINT_PTR>(w_param) == state->download_subscription) {
+                refresh_ocr_download_state(state);
+                InvalidateRect(window, nullptr, TRUE);
+            }
+            return 0;
+        }
+
+        case WM_SETTINGCHANGE:
+        case WM_THEMECHANGED: {
+            if (state->config.theme == L"system") {
+                refresh_settings_theme(state);
+            }
             return 0;
         }
 
@@ -622,6 +1471,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                     const wchar_t* labels[] = {
                         L"启用屏幕标注 (Screen Annotation)",
                         L"启用 OCR 识别 (OCR Recognition)",
+                        L"启用全局 OCR 热键 (Global OCR Hotkey)",
                         L"运行系统托盘 (System Tray Icon)",
                         L"开机自动启动 (Start at Login)",
                         L"启用提示通知 (Show Notifications)",
@@ -630,39 +1480,52 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                     bool values[] = {
                         state->config.annotation_enabled,
                         state->config.ocr_enabled,
+                        state->config.ocr_enabled && state->config.global_ocr_enabled,
                         state->config.shell_enabled,
                         state->config.start_at_login,
                         state->config.notifications_enabled,
                         state->config.annotation_locked_tool
                     };
 
-                    for (int i = 0; i < 6; ++i) {
-                        float row_y = 110.0f + i * 40.0f;
+                    for (int i = 0; i < kGeneralSwitchCount; ++i) {
+                        float row_y = 110.0f + i * static_cast<float>(kGeneralRowHeight);
+                        const bool row_enabled = i != 2 || state->config.ocr_enabled;
                         
                         // Row hover background
-                        D2D1_RECT_F row_rect = D2D1::RectF(231.0f, row_y + 1.0f, 709.0f, row_y + 39.0f);
-                        bool is_row_hovered = (state->mouse_pos.x >= 230 && state->mouse_pos.x <= 710 && state->mouse_pos.y >= row_y && state->mouse_pos.y <= row_y + 40.0f);
-                        if (is_row_hovered) {
+                        D2D1_RECT_F row_rect = D2D1::RectF(
+                            231.0f, row_y + 1.0f, 709.0f, row_y + kGeneralRowHeight - 1.0f);
+                        bool is_row_hovered =
+                            state->mouse_pos.x >= 230 && state->mouse_pos.x <= 710 &&
+                            state->mouse_pos.y >= row_y &&
+                            state->mouse_pos.y <= row_y + kGeneralRowHeight;
+                        if (is_row_hovered && row_enabled) {
                             D2D1_ROUNDED_RECT rounded_row = D2D1::RoundedRect(
                                 row_rect, 
-                                (i == 0 || i == 5) ? 7.0f : 0.0f, 
-                                (i == 0 || i == 5) ? 7.0f : 0.0f
+                                (i == 0 || i == kGeneralSwitchCount - 1) ? 7.0f : 0.0f,
+                                (i == 0 || i == kGeneralSwitchCount - 1) ? 7.0f : 0.0f
                             );
                             state->render_target->FillRoundedRectangle(rounded_row, state->hover_bg_brush.Get());
                         }
 
                         // Label
-                        D2D1_RECT_F text_rect = D2D1::RectF(250.0f, row_y, 620.0f, row_y + 40.0f);
-                        state->render_target->DrawTextW(labels[i], static_cast<UINT32>(wcslen(labels[i])), state->text_format.Get(), text_rect, state->text_white_brush.Get());
+                        D2D1_RECT_F text_rect = D2D1::RectF(
+                            250.0f, row_y, 620.0f, row_y + kGeneralRowHeight);
+                        state->render_target->DrawTextW(
+                            labels[i],
+                            static_cast<UINT32>(wcslen(labels[i])),
+                            state->text_format.Get(),
+                            text_rect,
+                            row_enabled ? state->text_white_brush.Get()
+                                        : state->text_grey_brush.Get());
                         
                         // Switch
-                        draw_switch(state, 640, static_cast<int>(row_y) + 9, values[i]);
+                        draw_switch(state, 640, static_cast<int>(row_y) + 6, values[i]);
 
                         // Separator line
-                        if (i < 5) {
+                        if (i < kGeneralSwitchCount - 1) {
                             state->render_target->DrawLine(
-                                D2D1::Point2F(250.0f, row_y + 40.0f), 
-                                D2D1::Point2F(690.0f, row_y + 40.0f), 
+                                D2D1::Point2F(250.0f, row_y + kGeneralRowHeight),
+                                D2D1::Point2F(690.0f, row_y + kGeneralRowHeight),
                                 state->separator_brush.Get(), 
                                 1.0f
                             );
@@ -710,19 +1573,12 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                         draw_choice_button(state, button.left, 525, button.right, 555, button.label, selected, hovered);
                     }
 
-                    bool is_downloading = false;
-                    int progress = 0;
-                    std::wstring dl_error;
-                    {
-                        std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
-                        is_downloading = g_ocr_download.is_downloading;
-                        progress = g_ocr_download.progress;
-                        dl_error = g_ocr_download.error;
-                    }
+                    const bool is_downloading = state->is_downloading;
+                    const int progress = state->download_progress;
+                    const std::wstring& dl_error = state->download_error;
 
-                    OcrDependencyStatus dependency_status = ocr_dependency_status(state->config.ocr_engine);
-                    std::wstring status_text = dependency_status.message;
-                    bool needs_download = dependency_status.can_download;
+                    std::wstring status_text = state->ocr_dependency.message;
+                    bool needs_download = state->ocr_dependency.can_download;
 
                     if (is_downloading) {
                         status_text = std::format(L"正在下载... {}%", progress);
@@ -938,11 +1794,38 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                 // 4. Draw Footer (Dividing Line & Save/Cancel buttons)
                 state->render_target->DrawLine(D2D1::Point2F(0.0f, 700.0f), D2D1::Point2F(740.0f, 700.0f), state->card_border_brush.Get(), 1.0f);
 
+                const bool default_file =
+                    _wcsicmp(state->config.default_output.c_str(), L"file") == 0;
+                const bool clipboard_hovered =
+                    state->mouse_pos.x >= 230 && state->mouse_pos.x <= 350 &&
+                    state->mouse_pos.y >= 715 && state->mouse_pos.y <= 745;
+                const bool file_hovered =
+                    state->mouse_pos.x >= 360 && state->mouse_pos.x <= 490 &&
+                    state->mouse_pos.y >= 715 && state->mouse_pos.y <= 745;
+                draw_choice_button(state,
+                                   230,
+                                   715,
+                                   350,
+                                   745,
+                                   L"默认复制",
+                                   !default_file,
+                                   clipboard_hovered);
+                draw_choice_button(state,
+                                   360,
+                                   715,
+                                   490,
+                                   745,
+                                   L"默认保存",
+                                   default_file,
+                                   file_hovered);
+
                 bool save_hovered = (state->mouse_pos.x >= 500 && state->mouse_pos.x <= 600 && state->mouse_pos.y >= 715 && state->mouse_pos.y <= 745);
                 draw_button(state, 500, 715, 600, 745, L"保存", save_hovered, btn_primary);
 
                 bool cancel_hovered = (state->mouse_pos.x >= 615 && state->mouse_pos.x <= 715 && state->mouse_pos.y >= 715 && state->mouse_pos.y <= 745);
                 draw_button(state, 615, 715, 715, 745, L"取消", cancel_hovered, btn_secondary);
+
+                draw_settings_keyboard_focus(state);
 
                 HRESULT end_hr = state->render_target->EndDraw();
                 if (end_hr == D2DERR_RECREATE_TARGET) {
@@ -954,8 +1837,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
         }
 
         case WM_MOUSEMOVE: {
-            float scale = static_cast<float>(GetDpiForWindow(window)) / 96.0f;
-            if (scale <= 0.0f) scale = 1.0f;
+            const float scale = settings_layout_scale(window);
             state->mouse_pos = {
                 static_cast<LONG>(std::round(GET_X_LPARAM(l_param) / scale)),
                 static_cast<LONG>(std::round(GET_Y_LPARAM(l_param) / scale))
@@ -965,8 +1847,8 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
         }
 
         case WM_LBUTTONDOWN: {
-            float scale = static_cast<float>(GetDpiForWindow(window)) / 96.0f;
-            if (scale <= 0.0f) scale = 1.0f;
+            state->keyboard_focus_visible = false;
+            const float scale = settings_layout_scale(window);
             POINT pt{
                 static_cast<LONG>(std::round(GET_X_LPARAM(l_param) / scale)),
                 static_cast<LONG>(std::round(GET_Y_LPARAM(l_param) / scale))
@@ -998,9 +1880,18 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
 
             // Check footer buttons
             if (pt.y >= 715 && pt.y <= 745) {
+                if (pt.x >= 230 && pt.x <= 350) {
+                    state->config.default_output = L"clipboard";
+                    InvalidateRect(window, nullptr, TRUE);
+                    return 0;
+                }
+                if (pt.x >= 360 && pt.x <= 490) {
+                    state->config.default_output = L"file";
+                    InvalidateRect(window, nullptr, TRUE);
+                    return 0;
+                }
                 if (pt.x >= 500 && pt.x <= 600) {
-                    state->accepted = true;
-                    PostMessageW(window, WM_CLOSE, 0, 0);
+                    (void)accept_settings(state);
                     return 0;
                 }
                 if (pt.x >= 615 && pt.x <= 715) {
@@ -1011,17 +1902,28 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
 
             // Check Content Panel
             if (state->active_tab == 0) {
-                // Switches y ranges: 110 + i * 40 + 9
-                for (int i = 0; i < 6; ++i) {
-                    int sy = 110 + i * 40 + 9;
-                    if (pt.x >= 640 && pt.x <= 684 && pt.y >= sy && pt.y <= sy + 22) {
+                for (int i = 0; i < kGeneralSwitchCount; ++i) {
+                    const int row_y = 110 + i * kGeneralRowHeight;
+                    if (pt.x >= 230 && pt.x <= 710 &&
+                        pt.y >= row_y && pt.y <= row_y + kGeneralRowHeight) {
                         switch (i) {
                             case 0: state->config.annotation_enabled = !state->config.annotation_enabled; break;
-                            case 1: state->config.ocr_enabled = !state->config.ocr_enabled; break;
-                            case 2: state->config.shell_enabled = !state->config.shell_enabled; break;
-                            case 3: state->config.start_at_login = !state->config.start_at_login; break;
-                            case 4: state->config.notifications_enabled = !state->config.notifications_enabled; break;
-                            case 5: state->config.annotation_locked_tool = !state->config.annotation_locked_tool; break;
+                            case 1:
+                                state->config.ocr_enabled = !state->config.ocr_enabled;
+                                if (!state->config.ocr_enabled) {
+                                    state->config.global_ocr_enabled = false;
+                                }
+                                break;
+                            case 2:
+                                if (state->config.ocr_enabled) {
+                                    state->config.global_ocr_enabled =
+                                        !state->config.global_ocr_enabled;
+                                }
+                                break;
+                            case 3: state->config.shell_enabled = !state->config.shell_enabled; break;
+                            case 4: state->config.start_at_login = !state->config.start_at_login; break;
+                            case 5: state->config.notifications_enabled = !state->config.notifications_enabled; break;
+                            case 6: state->config.annotation_locked_tool = !state->config.annotation_locked_tool; break;
                         }
                         InvalidateRect(window, nullptr, TRUE);
                         return 0;
@@ -1029,40 +1931,17 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                 }
                 // Font Family button (with popup menu)
                 if (pt.x >= 250 && pt.x <= 450 && pt.y >= 405 && pt.y <= 435) {
-                    HMENU menu = CreatePopupMenu();
-                    const wchar_t* fonts[] = {
-                        L"Microsoft YaHei",
-                        L"Consolas",
-                        L"SimSun",
-                        L"SimHei",
-                        L"KaiTi",
-                        L"Arial",
-                        L"Segoe UI"
-                    };
-                    for (int i = 0; i < 7; ++i) {
-                        UINT flags = MF_STRING;
-                        if (state->config.text_font_family == fonts[i]) {
-                            flags |= MF_CHECKED;
-                        }
-                        AppendMenuW(menu, flags, 1000 + i, fonts[i]);
-                    }
-                    
-                    POINT screen_pt{ 250, 435 };
-                    ClientToScreen(window, &screen_pt);
-                    
-                    int selection = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY, screen_pt.x, screen_pt.y, 0, window, nullptr);
-                    DestroyMenu(menu);
-                    
-                    if (selection >= 1000 && selection < 1007) {
-                        state->config.text_font_family = fonts[selection - 1000];
-                        InvalidateRect(window, nullptr, TRUE);
-                    }
+                    (void)show_font_family_menu(state);
                     return 0;
                 }
                 // Reset serial button
                 if (pt.x >= 530 && pt.x <= 690 && pt.y >= 405 && pt.y <= 435) {
                     state->config.annotation_next_serial = 1;
+                    enter_settings_modal(state);
                     MessageBoxW(window, L"标注序号计数器已成功重置为 1。", L"设置", MB_OK | MB_ICONINFORMATION);
+                    if (!leave_settings_modal(state)) {
+                        return 0;
+                    }
                     InvalidateRect(window, nullptr, TRUE);
                     return 0;
                 }
@@ -1080,31 +1959,26 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                 }
                 // OCR engine buttons
                 if (const auto* button = hit_test_ocr_engine_button(pt)) {
-                    bool is_downloading = false;
-                    {
-                        std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
-                        is_downloading = g_ocr_download.is_downloading;
-                    }
-                    if (!is_downloading) {
+                    if (!state->is_downloading) {
                         state->config.ocr_engine = std::wstring(button->engine);
-                        {
-                            std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
-                            g_ocr_download.error.clear();
-                        }
+                        g_ocr_download.clear_error();
+                        refresh_ocr_download_state(state, true);
                         InvalidateRect(window, nullptr, TRUE);
                     }
                     return 0;
                 }
                 // Download button
                 if (pt.x >= 530 && pt.x <= 650 && pt.y >= 565 && pt.y <= 595) {
-                    bool is_downloading = false;
-                    {
-                        std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
-                        is_downloading = g_ocr_download.is_downloading;
-                    }
-                    const OcrDependencyStatus status = ocr_dependency_status(state->config.ocr_engine);
-                    if (status.can_download && !is_downloading) {
-                        start_ocr_download(window, state->config.ocr_download_url);
+                    const OcrDependencyStatus status =
+                        ocr_dependency_status(state->config.ocr_engine);
+                    state->ocr_dependency = status;
+                    if (status.can_download && !state->is_downloading) {
+                        const bool started =
+                            g_ocr_download.start(state->config.ocr_download_url);
+                        refresh_ocr_download_state(state);
+                        if (!started && state->download_error.empty()) {
+                            state->download_error = L"OCR 下载任务已在运行。";
+                        }
                         InvalidateRect(window, nullptr, TRUE);
                     }
                     return 0;
@@ -1113,16 +1987,19 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                 if (pt.y >= 635 && pt.y <= 665) {
                     if (pt.x >= 250 && pt.x <= 380) {
                         state->config.theme = L"system";
+                        refresh_settings_theme(state);
                         InvalidateRect(window, nullptr, TRUE);
                         return 0;
                     }
                     if (pt.x >= 390 && pt.x <= 520) {
                         state->config.theme = L"light";
+                        refresh_settings_theme(state);
                         InvalidateRect(window, nullptr, TRUE);
                         return 0;
                     }
                     if (pt.x >= 530 && pt.x <= 660) {
                         state->config.theme = L"dark";
+                        refresh_settings_theme(state);
                         InvalidateRect(window, nullptr, TRUE);
                         return 0;
                     }
@@ -1228,6 +2105,11 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
 
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN: {
+            if (message == WM_KEYDOWN && w_param == VK_TAB) {
+                move_settings_keyboard_focus(
+                    state, (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+                return 0;
+            }
             if (state->capturing_idx_ != -1) {
                 WPARAM key = w_param;
                 
@@ -1271,10 +2153,42 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
 
                 std::wstring* sh = get_shortcut_ptr(state->config, state->capturing_idx_);
                 if (sh) {
+                    const std::wstring previous = *sh;
                     *sh = shortcut_str;
+                    if (const auto validation_error = shortcut_validation_error(state->config)) {
+                        *sh = previous;
+                        enter_settings_modal(state);
+                        MessageBoxW(window,
+                                    validation_error->c_str(),
+                                    L"快捷键冲突",
+                                    MB_OK | MB_ICONWARNING);
+                        if (!leave_settings_modal(state)) {
+                            return 0;
+                        }
+                    }
                 }
                 state->capturing_idx_ = -1;
                 InvalidateRect(window, nullptr, TRUE);
+                return 0;
+            }
+            if (message == WM_KEYDOWN &&
+                (w_param == VK_RETURN || w_param == VK_SPACE)) {
+                if ((l_param & (1LL << 30)) != 0) {
+                    return 0;
+                }
+                if (state->keyboard_focus_visible && state->keyboard_focus &&
+                    settings_focus_target_available(state, *state->keyboard_focus)) {
+                    const SettingsFocusTarget target = *state->keyboard_focus;
+                    (void)activate_settings_focus(state, target);
+                    return 0;
+                }
+                if (w_param == VK_RETURN) {
+                    (void)accept_settings(state);
+                }
+                return 0;
+            }
+            if (message == WM_KEYDOWN && w_param == VK_ESCAPE) {
+                PostMessageW(window, WM_CLOSE, 0, 0);
                 return 0;
             }
             break;
@@ -1285,8 +2199,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
             GetCursorPos(&pt);
             ScreenToClient(window, &pt);
             
-            float scale = static_cast<float>(GetDpiForWindow(window)) / 96.0f;
-            if (scale <= 0.0f) scale = 1.0f;
+            const float scale = settings_layout_scale(window);
             pt.x = static_cast<LONG>(std::round(pt.x / scale));
             pt.y = static_cast<LONG>(std::round(pt.y / scale));
             
@@ -1305,15 +2218,22 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                 }
             }
             // Check footer buttons
-            if (pt.y >= 715 && pt.y <= 745 && ((pt.x >= 500 && pt.x <= 600) || (pt.x >= 615 && pt.x <= 715))) {
+            if (pt.y >= 715 && pt.y <= 745 &&
+                ((pt.x >= 230 && pt.x <= 350) ||
+                 (pt.x >= 360 && pt.x <= 490) ||
+                 (pt.x >= 500 && pt.x <= 600) ||
+                 (pt.x >= 615 && pt.x <= 715))) {
                 is_hovering_interactive = true;
             }
             // Check content area elements
             if (state->active_tab == 0) {
-                for (int i = 0; i < 6; ++i) {
-                    int sy = 110 + i * 40 + 9;
-                    if (pt.x >= 640 && pt.x <= 684 && pt.y >= sy && pt.y <= sy + 22) {
-                        is_hovering_interactive = true;
+                for (int i = 0; i < kGeneralSwitchCount; ++i) {
+                    const int row_y = 110 + i * kGeneralRowHeight;
+                    if (pt.x >= 230 && pt.x <= 710 &&
+                        pt.y >= row_y && pt.y <= row_y + kGeneralRowHeight) {
+                        if (i != 2 || state->config.ocr_enabled) {
+                            is_hovering_interactive = true;
+                        }
                     }
                 }
                 // Font Family button
@@ -1334,24 +2254,14 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                 }
                 // OCR engine buttons
                 if (hit_test_ocr_engine_button(pt)) {
-                    bool is_downloading = false;
-                    {
-                        std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
-                        is_downloading = g_ocr_download.is_downloading;
-                    }
-                    if (!is_downloading) {
+                    if (!state->is_downloading) {
                         is_hovering_interactive = true;
                     }
                 }
                 // Download button
                 if (pt.x >= 530 && pt.x <= 650 && pt.y >= 565 && pt.y <= 595) {
-                    bool is_downloading = false;
-                    {
-                        std::lock_guard<std::mutex> lock(g_ocr_download.mutex);
-                        is_downloading = g_ocr_download.is_downloading;
-                    }
-                    const OcrDependencyStatus status = ocr_dependency_status(state->config.ocr_engine);
-                    if (status.can_download && !is_downloading) {
+                    if (state->ocr_dependency.can_download &&
+                        !state->is_downloading) {
                         is_hovering_interactive = true;
                     }
                 }
@@ -1407,10 +2317,24 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
 
         case WM_DPICHANGED: {
             const RECT* suggested_rect = reinterpret_cast<const RECT*>(l_param);
-            SetWindowPos(window, nullptr,
-                         suggested_rect->left, suggested_rect->top,
-                         suggested_rect->right - suggested_rect->left,
-                         suggested_rect->bottom - suggested_rect->top,
+            const HMONITOR monitor =
+                MonitorFromRect(suggested_rect, MONITOR_DEFAULTTONEAREST);
+            const RECT work_area = settings_work_area(monitor);
+            const SIZE size = fitted_settings_size(HIWORD(w_param), work_area);
+            const LONG minimum_x = work_area.left + kWorkAreaMargin;
+            const LONG minimum_y = work_area.top + kWorkAreaMargin;
+            const LONG maximum_x = work_area.right - kWorkAreaMargin - size.cx;
+            const LONG maximum_y = work_area.bottom - kWorkAreaMargin - size.cy;
+            const int x = static_cast<int>(std::clamp(
+                suggested_rect->left, minimum_x, std::max(minimum_x, maximum_x)));
+            const int y = static_cast<int>(std::clamp(
+                suggested_rect->top, minimum_y, std::max(minimum_y, maximum_y)));
+            SetWindowPos(window,
+                         nullptr,
+                         x,
+                         y,
+                         size.cx,
+                         size.cy,
                          SWP_NOZORDER | SWP_NOACTIVATE);
             discard_resources(state);
             InvalidateRect(window, nullptr, TRUE);
@@ -1424,8 +2348,23 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
         }
 
         case WM_DESTROY: {
-            PostMessageW(nullptr, WM_NULL, 0, 0);
             return 0;
+        }
+
+        case WM_NCDESTROY: {
+            if (state->download_subscription != 0) {
+                g_ocr_download.unsubscribe(window, state->download_subscription);
+                state->download_subscription = 0;
+            }
+            state->window = nullptr;
+            state->nc_destroyed = true;
+            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            const LRESULT default_result = DefWindowProcW(window, message, w_param, l_param);
+            restore_settings_owner(state);
+            if (state->modal_depth == 0) {
+                finalize_settings_state(state);
+            }
+            return default_result;
         }
     }
     return DefWindowProcW(window, message, w_param, l_param);
@@ -1433,7 +2372,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
 
 } // namespace
 
-bool show_settings_window(HWND owner, AppConfig& config) {
+HWND show_settings_window_async(HWND owner, AppConfig config, SettingsWindowCompletion completion) {
     static std::once_flag class_flag;
     std::call_once(class_flag, [] {
         WNDCLASSEXW window_class{sizeof(window_class)};
@@ -1446,34 +2385,54 @@ bool show_settings_window(HWND owner, AppConfig& config) {
         RegisterClassExW(&window_class);
     });
 
-    SettingsState state;
-    state.config = config;
-    constexpr int window_width = 740;
-    constexpr int window_height = 760;
-    UINT dpi = owner ? GetDpiForWindow(owner) : 96;
+    auto* state = new (std::nothrow) SettingsState;
+    if (!state) {
+        if (completion) {
+            completion(std::nullopt);
+        }
+        return nullptr;
+    }
+    state->config = std::move(config);
+    state->config.default_output =
+        _wcsicmp(state->config.default_output.c_str(), L"file") == 0 ? L"file" : L"clipboard";
+    state->is_light_theme = should_use_light_theme(state->config.theme);
+    state->owner = owner;
+    state->completion = std::move(completion);
+    UINT dpi = owner ? GetDpiForWindow(owner) : GetDpiForSystem();
     if (dpi == 0) {
         dpi = 96;
     }
-    float scale = static_cast<float>(dpi) / 96.0f;
-    const int scaled_width = static_cast<int>(std::round(window_width * scale));
-    const int scaled_height = static_cast<int>(std::round(window_height * scale));
 
     RECT owner_rect{};
-    GetWindowRect(owner, &owner_rect);
-    RECT work_area{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
-    MONITORINFO monitor_info{sizeof(monitor_info)};
-    if (HMONITOR monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
-        monitor && GetMonitorInfoW(monitor, &monitor_info)) {
-        work_area = monitor_info.rcWork;
-    }
+    const bool has_visible_owner =
+        owner && IsWindowVisible(owner) && GetWindowRect(owner, &owner_rect);
+    const HMONITOR monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTOPRIMARY);
+    const RECT work_area = settings_work_area(monitor);
+    const SIZE window_size = fitted_settings_size(dpi, work_area);
     auto clamp_position = [](LONG value, LONG size, LONG minimum, LONG maximum) {
         if (size >= maximum - minimum) {
             return static_cast<int>(minimum);
         }
         return static_cast<int>(std::clamp(value, minimum, maximum - size));
     };
-    const int x = clamp_position(owner_rect.left + 40L, scaled_width, work_area.left + 8L, work_area.right - 8L);
-    const int y = clamp_position(owner_rect.top + 40L, scaled_height, work_area.top + 8L, work_area.bottom - 8L);
+    const LONG preferred_x =
+        has_visible_owner
+            ? owner_rect.left + ((owner_rect.right - owner_rect.left) - window_size.cx) / 2
+            : work_area.left + ((work_area.right - work_area.left) - window_size.cx) / 2;
+    const LONG preferred_y =
+        has_visible_owner
+            ? owner_rect.top + ((owner_rect.bottom - owner_rect.top) - window_size.cy) / 2
+            : work_area.top + ((work_area.bottom - work_area.top) - window_size.cy) / 2;
+    const int x = clamp_position(
+        preferred_x,
+        window_size.cx,
+        work_area.left + kWorkAreaMargin,
+        work_area.right - kWorkAreaMargin);
+    const int y = clamp_position(
+        preferred_y,
+        window_size.cy,
+        work_area.top + kWorkAreaMargin,
+        work_area.bottom - kWorkAreaMargin);
     
     HWND window = CreateWindowExW(WS_EX_TOOLWINDOW,
                                   L"AirScreenshot.Settings",
@@ -1481,20 +2440,25 @@ bool show_settings_window(HWND owner, AppConfig& config) {
                                   WS_POPUP | WS_SYSMENU,
                                   x,
                                   y,
-                                  scaled_width,
-                                  scaled_height,
+                                  window_size.cx,
+                                  window_size.cy,
                                   owner,
                                   nullptr,
                                   GetModuleHandleW(nullptr),
-                                  &state);
+                                  state);
     if (!window) {
-        return false;
+        auto failed_completion = std::move(state->completion);
+        delete state;
+        if (failed_completion) {
+            failed_completion(std::nullopt);
+        }
+        return nullptr;
     }
 
     MARGINS margins = { 1, 1, 1, 1 };
     DwmExtendFrameIntoClientArea(window, &margins);
 
-    BOOL use_dark = !should_use_light_theme(config.theme);
+    BOOL use_dark = !state->is_light_theme;
     DwmSetWindowAttribute(window, 20, &use_dark, sizeof(use_dark));
     DwmSetWindowAttribute(window, 19, &use_dark, sizeof(use_dark));
     DWORD corner_preference = 2; // DWMWCP_ROUND
@@ -1502,15 +2466,40 @@ bool show_settings_window(HWND owner, AppConfig& config) {
     EnableWindow(owner, FALSE);
     ShowWindow(window, SW_SHOW);
     UpdateWindow(window);
+    return window;
+}
+
+bool show_settings_window(HWND owner, AppConfig& config) {
+    bool completed = false;
+    std::optional<AppConfig> result;
+    HWND window = show_settings_window_async(
+        owner,
+        config,
+        [&](std::optional<AppConfig> edited) {
+            result = std::move(edited);
+            completed = true;
+        });
+    if (!window && !completed) {
+        return false;
+    }
+
     MSG message{};
-    while (IsWindow(window) && GetMessageW(&message, nullptr, 0, 0) > 0) {
+    while (!completed) {
+        const BOOL status = GetMessageW(&message, nullptr, 0, 0);
+        if (status <= 0) {
+            if (status == 0) {
+                PostQuitMessage(static_cast<int>(message.wParam));
+            }
+            if (window && IsWindow(window)) {
+                DestroyWindow(window);
+            }
+            break;
+        }
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
-    EnableWindow(owner, TRUE);
-    SetForegroundWindow(owner);
-    if (state.accepted) {
-        config = std::move(state.config);
+    if (result) {
+        config = std::move(*result);
         return true;
     }
     return false;

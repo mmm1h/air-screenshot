@@ -17,7 +17,6 @@ namespace airshot {
 
 inline constexpr wchar_t kAppName[] = L"Air Screenshot";
 inline constexpr wchar_t kAppWindowClass[] = L"AirScreenshot.HostWindow";
-inline constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\LOCAL\\AirScreenshot.v1";
 inline constexpr wchar_t kHostMutexName[] = L"Local\\AirScreenshot.Host.v1";
 inline constexpr wchar_t kLatestJsonUrl[] = L"https://mmm1h.github.io/air-screenshot/latest.json";
 inline constexpr wchar_t kReleaseSignerSha256[] =

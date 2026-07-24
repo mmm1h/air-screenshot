@@ -103,17 +103,51 @@ int slider_value_from_point(const ToolbarButton& button, POINT point) {
     return std::clamp(raw, 0, 100);
 }
 
+bool shortcut_triggered(std::wstring_view shortcut, WPARAM key) {
+    const auto hotkey = parse_hotkey(shortcut);
+    if (!hotkey || hotkey->virtual_key != key) {
+        return false;
+    }
+
+    const bool actual_ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool actual_alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+    const bool actual_shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool actual_win =
+        (GetKeyState(VK_LWIN) & 0x8000) != 0 || (GetKeyState(VK_RWIN) & 0x8000) != 0;
+    return ((hotkey->modifiers & MOD_CONTROL) != 0) == actual_ctrl &&
+           ((hotkey->modifiers & MOD_ALT) != 0) == actual_alt &&
+           ((hotkey->modifiers & MOD_SHIFT) != 0) == actual_shift &&
+           ((hotkey->modifiers & MOD_WIN) != 0) == actual_win;
+}
+
 }  // namespace
 
-OverlaySession::OverlaySession(RegionRequest request) : request_(std::move(request)) {
+OverlaySession::OverlaySession(RegionRequest request, RegionCaptureCompletion completion)
+    : request_(std::move(request)), completion_(std::move(completion)) {
     custom_color_ = parse_hex_color(request_.config.custom_color, RGB(128, 0, 255));
     active_highlight_alpha_ = std::clamp(request_.config.annotation_highlight_alpha, 24, 192);
 }
 
-RegionResult OverlaySession::run() {
+OverlaySession::~OverlaySession() {
+    done_ = true;
+    destroy_scroll_windows();
+    if (prompt_window_ && IsWindow(prompt_window_)) {
+        DestroyWindow(prompt_window_);
+    }
+    prompt_window_ = nullptr;
+    destroy_windows();
+    release_overlay_factories();
+}
+
+bool OverlaySession::start() {
+    if (started_) {
+        return !done_;
+    }
+    started_ = true;
     monitors_ = capture_monitors();
     if (monitors_.empty() || std::ranges::any_of(monitors_, [](const auto& monitor) { return monitor.bitmap.empty(); })) {
-        return {ExitCode::operation_failed, std::wstring(strings::capture_failed)};
+        finish({ExitCode::operation_failed, std::wstring(strings::capture_failed)});
+        return false;
     }
     window_candidates_ = enumerate_window_candidates();
     virtual_bounds_ = monitors_.front().bounds;
@@ -139,17 +173,39 @@ RegionResult OverlaySession::run() {
         SetForegroundWindow(windows_.front()->hwnd());
         SetFocus(windows_.front()->hwnd());
     }
+    return !done_;
+}
 
+RegionResult OverlaySession::run() {
+    start();
     MSG message{};
-    while (!done_ && GetMessageW(&message, nullptr, 0, 0) > 0) {
+    while (!done_) {
+        const BOOL status = GetMessageW(&message, nullptr, 0, 0);
+        if (status <= 0) {
+            if (status == 0) {
+                PostQuitMessage(static_cast<int>(message.wParam));
+            }
+            if (!done_) {
+                finish({ExitCode::user_cancelled, L"已取消。"});
+            }
+            break;
+        }
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    destroy_windows();
+    return std::move(result_);
+}
+
+void OverlaySession::cancel() {
+    finish({ExitCode::user_cancelled, L"已取消。"});
+}
+
+void OverlaySession::destroy_windows() {
     for (auto& window : windows_) {
         window->destroy();
     }
     windows_.clear();
-    return result_;
 }
 
 DragMode OverlaySession::hit_test_drag_mode(POINT point) const {
@@ -301,20 +357,37 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
                 return;
             }
             if (active_tool_ == Tool::text) {
-                bool is_light = should_use_light_theme(request_.config.theme);
-                if (auto text = prompt_text(source, point, active_color_, active_text_size_, is_light)) {
-                    discard_redo();
-                    Annotation annotation;
-                    annotation.tool = Tool::text;
-                    annotation.start = relative;
-                    annotation.end = relative;
-                    annotation.text = std::move(*text);
-                    annotation.color = active_color_;
-                    annotation.width = active_text_size_;
-                    annotation.text_style = active_text_style_;
-                    annotations_.push_back(std::move(annotation));
-                    finish_annotation();
+                if (prompt_window_ && IsWindow(prompt_window_)) {
+                    SetForegroundWindow(prompt_window_);
+                    return;
                 }
+                bool is_light = should_use_light_theme(request_.config.theme);
+                const COLORREF color = active_color_;
+                const float text_size = active_text_size_;
+                const TextStyle text_style = active_text_style_;
+                prompt_window_ = show_text_prompt(
+                    source,
+                    point,
+                    color,
+                    text_size,
+                    is_light,
+                    [this, relative, color, text_size, text_style](std::optional<std::wstring> text) {
+                        prompt_window_ = nullptr;
+                        if (done_ || !text) {
+                            return;
+                        }
+                        discard_redo();
+                        Annotation annotation;
+                        annotation.tool = Tool::text;
+                        annotation.start = relative;
+                        annotation.end = relative;
+                        annotation.text = std::move(*text);
+                        annotation.color = color;
+                        annotation.width = text_size;
+                        annotation.text_style = text_style;
+                        annotations_.push_back(std::move(annotation));
+                        finish_annotation();
+                    });
                 return;
             }
             if (active_tool_ == Tool::watermark) {
@@ -544,8 +617,10 @@ void OverlaySession::on_mouse_move(POINT point) {
     invalidate_all();
 }
 
-void OverlaySession::on_mouse_up(POINT point) {
-    ReleaseCapture();
+void OverlaySession::on_mouse_up(HWND source, POINT point) {
+    if (GetCapture() == source) {
+        ReleaseCapture();
+    }
     if (selection_complete_ && drawing_annotation_) {
         drawing_annotation_ = false;
         if (preview_.tool != Tool::eraser && annotation_has_size(preview_)) {
@@ -606,7 +681,8 @@ void OverlaySession::on_mouse_up(POINT point) {
 
 void OverlaySession::on_double_click(POINT point) {
     if (selection_complete_ && selection_.contains(point) && !is_over_toolbar(point)) {
-        complete_clipboard();
+        HWND owner = windows_.empty() ? nullptr : windows_.front()->hwnd();
+        complete_default(owner);
     }
 }
 
@@ -629,7 +705,11 @@ void OverlaySession::on_key_down(HWND source, WPARAM key) {
             } else {
                 color_str = std::format(L"rgb({}, {}, {})", GetRValue(color), GetGValue(color), GetBValue(color));
             }
-            (void)copy_text_to_clipboard(color_str);
+            std::wstring error;
+            if (!copy_text_to_clipboard(color_str, &error)) {
+                finish({ExitCode::operation_failed, std::move(error)});
+                return;
+            }
 
             custom_color_ = color;
             request_.config.custom_color = format_hex_color(color);
@@ -646,49 +726,7 @@ void OverlaySession::on_key_down(HWND source, WPARAM key) {
         return;
     }
 
-    // After selection is complete: normal editing shortcuts
-    auto is_shortcut_triggered = [this](std::wstring_view shortcut_str, WPARAM k) {
-        auto hotkey = parse_hotkey(shortcut_str);
-        if (!hotkey) return false;
-        if (hotkey->virtual_key != k) return false;
-
-        bool ctrl = (hotkey->modifiers & MOD_CONTROL) != 0;
-        bool alt = (hotkey->modifiers & MOD_ALT) != 0;
-        bool shift = (hotkey->modifiers & MOD_SHIFT) != 0;
-        bool win = (hotkey->modifiers & MOD_WIN) != 0;
-
-        bool actual_ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        bool actual_alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-        bool actual_shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-        bool actual_win = (GetKeyState(VK_LWIN) & 0x8000) != 0 || (GetKeyState(VK_RWIN) & 0x8000) != 0;
-
-        return ctrl == actual_ctrl && alt == actual_alt && shift == actual_shift && win == actual_win;
-    };
-
-    Tool target_tool = Tool::none;
-    if (is_shortcut_triggered(request_.config.tool_shortcut_select, key)) target_tool = Tool::select;
-    else if (is_shortcut_triggered(request_.config.tool_shortcut_rectangle, key)) target_tool = Tool::rectangle;
-    else if (is_shortcut_triggered(request_.config.tool_shortcut_ellipse, key)) target_tool = Tool::ellipse;
-    else if (is_shortcut_triggered(request_.config.tool_shortcut_line, key)) target_tool = Tool::line;
-    else if (is_shortcut_triggered(request_.config.tool_shortcut_arrow, key)) target_tool = Tool::arrow;
-    else if (is_shortcut_triggered(request_.config.tool_shortcut_pen, key)) target_tool = Tool::pen;
-    else if (is_shortcut_triggered(request_.config.tool_shortcut_mosaic, key)) target_tool = Tool::mosaic;
-    else if (is_shortcut_triggered(request_.config.tool_shortcut_blur, key)) target_tool = Tool::blur;
-    else if (is_shortcut_triggered(request_.config.tool_shortcut_highlight, key)) target_tool = Tool::highlight;
-    else if (is_shortcut_triggered(request_.config.tool_shortcut_text, key)) target_tool = Tool::text;
-    else if (is_shortcut_triggered(request_.config.tool_shortcut_serial, key)) target_tool = Tool::serial;
-    else if (is_shortcut_triggered(request_.config.tool_shortcut_eraser, key)) target_tool = Tool::eraser;
-
-    if (target_tool != Tool::none) {
-        active_tool_ = target_tool;
-        selected_annotation_idx_ = -1;
-        build_toolbar();
-        build_sub_toolbar();
-        invalidate_all();
-        return;
-    }
-
-    // Arrow keys for micro-adjusting selection
+    // Editing commands take precedence over user-defined tool shortcuts.
     if (key == VK_UP || key == VK_DOWN || key == VK_LEFT || key == VK_RIGHT) {
         int step = (GetKeyState(VK_CONTROL) & 0x8000) ? 10 : 1;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -747,28 +785,52 @@ void OverlaySession::on_key_down(HWND source, WPARAM key) {
         }
     }
 
-    if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 && key == 'C') {
+    if (shortcut_triggered(L"Ctrl+C", key)) {
         complete_clipboard();
         return;
     }
-    if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 && key == L'Z') {
+    if (shortcut_triggered(L"Ctrl+Z", key)) {
         undo();
         return;
     }
-    if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 && key == L'Y') {
+    if (shortcut_triggered(L"Ctrl+Y", key)) {
         redo();
         return;
     }
-    if (request_.config.ocr_enabled && (GetKeyState(VK_SHIFT) & 0x8000) != 0 && key == L'C') {
+    if (request_.config.ocr_enabled &&
+        shortcut_triggered(request_.config.capture_ocr_shortcut, key)) {
         complete_ocr();
         return;
     }
     if (key == VK_RETURN) {
-        complete_clipboard();
+        complete_default(source);
         return;
     }
-    if (key == L'S' && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+    if (shortcut_triggered(L"Ctrl+S", key)) {
         complete_file({}, source);
+        return;
+    }
+
+    Tool target_tool = Tool::none;
+    if (shortcut_triggered(request_.config.tool_shortcut_select, key)) target_tool = Tool::select;
+    else if (shortcut_triggered(request_.config.tool_shortcut_rectangle, key)) target_tool = Tool::rectangle;
+    else if (shortcut_triggered(request_.config.tool_shortcut_ellipse, key)) target_tool = Tool::ellipse;
+    else if (shortcut_triggered(request_.config.tool_shortcut_line, key)) target_tool = Tool::line;
+    else if (shortcut_triggered(request_.config.tool_shortcut_arrow, key)) target_tool = Tool::arrow;
+    else if (shortcut_triggered(request_.config.tool_shortcut_pen, key)) target_tool = Tool::pen;
+    else if (shortcut_triggered(request_.config.tool_shortcut_mosaic, key)) target_tool = Tool::mosaic;
+    else if (shortcut_triggered(request_.config.tool_shortcut_blur, key)) target_tool = Tool::blur;
+    else if (shortcut_triggered(request_.config.tool_shortcut_highlight, key)) target_tool = Tool::highlight;
+    else if (shortcut_triggered(request_.config.tool_shortcut_text, key)) target_tool = Tool::text;
+    else if (shortcut_triggered(request_.config.tool_shortcut_serial, key)) target_tool = Tool::serial;
+    else if (shortcut_triggered(request_.config.tool_shortcut_eraser, key)) target_tool = Tool::eraser;
+
+    if (target_tool != Tool::none) {
+        active_tool_ = target_tool;
+        selected_annotation_idx_ = -1;
+        build_toolbar();
+        build_sub_toolbar();
+        invalidate_all();
     }
 }
 
@@ -790,10 +852,30 @@ RectI OverlaySession::get_text_size_dropdown_bounds() const noexcept {
         if (button.id == L"text_size_btn") {
             const int card_width = 86;
             const int card_height = static_cast<int>(kTextSizes.size()) * kTextSizeDropdownRowHeight;
-            int x = button.bounds.left;
+            RectI available = virtual_bounds_;
+            const POINT anchor{
+                button.bounds.left + button.bounds.width() / 2,
+                button.bounds.top + button.bounds.height() / 2,
+            };
+            for (const auto& monitor : monitors_) {
+                if (monitor.bounds.contains(anchor)) {
+                    available = monitor.bounds;
+                    break;
+                }
+            }
+            const int x = card_width >= available.width()
+                              ? available.left
+                              : std::clamp(button.bounds.left,
+                                           available.left,
+                                           available.right - card_width);
             int y = button.bounds.bottom + 4;
-            if (y + card_height > virtual_bounds_.bottom) {
+            if (y + card_height > available.bottom) {
                 y = button.bounds.top - 4 - card_height;
+            }
+            if (card_height >= available.height()) {
+                y = available.top;
+            } else {
+                y = std::clamp(y, available.top, available.bottom - card_height);
             }
             return RectI{x, y, x + card_width, y + card_height};
         }
@@ -938,9 +1020,16 @@ void OverlaySession::on_mouse_wheel(short delta) {
 
 void OverlaySession::show_quick_menu(HWND hwnd, POINT pt) {
     HMENU menu = CreatePopupMenu();
+    if (!menu) {
+        return;
+    }
 
     // Tools Submenu
     HMENU tools_menu = CreatePopupMenu();
+    if (!tools_menu) {
+        DestroyMenu(menu);
+        return;
+    }
     AppendMenuW(tools_menu, MF_STRING, 101, L"选择工具 (Select)\tSelect");
     AppendMenuW(tools_menu, MF_STRING, 102, L"矩形 (Rectangle)\tRectangle");
     AppendMenuW(tools_menu, MF_STRING, 103, L"椭圆 (Ellipse)\tEllipse");
@@ -958,11 +1047,22 @@ void OverlaySession::show_quick_menu(HWND hwnd, POINT pt) {
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(tools_menu), L"工具 (Tools)");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
-    AppendMenuW(menu, MF_STRING, 1, L"复制到剪贴板 (Copy)\tCtrl+C / Enter");
-    AppendMenuW(menu, MF_STRING, 2, L"保存到文件 (Save)\tCtrl+S");
+    const bool enter_saves = _wcsicmp(request_.config.default_output.c_str(), L"file") == 0;
+    AppendMenuW(menu,
+                MF_STRING,
+                1,
+                enter_saves ? L"复制到剪贴板 (Copy)\tCtrl+C"
+                            : L"复制到剪贴板 (Copy)\tCtrl+C / Enter");
+    AppendMenuW(menu,
+                MF_STRING,
+                2,
+                enter_saves ? L"保存到文件 (Save)\tCtrl+S / Enter"
+                            : L"保存到文件 (Save)\tCtrl+S");
     AppendMenuW(menu, MF_STRING, 3, L"贴图 (Pin)");
     if (request_.config.ocr_enabled) {
-        AppendMenuW(menu, MF_STRING, 4, L"屏幕识字 (OCR)\tShift+C");
+        const std::wstring ocr_label =
+            std::format(L"屏幕识字 (OCR)\t{}", request_.config.capture_ocr_shortcut);
+        AppendMenuW(menu, MF_STRING, 4, ocr_label.c_str());
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
@@ -972,9 +1072,14 @@ void OverlaySession::show_quick_menu(HWND hwnd, POINT pt) {
     AppendMenuW(menu, MF_STRING, 7, L"退出 (Exit)\tEsc");
 
     // Show menu
+    enter_modal();
     int selection = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, nullptr);
     DestroyMenu(tools_menu);
     DestroyMenu(menu);
+    if (done_) {
+        leave_modal();
+        return;
+    }
 
     if (selection == 1) {
         complete_clipboard();
@@ -1013,6 +1118,7 @@ void OverlaySession::show_quick_menu(HWND hwnd, POINT pt) {
         build_sub_toolbar();
         invalidate_all();
     }
+    leave_modal();
 }
 
 }  // namespace airshot::overlay_detail
