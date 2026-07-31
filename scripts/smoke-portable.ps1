@@ -5,7 +5,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$temporary = Join-Path ([IO.Path]::GetTempPath()) "AirScreenshot-Smoke-$PID"
+if (-not [IO.Path]::IsPathFullyQualified($Executable)) {
+    $Executable = Join-Path $root $Executable
+}
+$Executable = [IO.Path]::GetFullPath($Executable)
+if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
+    throw "AirScreenshot executable was not found: $Executable"
+}
+$temporary = Join-Path (
+    [IO.Path]::GetTempPath()
+) ("AirScreenshot-Portable-" + [Guid]::NewGuid().ToString("N"))
 $firstDirectory = Join-Path $temporary "first"
 $movedDirectory = Join-Path $temporary "moved"
 $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"

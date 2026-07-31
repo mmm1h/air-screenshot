@@ -23,6 +23,7 @@
 #include <utility>
 
 #include <winrt/Windows.Data.Json.h>
+#include <winrt/Windows.Foundation.Collections.h>
 
 #pragma comment(lib, "winhttp.lib")
 
@@ -501,6 +502,46 @@ std::filesystem::path updates_directory_path() {
 
 std::filesystem::path pending_manifest_path(const std::filesystem::path& directory) {
     return directory / L"pending.json";
+}
+
+struct PendingUpdate {
+    UpdateManifest manifest;
+    UpdateRequestSource source{UpdateRequestSource::automatic};
+};
+
+std::optional<PendingUpdate> parse_pending_update(std::wstring_view json) {
+    const auto manifest = parse_update_manifest(json);
+    if (!manifest) {
+        return std::nullopt;
+    }
+    try {
+        const JsonObject object = JsonObject::Parse(json);
+        UpdateRequestSource source = UpdateRequestSource::automatic;
+        if (object.HasKey(L"source")) {
+            const std::wstring value =
+                object.GetNamedString(L"source").c_str();
+            if (value == L"manual") {
+                source = UpdateRequestSource::manual;
+            } else if (value != L"automatic") {
+                return std::nullopt;
+            }
+        }
+        return PendingUpdate{*manifest, source};
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::wstring pending_update_to_json(const PendingUpdate& pending) {
+    JsonObject object = JsonObject::Parse(
+        update_manifest_to_json(pending.manifest));
+    object.SetNamedValue(
+        L"source",
+        JsonValue::CreateStringValue(
+            pending.source == UpdateRequestSource::manual
+                ? L"manual"
+                : L"automatic"));
+    return object.Stringify().c_str();
 }
 
 std::filesystem::path update_executable_path(
@@ -2698,23 +2739,23 @@ bool helper_matches_pending_update(
     UpdateManifest* manifest,
     std::wstring* error) {
     const auto text = read_text_file(pending_manifest_path(directory), error);
-    const auto parsed = text ? parse_update_manifest(*text) : std::nullopt;
+    const auto parsed = text ? parse_pending_update(*text) : std::nullopt;
     if (!parsed) {
         set_error(error, L"找不到有效的待处理更新清单。");
         return false;
     }
     const std::filesystem::path self = portable_executable_path();
     const std::filesystem::path expected =
-        update_executable_path(directory, parsed->version);
+        update_executable_path(directory, parsed->manifest.version);
     if (self.empty() || !same_file(self, expected, error) ||
-        !verify_portable_executable(self, *parsed, error)) {
+        !verify_portable_executable(self, parsed->manifest, error)) {
         if (error && error->empty()) {
             *error = L"更新 helper 与待处理更新不匹配。";
         }
         return false;
     }
     if (manifest) {
-        *manifest = *parsed;
+        *manifest = parsed->manifest;
     }
     return true;
 }
@@ -3407,21 +3448,56 @@ bool remove_regular_file(const std::filesystem::path& path) {
     return DeleteFileW(path.c_str()) != FALSE;
 }
 
-bool pending_update_available_unlocked(
+std::optional<PendingUpdate> validated_pending_update_unlocked(
     const std::filesystem::path& directory) {
     const auto text = read_text_file(pending_manifest_path(directory));
-    const auto manifest = text ? parse_update_manifest(*text) : std::nullopt;
-    if (!manifest ||
-        !version_is_newer(from_utf8(AIRSHOT_VERSION), manifest->version)) {
-        return false;
+    const auto pending = text ? parse_pending_update(*text) : std::nullopt;
+    if (!pending ||
+        !version_is_newer(
+            from_utf8(AIRSHOT_VERSION), pending->manifest.version)) {
+        return std::nullopt;
     }
-    return verify_portable_executable(
-        update_executable_path(directory, manifest->version), *manifest);
+    if (!verify_portable_executable(
+            update_executable_path(directory, pending->manifest.version),
+            pending->manifest)) {
+        return std::nullopt;
+    }
+    return pending;
+}
+
+bool pending_update_available_unlocked(
+    const std::filesystem::path& directory,
+    bool allow_automatic_pending = true) {
+    const auto pending = validated_pending_update_unlocked(directory);
+    return pending &&
+           portable_internal::pending_update_source_allowed(
+               pending->source, allow_automatic_pending);
 }
 
 }  // namespace
 
 namespace portable_internal {
+
+std::optional<UpdateRequestSource> pending_update_source_from_json(
+    std::wstring_view json) {
+    const auto pending = parse_pending_update(json);
+    return pending
+               ? std::optional<UpdateRequestSource>(pending->source)
+               : std::nullopt;
+}
+
+std::wstring pending_update_to_json_for_testing(
+    const UpdateManifest& manifest,
+    UpdateRequestSource source) {
+    return pending_update_to_json(PendingUpdate{manifest, source});
+}
+
+bool pending_update_source_allowed(
+    UpdateRequestSource source,
+    bool allow_automatic_pending) noexcept {
+    return allow_automatic_pending ||
+           source == UpdateRequestSource::manual;
+}
 
 bool named_object_security_uses_current_user_owner(
     std::wstring* error) {
@@ -4084,12 +4160,21 @@ bool update_target_is_replaceable(std::wstring* error) {
 }
 
 UpdateStageResult stage_latest_update(std::wstring* message) {
-    return stage_latest_update(message, {});
+    return stage_latest_update(
+        message, {}, UpdateRequestSource::automatic);
 }
 
 UpdateStageResult stage_latest_update(
     std::wstring* message,
     std::stop_token stop_token) {
+    return stage_latest_update(
+        message, stop_token, UpdateRequestSource::automatic);
+}
+
+UpdateStageResult stage_latest_update(
+    std::wstring* message,
+    std::stop_token stop_token,
+    UpdateRequestSource source) {
     clear_error(message);
     auto update_lock =
         lock_update_operation(stop_token, INFINITE, message);
@@ -4112,7 +4197,25 @@ UpdateStageResult stage_latest_update(
             set_error(message, error);
             return UpdateStageResult::failed;
         }
-        if (pending_update_available_unlocked(*directory)) {
+        auto pending_update =
+            validated_pending_update_unlocked(*directory);
+        if (pending_update) {
+            if (source == UpdateRequestSource::manual &&
+                pending_update->source == UpdateRequestSource::automatic) {
+                pending_update->source = UpdateRequestSource::manual;
+                if (!write_text_file(
+                        pending_manifest_path(*directory),
+                        pending_update_to_json(*pending_update),
+                        *update_directory_guard,
+                        &error)) {
+                    set_error(
+                        message,
+                        error.empty()
+                            ? L"已下载更新有效，但无法记录本次手动更新意图。"
+                            : error);
+                    return UpdateStageResult::failed;
+                }
+            }
             set_error(
                 message,
                 L"新版本已下载，将在退出或下次启动时更新。");
@@ -4207,7 +4310,7 @@ UpdateStageResult stage_latest_update(
         download_cleanup.release();
         if (!write_text_file(
                 pending_manifest_path(*directory),
-                update_manifest_to_json(*manifest),
+                pending_update_to_json(PendingUpdate{*manifest, source}),
                 *update_directory_guard,
                 &error)) {
             remove_regular_file(staged_path);
@@ -4226,24 +4329,79 @@ UpdateStageResult stage_latest_update(
     }
 }
 
-bool pending_update_available() {
+PendingUpdateManualResult mark_pending_update_manual(
+    std::wstring* error) {
+    clear_error(error);
+    std::wstring lock_error;
     auto update_lock =
-        lock_update_operation({}, 2'000, nullptr);
+        lock_update_operation({}, 0, &lock_error);
     if (!update_lock) {
-        return false;
+        set_error(error, lock_error);
+        return lock_error.find(L"另一个更新操作正在进行") !=
+                       std::wstring::npos
+                   ? PendingUpdateManualResult::busy
+                   : PendingUpdateManualResult::failed;
     }
-    const auto directory = safe_updates_directory(false);
-    if (!directory) {
-        return false;
+    try {
+        const std::filesystem::path expected_directory =
+            updates_directory_path();
+        if (path_is_missing(expected_directory)) {
+            clear_error(error);
+            return PendingUpdateManualResult::missing;
+        }
+        const auto directory = safe_updates_directory(false, error);
+        if (!directory) {
+            return PendingUpdateManualResult::failed;
+        }
+        auto directory_guard =
+            lock_safe_directory_tree(*directory, error);
+        if (!directory_guard) {
+            return PendingUpdateManualResult::failed;
+        }
+        const auto path = pending_manifest_path(*directory);
+        if (path_is_missing(path)) {
+            clear_error(error);
+            return PendingUpdateManualResult::missing;
+        }
+        const auto text = read_text_file(path, error);
+        if (!text) {
+            return PendingUpdateManualResult::failed;
+        }
+        auto pending = parse_pending_update(*text);
+        if (!pending ||
+            !version_is_newer(
+                from_utf8(AIRSHOT_VERSION),
+                pending->manifest.version)) {
+            set_error(error, L"待处理更新清单无效或已经过期。");
+            return PendingUpdateManualResult::invalid;
+        }
+        if (pending->source == UpdateRequestSource::manual) {
+            return PendingUpdateManualResult::ready;
+        }
+        pending->source = UpdateRequestSource::manual;
+        return write_text_file(
+                   path,
+                   pending_update_to_json(*pending),
+                   *directory_guard,
+                   error)
+                   ? PendingUpdateManualResult::ready
+                   : PendingUpdateManualResult::failed;
+    } catch (const std::exception& exception) {
+        set_error(error, from_utf8(exception.what()));
+        return PendingUpdateManualResult::failed;
     }
-    auto directory_guard =
-        lock_safe_directory_tree(*directory, nullptr);
-    return directory_guard &&
-           pending_update_available_unlocked(*directory);
 }
 
 bool launch_pending_update(
     bool restart_after_update,
+    std::wstring* error) {
+    return launch_pending_update(
+        restart_after_update, true, error);
+}
+
+bool launch_pending_update(
+    bool restart_after_update,
+    bool allow_automatic_pending,
     std::wstring* error) {
     clear_error(error);
     auto update_lock =
@@ -4274,19 +4432,27 @@ bool launch_pending_update(
         }
         const auto text =
             read_text_file(pending, error);
-        const auto manifest =
-            text ? parse_update_manifest(*text) : std::nullopt;
-        if (!manifest ||
+        const auto pending_update =
+            text ? parse_pending_update(*text) : std::nullopt;
+        if (!pending_update ||
             !version_is_newer(
-                from_utf8(AIRSHOT_VERSION), manifest->version)) {
+                from_utf8(AIRSHOT_VERSION),
+                pending_update->manifest.version)) {
             if (text) {
                 clear_error(error);
             }
             return false;
         }
+        if (!portable_internal::pending_update_source_allowed(
+                pending_update->source,
+                allow_automatic_pending)) {
+            clear_error(error);
+            return false;
+        }
+        const UpdateManifest& manifest = pending_update->manifest;
         const auto staged =
-            update_executable_path(*directory, manifest->version);
-        if (!verify_portable_executable(staged, *manifest, error)) {
+            update_executable_path(*directory, manifest.version);
+        if (!verify_portable_executable(staged, manifest, error)) {
             return false;
         }
 
@@ -4434,11 +4600,11 @@ int run_update_helper(std::span<const std::wstring> arguments) {
         if (arguments.size() == 3 &&
             arguments[0] == L"--verify-update") {
             const auto text = read_text_file(arguments[2]);
-            const auto manifest =
-                text ? parse_update_manifest(*text) : std::nullopt;
-            return manifest &&
+            const auto pending =
+                text ? parse_pending_update(*text) : std::nullopt;
+            return pending &&
                            verify_portable_executable(
-                               arguments[1], *manifest)
+                               arguments[1], pending->manifest)
                        ? 0
                        : static_cast<int>(ExitCode::operation_failed);
         }

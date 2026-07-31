@@ -44,6 +44,10 @@ dependencies where available.
 
 ## Behavioral references not redistributed
 
-Flameshot (<https://github.com/flameshot-org/flameshot>) is used as an
-interaction reference for screenshot and annotation workflows. No Flameshot
-code or binary is included on that basis.
+Snipaste (<https://www.snipaste.com/>), PixPin
+(<https://pixpin.cn/>), Snow Shot
+(<https://github.com/mg-chao/snow-shot>), and Flameshot
+(<https://github.com/flameshot-org/flameshot>) are used as behavioral and
+interaction references for capture, annotation, scrolling capture, pinning,
+and OCR workflows. No code, binary, brand asset, or proprietary artwork from
+those products is included on that basis.

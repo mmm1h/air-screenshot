@@ -24,6 +24,12 @@ jobs:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - name: Set up pinned Python for OCR tests and packaging
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11.15"
+          architecture: "x64"
+
       - name: Validate release metadata
         id: metadata
         shell: pwsh
@@ -60,12 +66,6 @@ jobs:
             -Version $env:VERSION `
             -OcrManifestKeyId $env:OCR_MANIFEST_KEY_ID `
             -OcrManifestPublicKeyHex $env:OCR_MANIFEST_PUBLIC_KEY_HEX
-
-      - name: Set up pinned Python for OCR runner
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: "3.11.15"
-          architecture: "x64"
 
       - name: Prepare OCR dependencies
         shell: pwsh
@@ -290,6 +290,8 @@ jobs:
             dist/site/AirScreenshot.exe
             dist/site/ocr-dependencies.json
             dist/site/ocr-dependencies.json.sig
+            dist/site/ocr/rapidocr-onnx/.airshot-manifest.json
+            dist/site/ocr/rapidocr-onnx/.airshot-manifest.sig
             dist/site/ocr/rapidocr-onnx/rapidocr_runner.exe
             dist/release-assets/AirScreenshot.pdb
             dist/release-assets/AirScreenshot.spdx.json

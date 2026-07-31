@@ -24,4 +24,10 @@ struct ClipboardVisual {
     HWND owner = nullptr,
     std::wstring* error = nullptr);
 
+// Decodes the first frame of a local static image through WIC. Network paths,
+// files over 128 MiB and decoded images over 64 MiB are rejected.
+[[nodiscard]] std::optional<Bitmap> decode_local_image_file(
+    const std::filesystem::path& path,
+    std::wstring* error = nullptr);
+
 }  // namespace airshot

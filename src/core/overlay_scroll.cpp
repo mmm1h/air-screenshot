@@ -557,6 +557,18 @@ bool scroll_bitmap_fits_budget(int width, int height) noexcept {
     return stitched_dimensions_allowed(width, height, bytes);
 }
 
+bool replace_scroll_resume_baseline(
+    Bitmap& baseline,
+    Bitmap candidate) noexcept {
+    if (!baseline.valid() || !candidate.valid() ||
+        baseline.width != candidate.width ||
+        baseline.height != candidate.height) {
+        return false;
+    }
+    baseline = std::move(candidate);
+    return true;
+}
+
 bool is_bitmap_static(const Bitmap& bmp1, const Bitmap& bmp2) {
     if (!valid_bitmap(bmp1) || !valid_bitmap(bmp2)) return false;
     if (bmp1.width != bmp2.width || bmp1.height != bmp2.height) return false;

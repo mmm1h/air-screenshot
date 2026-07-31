@@ -15,6 +15,16 @@ namespace airshot::overlay_detail {
                                         const std::vector<Annotation>& annotations,
                                         const AppConfig& config);
 
+// Uses the exact GDI font construction and DrawText flags used by
+// render_annotations. A zero rectangle means the annotation cannot be
+// measured (for example, it is not a non-empty text annotation).
+[[nodiscard]] RectI measure_text_annotation_bounds(
+    const Annotation& annotation,
+    const AppConfig& config) noexcept;
+[[nodiscard]] bool refresh_text_annotation_bounds(
+    Annotation& annotation,
+    const AppConfig& config) noexcept;
+
 [[nodiscard]] COLORREF parse_hex_color(std::wstring_view hex, COLORREF fallback);
 [[nodiscard]] std::wstring format_hex_color(COLORREF color);
 
@@ -33,22 +43,69 @@ using TextPromptCompletion = std::function<void(std::optional<std::wstring>)>;
                                     float text_size,
                                     bool is_light_theme,
                                     TextPromptCompletion completion,
-                                    std::wstring initial_text = {});
+                                    std::wstring initial_text = {},
+                                    std::wstring_view font_family = L"Microsoft YaHei",
+                                    bool font_bold = false,
+                                    bool font_italic = false,
+                                    TextStyle text_style = TextStyle::normal);
 [[nodiscard]] std::optional<std::wstring> prompt_text(HWND owner, POINT position, COLORREF color, float text_size, bool is_light_theme);
+
+struct SelectionSizeInput {
+    int width{};
+    int height{};
+    SelectionSizeAnchor anchor{SelectionSizeAnchor::center};
+};
+
+using SelectionSizeCompletion =
+    std::function<void(std::optional<SelectionSizeInput>)>;
+
+[[nodiscard]] HWND show_selection_size_prompt(
+    HWND owner,
+    POINT position,
+    int current_width,
+    int current_height,
+    int maximum_width,
+    int maximum_height,
+    bool is_light_theme,
+    SelectionSizeCompletion completion);
 
 struct ScrollControlState {
     bool finished{false};
     bool cancelled{false};
+    bool paused{false};
+    bool can_resume{true};
     int hover_button{};
     int pressed_button{};
     int blink_counter{};
     std::function<void()> on_tick;
+    std::function<void()> on_toggle_pause;
     std::function<void()> on_finish;
     std::function<void()> on_cancel;
 };
 
 inline constexpr UINT_PTR kScrollBlinkTimer = 1;
 inline constexpr UINT_PTR kScrollCaptureTimer = 2;
+
+enum class ScrollKeyboardCommand {
+    none,
+    toggle_pause,
+    finish,
+    cancel,
+};
+
+[[nodiscard]] inline ScrollKeyboardCommand scroll_keyboard_command(
+    WPARAM key) noexcept {
+    if (key == 'P' || key == VK_SPACE) {
+        return ScrollKeyboardCommand::toggle_pause;
+    }
+    if (key == VK_RETURN) {
+        return ScrollKeyboardCommand::finish;
+    }
+    if (key == VK_ESCAPE) {
+        return ScrollKeyboardCommand::cancel;
+    }
+    return ScrollKeyboardCommand::none;
+}
 
 [[nodiscard]] HWND create_scroll_border_window(HINSTANCE instance, HWND parent, const RectI& bounds);
 [[nodiscard]] HWND create_scroll_control_window(HINSTANCE instance, HWND parent, const RectI& selection, ScrollControlState* state);
@@ -96,6 +153,12 @@ inline constexpr std::size_t kMaxScrollBitmapBytes =
 inline constexpr int kMaxScrollBitmapHeight = 65'535;
 
 [[nodiscard]] bool scroll_bitmap_fits_budget(int width, int height) noexcept;
+// A resume frame becomes the new comparison baseline only when it is a valid
+// capture of the exact same pixel region. Failure leaves the previous baseline
+// untouched so the caller can remain paused and retry safely.
+[[nodiscard]] bool replace_scroll_resume_baseline(
+    Bitmap& baseline,
+    Bitmap candidate) noexcept;
 
 enum class StitchStatus {
     success,

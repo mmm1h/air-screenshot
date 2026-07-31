@@ -299,7 +299,7 @@ The compact `截图 → 标注 → OCR → 输出` strip keeps cause and result 
 
 **Key Characteristics:**
 
-- Five stable destinations in a 224-DIP precision rail.
+- Six stable destinations in a 224-DIP precision rail.
 - Open 56-DIP settings rows and compact 40-DIP tool rows.
 - Cobalt interaction, cyan health, and red recovery semantics.
 - A 64-DIP footer that keeps save validity and draft state visible.
@@ -430,6 +430,12 @@ The application-icon family shares a centered safe-area system and the same thre
 
 **The Saved Runtime Icon Rule.** Treat the selected icon as draft state until Save; update runtime shell surfaces after Save while leaving the Explorer program-file icon on Focus Frame.
 
+### Update & Security
+
+- The sixth destination contains one editable automatic-update switch followed by read-only verification, installation-safety, manual-check, and activation guidance.
+- Saving changes only the preference draft; it never starts network activity. The manual “检查更新” action remains in the tray so automatic and explicit user intent are visually and behaviorally distinct.
+- Security guarantees use normal row hierarchy and concise recovery copy. They are not presented as decorative badges or controls that imply a configurable trust policy.
+
 ### Shortcut Fields
 
 - Global shortcut fields are 186 × 36 DIPs; compact tool fields are 134 × 30 DIPs. Both use a 7-DIP radius and centered Consolas text.
@@ -438,7 +444,7 @@ The application-icon family shares a centered safe-area system and the same thre
 
 ### Navigation
 
-- Five destinations live in the 224-DIP near-black rail. Each destination occupies a 200 × 40-DIP item on a 48-DIP pitch.
+- Six destinations live in the 224-DIP near-black rail. Each destination occupies a 200 × 40-DIP item on a 48-DIP pitch.
 - The selected item uses the rail-selected surface, full rail text, and a 3 × 22-DIP cobalt indicator; inactive items use muted rail text.
 - The rail also exposes the current screenshot shortcut in a compact bordered field.
 

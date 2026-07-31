@@ -35,7 +35,12 @@ private:
     D2D1_RECT_F local_rect(const RectI& rect) const;
     bool draw_rendered_annotations();
     void draw_annotation(const Annotation& annotation, bool preview);
-    void draw_arrow(POINT start, POINT end, ID2D1Brush* brush, float width);
+    void draw_arrow(POINT start,
+                    POINT end,
+                    ID2D1Brush* brush,
+                    float width,
+                    ArrowHeadStyle head_style,
+                    ID2D1StrokeStyle* stroke_style);
 
     OverlaySession& session_;
     MonitorSnapshot& monitor_;
@@ -45,6 +50,7 @@ private:
     Microsoft::WRL::ComPtr<ID2D1Bitmap> rendered_annotations_;
     std::uint64_t rendered_annotation_revision_{};
     RectI rendered_annotation_selection_;
+    bool rendered_annotation_has_effect_preview_{};
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> dim_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> blue_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> white_brush_;
@@ -61,6 +67,7 @@ private:
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> green_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> red_brush_;
     Microsoft::WRL::ComPtr<ID2D1StrokeStyle> round_stroke_style_;
+    Microsoft::WRL::ComPtr<ID2D1StrokeStyle> dashed_stroke_style_;
     bool is_light_theme_{};
 };
 

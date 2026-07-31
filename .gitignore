@@ -1,4 +1,5 @@
 /build/
+/build-*/
 /build_debug/
 /dist/
 /.vs/
@@ -9,3 +10,5 @@
 /*.cer
 *.obj
 *.log
+__pycache__/
+*.py[cod]

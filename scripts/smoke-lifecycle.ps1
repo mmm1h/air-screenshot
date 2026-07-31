@@ -24,6 +24,9 @@ $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $originalDataDirectory = $env:AIRSHOT_DATA_DIR
 $originalRunValue = $null
 $hadRunValue = $false
+$smokeHotkey = $null
+$heldSmokeHotkey = $false
+$smokeHotkeyFixtureId = 0x4157
 try {
     $originalRunValue = (
         Get-ItemProperty -LiteralPath $runKey -Name AirScreenshot -ErrorAction Stop
@@ -33,6 +36,7 @@ try {
 catch {
 }
 
+if (-not ("AirScreenshotSmokeNative" -as [type])) {
 Add-Type -TypeDefinition @"
 using System;
 using System.Diagnostics;
@@ -43,12 +47,135 @@ using System.Security.Principal;
 using System.Text;
 
 public static class AirScreenshotSmokeNative {
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr FindWindow(string className, string windowName);
+    [DllImport(
+        "user32.dll",
+        EntryPoint = "FindWindowW",
+        CharSet = CharSet.Unicode,
+        ExactSpelling = true)]
+    private static extern IntPtr FindWindowNative(
+        string className,
+        string windowName);
+
+    public static IntPtr FindWindowByClass(string className)
+    {
+        return FindWindowNative(className, null);
+    }
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativePoint
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeRect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetCursorPos(out NativePoint point);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetCursorPos(int x, int y);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(IntPtr window, out NativeRect rect);
+
+    public static bool DragRegionSelection(IntPtr window)
+    {
+        const uint WM_MOUSEMOVE = 0x0200;
+        const uint WM_LBUTTONDOWN = 0x0201;
+        const uint WM_LBUTTONUP = 0x0202;
+        const int MK_LBUTTON = 0x0001;
+
+        NativeRect rect;
+        NativePoint original;
+        if (!GetWindowRect(window, out rect) || !GetCursorPos(out original))
+        {
+            return false;
+        }
+        int availableWidth = rect.Right - rect.Left;
+        int availableHeight = rect.Bottom - rect.Top;
+        if (availableWidth < 16 || availableHeight < 16)
+        {
+            return false;
+        }
+
+        int startX = rect.Left + Math.Min(32, Math.Max(2, availableWidth / 4));
+        int startY = rect.Top + Math.Min(32, Math.Max(2, availableHeight / 4));
+        int endX = Math.Min(rect.Right - 2, startX + Math.Min(240, Math.Max(8, availableWidth / 3)));
+        int endY = Math.Min(rect.Bottom - 2, startY + Math.Min(160, Math.Max(8, availableHeight / 3)));
+        try
+        {
+            if (!SetCursorPos(startX, startY))
+            {
+                return false;
+            }
+            SendMessage(window, WM_LBUTTONDOWN, new IntPtr(MK_LBUTTON), IntPtr.Zero);
+            if (!SetCursorPos(endX, endY))
+            {
+                return false;
+            }
+            SendMessage(window, WM_MOUSEMOVE, new IntPtr(MK_LBUTTON), IntPtr.Zero);
+            SendMessage(window, WM_LBUTTONUP, IntPtr.Zero, IntPtr.Zero);
+            return true;
+        }
+        finally
+        {
+            SetCursorPos(original.X, original.Y);
+        }
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool RegisterHotKey(IntPtr window, int id, uint modifiers, uint virtualKey);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool UnregisterHotKey(IntPtr window, int id);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint desiredAccess);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseDesktop(IntPtr desktop);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetProcessWindowStation();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetThreadDesktop(uint threadId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetUserObjectInformation(
+        IntPtr handle,
+        int index,
+        StringBuilder value,
+        int length,
+        out int required);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetShellWindow();
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr CreateMutex(IntPtr attributes, bool initialOwner, string name);
@@ -56,6 +183,50 @@ public static class AirScreenshotSmokeNative {
     [DllImport("kernel32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool CloseHandle(IntPtr handle);
+
+    public static bool HasInteractiveDesktop()
+    {
+        const uint DESKTOP_READOBJECTS = 0x0001;
+        const uint DESKTOP_SWITCHDESKTOP = 0x0100;
+        const int UOI_NAME = 2;
+        IntPtr desktop = OpenInputDesktop(
+            0,
+            false,
+            DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP);
+        if (desktop == IntPtr.Zero)
+        {
+            return false;
+        }
+        try
+        {
+            StringBuilder stationName = new StringBuilder(256);
+            StringBuilder currentDesktopName = new StringBuilder(256);
+            StringBuilder inputDesktopName = new StringBuilder(256);
+            int required;
+            bool namesAvailable =
+                GetUserObjectInformation(
+                    GetProcessWindowStation(), UOI_NAME, stationName,
+                    stationName.Capacity * sizeof(char), out required) &&
+                GetUserObjectInformation(
+                    GetThreadDesktop(GetCurrentThreadId()), UOI_NAME,
+                    currentDesktopName,
+                    currentDesktopName.Capacity * sizeof(char), out required) &&
+                GetUserObjectInformation(
+                    desktop, UOI_NAME, inputDesktopName,
+                    inputDesktopName.Capacity * sizeof(char), out required);
+            return namesAvailable &&
+                   Process.GetCurrentProcess().SessionId != 0 &&
+                   stationName.ToString().Equals(
+                       "WinSta0", StringComparison.OrdinalIgnoreCase) &&
+                   currentDesktopName.ToString().Equals(
+                       inputDesktopName.ToString(),
+                       StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            CloseDesktop(desktop);
+        }
+    }
 
     private static string PipeName()
     {
@@ -119,6 +290,7 @@ public static class AirScreenshotSmokeNative {
     }
 }
 "@
+}
 
 function Start-AirScreenshot {
     param([Parameter(Mandatory)][string[]]$Arguments)
@@ -241,6 +413,186 @@ function Get-AppStatus {
     return $response.data
 }
 
+function Convert-CompatibleAppStatus {
+    param([Parameter(Mandatory)]$Data)
+
+    $hotkeysProperty = $Data.PSObject.Properties["hotkeysAvailable"]
+    $runtimeErrorProperty = $Data.PSObject.Properties["runtimeError"]
+    $trayProperty = $Data.PSObject.Properties["trayIconVisible"]
+    return [pscustomobject]@{
+        Running = [bool]$Data.running
+        Transient = [bool]$Data.transient
+        Shell = [bool]$Data.shell
+        TrayIconVisible = if ($trayProperty) {
+            [Nullable[bool]]([bool]$trayProperty.Value)
+        } else {
+            $null
+        }
+        HotkeysAvailable = if ($hotkeysProperty) {
+            [Nullable[bool]]([bool]$hotkeysProperty.Value)
+        } else {
+            $null
+        }
+        RuntimeError = if ($runtimeErrorProperty) {
+            [string]$runtimeErrorProperty.Value
+        } else {
+            $null
+        }
+    }
+}
+
+function Find-FreeSmokeHotkey {
+    $modifiers = [uint32](0x0001 -bor 0x0002 -bor 0x0004 -bor 0x4000)
+    $candidates = @(
+        [pscustomobject]@{ Text = "Ctrl+Alt+Shift+F12"; VirtualKey = [uint32]0x7B },
+        [pscustomobject]@{ Text = "Ctrl+Alt+Shift+F11"; VirtualKey = [uint32]0x7A },
+        [pscustomobject]@{ Text = "Ctrl+Alt+Shift+F10"; VirtualKey = [uint32]0x79 },
+        [pscustomobject]@{ Text = "Ctrl+Alt+Shift+F9"; VirtualKey = [uint32]0x78 }
+    )
+    foreach ($candidate in $candidates) {
+        if ([AirScreenshotSmokeNative]::RegisterHotKey(
+                [IntPtr]::Zero,
+                $smokeHotkeyFixtureId,
+                $modifiers,
+                $candidate.VirtualKey)) {
+            [AirScreenshotSmokeNative]::UnregisterHotKey(
+                [IntPtr]::Zero,
+                $smokeHotkeyFixtureId
+            ) | Out-Null
+            $candidate | Add-Member -NotePropertyName Modifiers -NotePropertyValue $modifiers
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function Assert-SmokeHotkeyOccupied {
+    param([Parameter(Mandatory)]$Hotkey)
+
+    if ([AirScreenshotSmokeNative]::RegisterHotKey(
+            [IntPtr]::Zero,
+            $smokeHotkeyFixtureId,
+            $Hotkey.Modifiers,
+            $Hotkey.VirtualKey)) {
+        [AirScreenshotSmokeNative]::UnregisterHotKey(
+            [IntPtr]::Zero,
+            $smokeHotkeyFixtureId
+        ) | Out-Null
+        throw "The configured capture hotkey became unreserved while settings were open."
+    }
+    $registrationError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    if ($registrationError -ne 1409) {
+        throw "Unable to verify hotkey ownership. RegisterHotKey returned Win32 $registrationError."
+    }
+}
+
+function Wait-SettingsWindow {
+    param([int]$TimeoutMilliseconds = 5000)
+
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($watch.ElapsedMilliseconds -lt $TimeoutMilliseconds) {
+        $window = [AirScreenshotSmokeNative]::FindWindowByClass(
+            "AirScreenshot.Settings"
+        )
+        if ($window -ne [IntPtr]::Zero) {
+            return $window
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    $processState = Get-TestHostProcessIds
+    $statusText = "unavailable"
+    try {
+        $statusText = (Invoke-AirScreenshot -Arguments @(
+            "app", "status", "--json"
+        )).Output
+    }
+    catch {
+        $statusText = $_.Exception.Message
+    }
+    throw "The settings window did not appear within $TimeoutMilliseconds ms. hostPids=$([string]::Join(',', $processState)) status=$statusText"
+}
+
+function Wait-SettingsWindowClosed {
+    param([int]$TimeoutMilliseconds = 5000)
+
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($watch.ElapsedMilliseconds -lt $TimeoutMilliseconds) {
+        if ([AirScreenshotSmokeNative]::FindWindowByClass(
+                "AirScreenshot.Settings"
+            ) -eq [IntPtr]::Zero) {
+            return
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    throw "The settings window did not close within $TimeoutMilliseconds ms."
+}
+
+function Send-SettingsKey {
+    param(
+        [Parameter(Mandatory)][IntPtr]$Window,
+        [Parameter(Mandatory)][int]$VirtualKey
+    )
+
+    if (-not [AirScreenshotSmokeNative]::PostMessage(
+            $Window,
+            0x0100,
+            [IntPtr]$VirtualKey,
+            [IntPtr]::Zero
+        )) {
+        throw "Unable to post virtual key 0x$($VirtualKey.ToString('X')) to settings."
+    }
+}
+
+function Get-TestHostProcessIds {
+    return @(
+        Get-Process AirScreenshot -ErrorAction SilentlyContinue |
+            Where-Object {
+                try {
+                    $_.Path -and $_.Path.Equals(
+                        $Executable,
+                        [StringComparison]::OrdinalIgnoreCase
+                    )
+                }
+                catch {
+                    $false
+                }
+            } |
+            Select-Object -ExpandProperty Id
+    )
+}
+
+function Write-IsolatedSmokeConfig {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][bool]$ShellEnabled,
+        [Parameter(Mandatory)][bool]$TrayIconVisible,
+        [Parameter(Mandatory)][string]$CaptureHotkey
+    )
+
+    $config = [ordered]@{
+        schemaVersion = 2
+        shell = [ordered]@{
+            enabled = $ShellEnabled
+            trayIconVisible = $TrayIconVisible
+            startAtLogin = $false
+            notificationsEnabled = $false
+        }
+        update = [ordered]@{
+            automatic = $false
+            lastCheckUnix = 0
+            warnedTarget = ""
+        }
+        hotkey = [ordered]@{
+            capture = $CaptureHotkey
+            pin = ""
+            globalOcrEnabled = $false
+            globalOcr = "Ctrl+Alt+O"
+        }
+    }
+    $json = $config | ConvertTo-Json -Compress -Depth 5
+    Set-Content -LiteralPath $Path -Value $json -Encoding utf8NoBOM
+}
+
 function Wait-AppState {
     param(
         [Parameter(Mandatory)][bool]$Running,
@@ -298,9 +650,8 @@ function Wait-OverlayWindow {
             $early = Complete-AirScreenshot -Run $Run
             throw "The region command exited before showing an overlay. exit=$($early.ExitCode) stdout=$($early.Output) stderr=$($early.Error)"
         }
-        $window = [AirScreenshotSmokeNative]::FindWindow(
-            "AirScreenshot.Overlay",
-            $null
+        $window = [AirScreenshotSmokeNative]::FindWindowByClass(
+            "AirScreenshot.Overlay"
         )
         if ($window -ne [IntPtr]::Zero) {
             return $window
@@ -430,6 +781,232 @@ try {
     }
     Remove-Item -LiteralPath $configPath -Force
 
+    $legacyStatusData =
+        '{"running":true,"transient":false,"shell":true}' |
+        ConvertFrom-Json -ErrorAction Stop
+    $legacyStatus = Convert-CompatibleAppStatus $legacyStatusData
+    if (-not $legacyStatus.Running -or
+        $legacyStatus.Transient -or
+        -not $legacyStatus.Shell -or
+        $null -ne $legacyStatus.HotkeysAvailable -or
+        $null -ne $legacyStatus.RuntimeError) {
+        throw "The app status parser is not backward-compatible with responses that predate runtime health fields."
+    }
+
+    $interactiveDesktop =
+        [AirScreenshotSmokeNative]::HasInteractiveDesktop()
+    $smokeHotkey = Find-FreeSmokeHotkey
+    $captureHotkeyText = if ($smokeHotkey) {
+        [string]$smokeHotkey.Text
+    } else {
+        "Ctrl+Alt+Shift+F12"
+    }
+
+    if ($interactiveDesktop) {
+        Write-IsolatedSmokeConfig `
+            -Path $configPath `
+            -ShellEnabled $false `
+            -TrayIconVisible $false `
+            -CaptureHotkey $captureHotkeyText
+        $settingsConfigHash =
+            (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
+
+        $transientSettings = Invoke-AirScreenshot -Arguments @(
+            "app", "settings", "--json"
+        )
+        Assert-JsonResult `
+            -Result $transientSettings `
+            -ExpectedCode 0 | Out-Null
+        $transientSettingsWindow = Wait-SettingsWindow
+
+        # Move keyboard focus from the first category to the first editable
+        # capture setting, then toggle it. This creates an actual in-memory
+        # draft before Escape cancels the dialog.
+        for ($tab = 0; $tab -lt 6; $tab++) {
+            Send-SettingsKey `
+                -Window $transientSettingsWindow `
+                -VirtualKey 0x09
+        }
+        Send-SettingsKey `
+            -Window $transientSettingsWindow `
+            -VirtualKey 0x20
+        Start-Sleep -Milliseconds 100
+        if ((Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash -ne
+            $settingsConfigHash) {
+            throw "Editing a settings draft wrote the isolated configuration before Save."
+        }
+
+        $settingsCancelWatch = [Diagnostics.Stopwatch]::StartNew()
+        Send-SettingsKey `
+            -Window $transientSettingsWindow `
+            -VirtualKey 0x1B
+        Wait-SettingsWindowClosed -TimeoutMilliseconds 3000
+        Wait-AirScreenshotProcessesExited -TimeoutMilliseconds 5000
+        $settingsCancelWatch.Stop()
+        if ($settingsCancelWatch.ElapsedMilliseconds -ge 5000) {
+            throw "A shell-disabled settings-only host did not exit promptly after Escape."
+        }
+        if ((Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash -ne
+            $settingsConfigHash) {
+            throw "Cancelling settings persisted the in-memory draft."
+        }
+        $afterCancelledSettings =
+            Convert-CompatibleAppStatus (Get-AppStatus)
+        if ($afterCancelledSettings.Running) {
+            throw "A shell-disabled settings-only host remained running after cancellation."
+        }
+        Wait-AirScreenshotProcessesExited
+    }
+    else {
+        Write-Host "SKIP: shell=false settings cancellation requires an unlocked interactive desktop."
+    }
+
+    if ($smokeHotkey) {
+        Write-IsolatedSmokeConfig `
+            -Path $configPath `
+            -ShellEnabled $true `
+            -TrayIconVisible $false `
+            -CaptureHotkey $smokeHotkey.Text
+
+        $showTray = Invoke-AirScreenshot -Arguments @(
+            "app", "tray", "show", "--json"
+        )
+        Assert-JsonResult -Result $showTray -ExpectedCode 0 | Out-Null
+        $trayStatusData = Get-AppStatus
+        $trayStatus = Convert-CompatibleAppStatus $trayStatusData
+        if (-not $trayStatus.Running -or
+            $trayStatus.Transient -or
+            -not $trayStatus.Shell -or
+            $trayStatus.TrayIconVisible -ne $true -or
+            $null -eq $trayStatus.HotkeysAvailable -or
+            $trayStatus.HotkeysAvailable -ne $true) {
+            throw "app tray show did not restore a persistent, healthy shell host."
+        }
+        $persistedTrayConfig =
+            Get-Content -LiteralPath $configPath -Raw |
+            ConvertFrom-Json -ErrorAction Stop
+        if (-not [bool]$persistedTrayConfig.shell.enabled -or
+            -not [bool]$persistedTrayConfig.shell.trayIconVisible) {
+            throw "app tray show did not persist trayIconVisible=true in the isolated configuration."
+        }
+
+        $firstTrayHash =
+            (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
+        $firstTrayWrite = (Get-Item -LiteralPath $configPath).LastWriteTimeUtc.Ticks
+        $firstTrayHostIds = @(Get-TestHostProcessIds | Sort-Object)
+        if ($firstTrayHostIds.Count -ne 1) {
+            throw "app tray show did not leave exactly one test host running."
+        }
+        Start-Sleep -Milliseconds 100
+        $showTrayAgain = Invoke-AirScreenshot -Arguments @(
+            "app", "tray", "show", "--json"
+        )
+        Assert-JsonResult -Result $showTrayAgain -ExpectedCode 0 | Out-Null
+        $secondTrayHostIds = @(Get-TestHostProcessIds | Sort-Object)
+        if ((Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash -ne
+                $firstTrayHash -or
+            (Get-Item -LiteralPath $configPath).LastWriteTimeUtc.Ticks -ne
+                $firstTrayWrite -or
+            [string]::Join(",", $secondTrayHostIds) -ne
+                [string]::Join(",", $firstTrayHostIds)) {
+            throw "Repeated app tray show was not idempotent."
+        }
+
+        if ($interactiveDesktop) {
+            $persistentSettings = Invoke-AirScreenshot -Arguments @(
+                "app", "settings", "--json"
+            )
+            Assert-JsonResult `
+                -Result $persistentSettings `
+                -ExpectedCode 0 | Out-Null
+            $persistentSettingsWindow = Wait-SettingsWindow
+            $duringSettingsStatus =
+                Convert-CompatibleAppStatus (Get-AppStatus)
+            if ($duringSettingsStatus.HotkeysAvailable -ne $true) {
+                throw "app status reported unavailable hotkeys while settings were open."
+            }
+            $settingsOpenConfigHash =
+                (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
+            $busyTrayShow = Invoke-AirScreenshot -Arguments @(
+                "app", "tray", "show", "--json"
+            )
+            Assert-JsonResult `
+                -Result $busyTrayShow `
+                -ExpectedCode 5 `
+                -ExpectedErrorType "busy" | Out-Null
+            if ((Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash -ne
+                    $settingsOpenConfigHash) {
+                throw "app tray show changed configuration while settings were open."
+            }
+            Assert-SmokeHotkeyOccupied -Hotkey $smokeHotkey
+            Send-SettingsKey `
+                -Window $persistentSettingsWindow `
+                -VirtualKey 0x1B
+            Wait-SettingsWindowClosed
+            Assert-SmokeHotkeyOccupied -Hotkey $smokeHotkey
+        }
+        else {
+            Write-Host "SKIP: settings hotkey reservation requires an unlocked interactive desktop."
+        }
+        Stop-App
+
+        if ($interactiveDesktop -and
+            [AirScreenshotSmokeNative]::GetShellWindow() -ne [IntPtr]::Zero) {
+            if (-not [AirScreenshotSmokeNative]::RegisterHotKey(
+                    [IntPtr]::Zero,
+                    $smokeHotkeyFixtureId,
+                    $smokeHotkey.Modifiers,
+                    $smokeHotkey.VirtualKey
+                )) {
+                throw "Unable to acquire the selected hotkey for the runtime-error fixture."
+            }
+            $heldSmokeHotkey = $true
+            try {
+                Write-IsolatedSmokeConfig `
+                    -Path $configPath `
+                    -ShellEnabled $true `
+                    -TrayIconVisible $true `
+                    -CaptureHotkey $smokeHotkey.Text
+                $conflictedStart = Invoke-AirScreenshot -Arguments @(
+                    "app", "start", "--json"
+                )
+                Assert-JsonResult `
+                    -Result $conflictedStart `
+                    -ExpectedCode 0 | Out-Null
+                $conflictedStatusData = Get-AppStatus
+                if (-not $conflictedStatusData.PSObject.Properties[
+                        "hotkeysAvailable"] -or
+                    -not $conflictedStatusData.PSObject.Properties[
+                        "runtimeError"]) {
+                    throw "app status omitted runtime hotkey health fields."
+                }
+                $conflictedStatus =
+                    Convert-CompatibleAppStatus $conflictedStatusData
+                if ($conflictedStatus.HotkeysAvailable -ne $false -or
+                    [string]::IsNullOrWhiteSpace(
+                        $conflictedStatus.RuntimeError)) {
+                    throw "app status did not describe the injected hotkey registration failure."
+                }
+                Stop-App
+            }
+            finally {
+                [AirScreenshotSmokeNative]::UnregisterHotKey(
+                    [IntPtr]::Zero,
+                    $smokeHotkeyFixtureId
+                ) | Out-Null
+                $heldSmokeHotkey = $false
+            }
+        }
+        else {
+            Write-Host "SKIP: runtimeError status fixture requires an interactive Explorer shell and a free hotkey."
+        }
+    }
+    else {
+        Write-Host "SKIP: no candidate smoke-test hotkey is currently available."
+    }
+
+    Remove-Item -LiteralPath $configPath -Force -ErrorAction SilentlyContinue
+
     $coldStartRuns = @(
         (Start-AirScreenshot -Arguments @("module", "list", "--json")),
         (Start-AirScreenshot -Arguments @("module", "list", "--json"))
@@ -514,58 +1091,121 @@ try {
     Wait-AppState -Running $false | Out-Null
     Wait-AirScreenshotProcessesExited
 
-    $cancelledRegion = Start-AirScreenshot -Arguments @(
-        "capture", "region", "--output", "clipboard", "--json"
-    )
-    $overlay = Wait-OverlayWindow -Run $cancelledRegion
-    if (-not [AirScreenshotSmokeNative]::PostMessage(
-            $overlay,
-            0x0100,
-            [IntPtr]0x1B,
-            [IntPtr]::Zero
-        )) {
-        throw "Unable to post Escape to the region overlay."
+    if ($interactiveDesktop) {
+        $cancelledRegion = Start-AirScreenshot -Arguments @(
+            "capture", "region", "--output", "clipboard", "--json"
+        )
+        $overlay = Wait-OverlayWindow -Run $cancelledRegion
+        if (-not [AirScreenshotSmokeNative]::PostMessage(
+                $overlay,
+                0x0100,
+                [IntPtr]0x1B,
+                [IntPtr]::Zero
+            )) {
+            throw "Unable to post Escape to the region overlay."
+        }
+        $cancelled = Complete-AirScreenshot -Run $cancelledRegion
+        Assert-JsonResult `
+            -Result $cancelled `
+            -ExpectedCode 3 `
+            -ExpectedErrorType "user_cancelled" | Out-Null
+        Wait-AppState -Running $false | Out-Null
+        Wait-AirScreenshotProcessesExited
+
+        $missingRepeat = Invoke-AirScreenshot -Arguments @(
+            "capture", "repeat", "--output", "file",
+            "--path", "`"$(Join-Path $temporary 'missing-repeat.png')`"",
+            "--json"
+        )
+        Assert-JsonResult `
+            -Result $missingRepeat `
+            -ExpectedCode 5 `
+            -ExpectedErrorType "operation_failed" | Out-Null
+        Wait-AirScreenshotProcessesExited
+
+        $selectedRegionPath = Join-Path $temporary "selected-region.png"
+        $selectedRegion = Start-AirScreenshot -Arguments @(
+            "capture", "region", "--output", "file",
+            "--path", "`"$selectedRegionPath`"", "--json"
+        )
+        $selectionOverlay = Wait-OverlayWindow -Run $selectedRegion
+        if (-not [AirScreenshotSmokeNative]::DragRegionSelection(
+                $selectionOverlay)) {
+            throw "Unable to create a region selection for repeat capture."
+        }
+        # An explicit --output file request commits as soon as the initial
+        # region drag ends. Do not post Enter to the old overlay HWND: on a
+        # fast machine the session has already completed and destroyed it.
+        $selectedRegionResult = Complete-AirScreenshot -Run $selectedRegion
+        Assert-JsonResult `
+            -Result $selectedRegionResult `
+            -ExpectedCode 0 | Out-Null
+        if (-not (Test-Png $selectedRegionPath)) {
+            throw "The completed region fixture did not produce a PNG."
+        }
+        Wait-AppState -Running $false | Out-Null
+        Wait-AirScreenshotProcessesExited
+
+        $repeatPath = Join-Path $temporary "repeat-region.png"
+        $repeatRegion = Invoke-AirScreenshot -Arguments @(
+            "capture", "repeat", "--output", "file",
+            "--path", "`"$repeatPath`"", "--json"
+        )
+        $repeatResponse = Assert-JsonResult `
+            -Result $repeatRegion `
+            -ExpectedCode 0
+        if (-not [IO.Path]::GetFullPath([string]$repeatResponse.path).Equals(
+                [IO.Path]::GetFullPath($repeatPath),
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or -not (Test-Png $repeatPath)) {
+            throw "Repeat capture did not reproduce the last completed region."
+        }
+        $repeatConfig = Get-Content -LiteralPath $configPath -Raw |
+            ConvertFrom-Json -ErrorAction Stop
+        if (-not $repeatConfig.capture.lastRegion -or
+            [int]$repeatConfig.capture.lastRegion.width -lt 2 -or
+            [int]$repeatConfig.capture.lastRegion.height -lt 2) {
+            throw "Repeat capture did not retain a valid physical region history."
+        }
+        Wait-AppState -Running $false | Out-Null
+        Wait-AirScreenshotProcessesExited
+
+        $activeRegion = Start-AirScreenshot -Arguments @(
+            "capture", "region", "--output", "clipboard", "--json"
+        )
+        $transientStatus = Wait-AppState -Running $true
+        if (-not $transientStatus.transient) {
+            throw "A region command did not start a transient host."
+        }
+        Wait-OverlayWindow -Run $activeRegion | Out-Null
+
+        $busyRegion = Invoke-AirScreenshot -Arguments @(
+            "capture", "region", "--output", "clipboard", "--json"
+        )
+        Assert-JsonResult `
+            -Result $busyRegion `
+            -ExpectedCode 5 `
+            -ExpectedErrorType "busy" | Out-Null
+
+        $promote = Invoke-AirScreenshot -Arguments @("app", "start", "--json")
+        $promoteResponse = Assert-JsonResult -Result $promote -ExpectedCode 0
+        if ($promoteResponse.data.transient) {
+            throw "app start did not promote the transient host."
+        }
+
+        $stop = Invoke-AirScreenshot -Arguments @("app", "stop", "--json")
+        Assert-JsonResult -Result $stop -ExpectedCode 0 | Out-Null
+        $stoppedRegion = Complete-AirScreenshot -Run $activeRegion
+        Assert-JsonResult `
+            -Result $stoppedRegion `
+            -ExpectedCode 5 `
+            -ExpectedErrorType "shutting_down" | Out-Null
+        Wait-AppState -Running $false | Out-Null
+        Wait-AirScreenshotProcessesExited
     }
-    $cancelled = Complete-AirScreenshot -Run $cancelledRegion
-    Assert-JsonResult `
-        -Result $cancelled `
-        -ExpectedCode 3 `
-        -ExpectedErrorType "user_cancelled" | Out-Null
-    Wait-AppState -Running $false | Out-Null
-    Wait-AirScreenshotProcessesExited
-
-    $activeRegion = Start-AirScreenshot -Arguments @(
-        "capture", "region", "--output", "clipboard", "--json"
-    )
-    $transientStatus = Wait-AppState -Running $true
-    if (-not $transientStatus.transient) {
-        throw "A region command did not start a transient host."
+    else {
+        Write-Host "SKIP: region overlay lifecycle requires an unlocked interactive desktop."
     }
-    Wait-OverlayWindow -Run $activeRegion | Out-Null
-
-    $busyRegion = Invoke-AirScreenshot -Arguments @(
-        "capture", "region", "--output", "clipboard", "--json"
-    )
-    Assert-JsonResult `
-        -Result $busyRegion `
-        -ExpectedCode 5 `
-        -ExpectedErrorType "busy" | Out-Null
-
-    $promote = Invoke-AirScreenshot -Arguments @("app", "start", "--json")
-    $promoteResponse = Assert-JsonResult -Result $promote -ExpectedCode 0
-    if ($promoteResponse.data.transient) {
-        throw "app start did not promote the transient host."
-    }
-
-    $stop = Invoke-AirScreenshot -Arguments @("app", "stop", "--json")
-    Assert-JsonResult -Result $stop -ExpectedCode 0 | Out-Null
-    $stoppedRegion = Complete-AirScreenshot -Run $activeRegion
-    Assert-JsonResult `
-        -Result $stoppedRegion `
-        -ExpectedCode 5 `
-        -ExpectedErrorType "shutting_down" | Out-Null
-    Wait-AppState -Running $false | Out-Null
-    Wait-AirScreenshotProcessesExited
 
     $settings = Invoke-AirScreenshot -Arguments @("app", "settings", "--json")
     Assert-JsonResult -Result $settings -ExpectedCode 0 | Out-Null
@@ -597,6 +1237,13 @@ try {
     Write-Host "Lifecycle smoke passed."
 }
 finally {
+    if ($heldSmokeHotkey) {
+        [AirScreenshotSmokeNative]::UnregisterHotKey(
+            [IntPtr]::Zero,
+            $smokeHotkeyFixtureId
+        ) | Out-Null
+        $heldSmokeHotkey = $false
+    }
     Get-Process AirScreenshot -ErrorAction SilentlyContinue |
         Where-Object {
             try {

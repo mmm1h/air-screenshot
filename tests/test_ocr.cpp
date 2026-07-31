@@ -8,8 +8,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <optional>
@@ -471,6 +473,55 @@ void test_pre_requested_download_cancellation() {
         L"OCR pre-cancel performs no progress or network work");
 }
 
+void test_unconfigured_build_is_offline_and_unavailable() {
+    ScopedTestDirectory directory;
+    expect(!directory.path().empty(),
+           L"OCR unavailable-state test creates an isolated data directory");
+    if (directory.path().empty()) {
+        return;
+    }
+
+    const DWORD old_size =
+        GetEnvironmentVariableW(L"AIRSHOT_DATA_DIR", nullptr, 0);
+    std::wstring old_value(old_size, L'\0');
+    if (old_size > 0) {
+        const DWORD copied = GetEnvironmentVariableW(
+            L"AIRSHOT_DATA_DIR", old_value.data(), old_size);
+        old_value.resize(copied);
+    }
+    const std::filesystem::path isolated_data =
+        directory.path() / L"data";
+    SetEnvironmentVariableW(L"AIRSHOT_DATA_DIR", isolated_data.c_str());
+
+    const airshot::OcrDependencyStatus status =
+        airshot::ocr_dependency_status(L"rapidocr-onnx");
+    if (!status.ready && !status.can_download) {
+        expect(status.message.find(L"公钥") != std::wstring::npos,
+               L"an unconfigured build reports OCR as unavailable in the UI");
+
+        int progress_calls = 0;
+        std::wstring error;
+        const auto started = std::chrono::steady_clock::now();
+        const bool downloaded = airshot::download_ocr_dependencies(
+            L"https://127.0.0.1:9/this-must-not-be-requested.json",
+            [&progress_calls](int) { ++progress_calls; },
+            &error);
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        expect(
+            !downloaded && progress_calls == 0 &&
+                error.find(L"公钥") != std::wstring::npos &&
+                error.find(L"拒绝网络安装") != std::wstring::npos &&
+                elapsed < std::chrono::seconds(2),
+            L"an unconfigured build refuses OCR installation before network I/O");
+    }
+
+    if (old_size > 0) {
+        SetEnvironmentVariableW(L"AIRSHOT_DATA_DIR", old_value.c_str());
+    } else {
+        SetEnvironmentVariableW(L"AIRSHOT_DATA_DIR", nullptr);
+    }
+}
+
 void test_compiled_sequence_floor() {
     constexpr std::uint64_t expected =
         static_cast<std::uint64_t>(
@@ -734,6 +785,143 @@ void test_locked_path_share_contract() {
         L"OCR delete succeeds after lease release");
 }
 
+void test_dependency_hash_cache_and_cancellation() {
+    const std::filesystem::path dependency_root(L"C:\\ocr-deps");
+    constexpr std::wstring_view relative_path =
+        L"models/rapidocr-v5-fast/det.onnx";
+    constexpr std::wstring_view digest =
+        L"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    expect(
+        airshot::ocr_test_support::dependency_hash_cache_key_matches(
+            true,
+            dependency_root,
+            99,
+            relative_path,
+            digest,
+            5,
+            std::filesystem::path(L"c:\\OCR-DEPS"),
+            99,
+            L"MODELS/RAPIDOCR-V5-FAST/DET.ONNX",
+            L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            5),
+        L"OCR dependency hash cache reuses the same locked file identity");
+    expect(
+        !airshot::ocr_test_support::dependency_hash_cache_key_matches(
+            false,
+            dependency_root,
+            99,
+            relative_path,
+            digest,
+            5,
+            dependency_root,
+            99,
+            relative_path,
+            digest,
+            5),
+        L"OCR dependency hash cache rejects a replaced file object");
+    expect(
+        !airshot::ocr_test_support::dependency_hash_cache_key_matches(
+            true,
+            dependency_root,
+            99,
+            relative_path,
+            digest,
+            5,
+            dependency_root,
+            100,
+            relative_path,
+            digest,
+            5) &&
+            !airshot::ocr_test_support::dependency_hash_cache_key_matches(
+                true,
+                dependency_root,
+                99,
+                relative_path,
+                digest,
+                5,
+                dependency_root,
+                99,
+                relative_path,
+                L"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                5) &&
+            !airshot::ocr_test_support::dependency_hash_cache_key_matches(
+                true,
+                dependency_root,
+                99,
+                relative_path,
+                digest,
+                5,
+                dependency_root,
+                99,
+                relative_path,
+                digest,
+                6),
+        L"OCR dependency hash cache invalidates sequence, digest, and size changes");
+
+    ScopedTestDirectory directory;
+    expect(
+        !directory.path().empty(),
+        L"create OCR hash cancellation test directory");
+    if (directory.path().empty()) {
+        return;
+    }
+    const auto file = directory.path() / L"model.onnx";
+    {
+        ScopedHandle creator(CreateFileW(
+            file.c_str(),
+            GENERIC_WRITE,
+            0,
+            nullptr,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr));
+        constexpr char content[] = "model";
+        DWORD written = 0;
+        expect(
+            creator.get() &&
+                creator.get() != INVALID_HANDLE_VALUE &&
+                WriteFile(
+                    creator.get(),
+                    content,
+                    5,
+                    &written,
+                    nullptr) &&
+                written == 5,
+            L"create OCR hash cancellation test file");
+    }
+
+    std::wstring error;
+    const auto digest_result =
+        airshot::ocr_test_support::sha256_file(
+            file,
+            {},
+            &error);
+    expect(
+        digest_result && digest_result->size() == 64,
+        L"OCR dependency hashing succeeds for a locked file");
+
+    std::stop_source cancellation;
+    cancellation.request_stop();
+    error.clear();
+    expect(
+        !airshot::ocr_test_support::sha256_file(
+            file,
+            cancellation.get_token(),
+            &error) &&
+            error.find(L"取消") != std::wstring::npos,
+        L"OCR dependency hashing honors pre-requested cancellation");
+    error.clear();
+    expect(
+        !airshot::acquire_ocr_dependency_lease(
+            directory.path() / L"missing-package",
+            true,
+            false,
+            &error,
+            cancellation.get_token()) &&
+            error.find(L"取消") != std::wstring::npos,
+        L"OCR dependency lease acquisition honors cancellation before I/O");
+}
+
 void test_manifest_verifier_cli_contract() {
     const std::array incomplete{
         std::wstring(L"--verify-ocr-manifest"),
@@ -753,6 +941,393 @@ void test_manifest_verifier_cli_contract() {
         airshot::run_ocr_manifest_verifier(missing_files) ==
             static_cast<int>(airshot::ExitCode::operation_failed),
         L"OCR manifest verifier fails closed for unreadable input");
+}
+
+std::string ocr_protocol_json(std::string_view blocks) {
+    std::string json =
+        R"({"schemaVersion":1,"profile":"rapidocr-v5-fast","preprocess":{"sourceWidth":100,"sourceHeight":50,"inputWidth":200,"inputHeight":100,"scaleX":2,"scaleY":2,"resample":"bilinear-upscale","tiled":false,"tileCount":1,"tileSize":0,"tileOverlap":0,"coordinateSpace":"input-pixels"},"timings":{"decodeMs":1,"modelInitMs":2,"inferenceMs":3,"mergeMs":0.5,"totalMs":7},"blocks":[)";
+    json += blocks;
+    json += R"(]})";
+    return json;
+}
+
+airshot::OcrProtocolExpectations protocol_expectations() {
+    return {
+        airshot::kOcrEngineRapidV5Fast,
+        100,
+        50,
+        200,
+        100,
+        2.0,
+        2.0,
+        L"bilinear-upscale",
+    };
+}
+
+void test_ocr_protocol_parser_and_ordering() {
+    const std::string protocol = ocr_protocol_json(
+        R"({"quad":[[120,12],[180,12],[180,32],[120,32]],"text":"B","score":0.8},{"quad":[[20,60],[80,60],[80,80],[20,80]],"text":"C","score":0.7},{"quad":[[10,10],[90,10],[90,30],[10,30]],"text":"A","score":0.9})");
+    std::wstring error;
+    const auto parsed = airshot::parse_ocr_runner_protocol(
+        protocol,
+        protocol_expectations(),
+        &error);
+    expect(parsed.has_value(), L"OCR protocol accepts valid structured output");
+    if (!parsed) {
+        return;
+    }
+    expect(parsed->ok, L"OCR protocol reports recognized blocks as success");
+    expect(parsed->text == L"A B\r\nC", L"OCR protocol applies deterministic row then column ordering");
+    expect(parsed->blocks.size() == 3, L"OCR protocol retains structured blocks");
+    expect(
+        parsed->blocks.size() == 3 && parsed->blocks[0].text == L"A" &&
+            parsed->blocks[1].text == L"B" && parsed->blocks[2].text == L"C",
+        L"OCR protocol returns blocks in generated text order");
+    expect(
+        parsed->blocks.size() == 3 &&
+            std::abs(parsed->blocks[0].quad[0].x - 5.0) < 0.001 &&
+            std::abs(parsed->blocks[0].quad[0].y - 5.0) < 0.001,
+        L"OCR protocol maps input pixel quads back to source pixels");
+    expect(
+        parsed->profile == airshot::kOcrEngineRapidV5Fast &&
+            parsed->preprocess.input_width == 200 &&
+            std::abs(parsed->timings.inference_ms - 3.0) < 0.001,
+        L"OCR protocol retains profile preprocessing and timings");
+
+    const auto empty = airshot::parse_ocr_runner_protocol(
+        ocr_protocol_json(""),
+        protocol_expectations(),
+        &error);
+    expect(
+        empty.has_value() && !empty->ok && empty->blocks.empty() && !empty->error.empty(),
+        L"OCR protocol represents a valid no-text result without malformed output");
+}
+
+void test_ocr_protocol_rejects_untrusted_fields() {
+    std::wstring error;
+    const airshot::OcrProtocolExpectations expected = protocol_expectations();
+    const std::string invalid_utf8(1, static_cast<char>(0xff));
+    expect(
+        !airshot::parse_ocr_runner_protocol(invalid_utf8, expected, &error),
+        L"OCR protocol rejects invalid UTF-8");
+
+    std::string unknown_field = ocr_protocol_json("");
+    unknown_field.insert(unknown_field.size() - 1, R"(,"unexpected":true)");
+    expect(
+        !airshot::parse_ocr_runner_protocol(unknown_field, expected, &error),
+        L"OCR protocol rejects unknown top-level fields");
+
+    std::string duplicate_field = ocr_protocol_json("");
+    duplicate_field.insert(1, R"("profile":"rapidocr-v5-fast",)");
+    expect(
+        !airshot::parse_ocr_runner_protocol(duplicate_field, expected, &error),
+        L"OCR protocol rejects duplicate object fields");
+
+    expect(
+        !airshot::parse_ocr_runner_protocol(
+            ocr_protocol_json(
+                R"({"quad":[[0,0],[201,0],[201,10],[0,10]],"text":"x","score":0.8})"),
+            expected,
+            &error),
+        L"OCR protocol rejects out of bounds quad coordinates");
+    expect(
+        !airshot::parse_ocr_runner_protocol(
+            ocr_protocol_json(
+                R"({"quad":[[0,0],[10,0],[10,10],[0,10]],"text":"x","score":1e309})"),
+            expected,
+            &error),
+        L"OCR protocol rejects non-finite confidence values");
+    expect(
+        !airshot::parse_ocr_runner_protocol(
+            ocr_protocol_json(
+                R"({"quad":[[0,0],[10,0],[10,10],[0,10]],"text":"x\nwarning","score":0.8})"),
+            expected,
+            &error),
+        L"OCR protocol rejects control characters in block text");
+
+    const std::string oversized_text = std::string(4'097, 'a');
+    expect(
+        !airshot::parse_ocr_runner_protocol(
+            ocr_protocol_json(
+                R"({"quad":[[0,0],[10,0],[10,10],[0,10]],"text":")" +
+                oversized_text + R"(","score":0.8})"),
+            expected,
+            &error),
+        L"OCR protocol rejects oversized block text");
+
+    std::string excessive_blocks;
+    constexpr std::string_view block =
+        R"({"quad":[[0,0],[1,0],[1,1],[0,1]],"text":"x","score":1})";
+    for (std::size_t index = 0; index < 16'385; ++index) {
+        if (!excessive_blocks.empty()) {
+            excessive_blocks.push_back(',');
+        }
+        excessive_blocks += block;
+    }
+    expect(
+        !airshot::parse_ocr_runner_protocol(
+            ocr_protocol_json(excessive_blocks),
+            expected,
+            &error),
+        L"OCR protocol rejects excessive block counts");
+}
+
+void test_ocr_preprocess_scaling_and_threads() {
+    airshot::Bitmap source(2, 2);
+    const auto set_gray = [](airshot::Bitmap& bitmap, int x, int y, std::uint8_t value) {
+        auto row = bitmap.row(y);
+        const std::size_t offset = static_cast<std::size_t>(x) * airshot::Bitmap::bytes_per_pixel;
+        row[offset] = value;
+        row[offset + 1] = value;
+        row[offset + 2] = value;
+        row[offset + 3] = 255;
+    };
+    set_gray(source, 0, 0, 0);
+    set_gray(source, 1, 0, 100);
+    set_gray(source, 0, 1, 200);
+    set_gray(source, 1, 1, 255);
+    const airshot::Bitmap enlarged =
+        airshot::ocr_test_support::resize_bitmap_high_quality(source, 3, 3);
+    expect(enlarged.valid(), L"OCR bilinear enlargement returns a valid bitmap");
+    if (enlarged.valid()) {
+        const auto center = enlarged.row(1);
+        expect(
+            center[4] >= 138 && center[4] <= 139 && center[7] == 255,
+            L"OCR bilinear enlargement interpolates instead of nearest-neighbor sampling");
+    }
+
+    airshot::Bitmap checkerboard(8, 8);
+    for (int y = 0; y < checkerboard.height; ++y) {
+        for (int x = 0; x < checkerboard.width; ++x) {
+            set_gray(checkerboard, x, y, (x + y) % 2 == 0 ? 0 : 255);
+        }
+    }
+    const airshot::Bitmap reduced =
+        airshot::ocr_test_support::resize_bitmap_high_quality(checkerboard, 1, 1);
+    expect(
+        reduced.valid() && reduced.pixels[0] >= 120 && reduced.pixels[0] <= 136,
+        L"OCR progressive bilinear downsampling preserves mixed high-frequency content");
+
+    expect(
+        std::abs(airshot::ocr_test_support::select_preprocess_scale(800, 600) - 2.0) < 0.001,
+        L"OCR bounded preprocessing uses 2x for small captures");
+    expect(
+        std::abs(airshot::ocr_test_support::select_preprocess_scale(1400, 900) - 1.5) < 0.001,
+        L"OCR bounded preprocessing uses 1.5x for medium captures");
+    expect(
+        std::abs(airshot::ocr_test_support::select_preprocess_scale(1920, 1080) - 1.0) < 0.001,
+        L"OCR preprocessing leaves normal full-HD captures unchanged");
+    expect(
+        std::abs(airshot::ocr_test_support::select_preprocess_scale(1440, 10'000) - 1.0) < 0.001,
+        L"OCR preprocessing preserves long screenshots for runner tiling");
+    expect(
+        airshot::ocr_test_support::select_preprocess_scale(10'000, 10'000) < 1.0,
+        L"OCR preprocessing bounds exceptionally large pixel surfaces");
+
+    expect(
+        airshot::ocr_test_support::select_thread_count(5'000'000, 1, true) == 1,
+        L"OCR thread selection respects single-core systems");
+    expect(
+        airshot::ocr_test_support::select_thread_count(200'000, 16, false) == 2,
+        L"OCR thread selection limits small images");
+    expect(
+        airshot::ocr_test_support::select_thread_count(3'000'000, 16, false) == 3,
+        L"OCR thread selection scales normal large images to three threads");
+    expect(
+        airshot::ocr_test_support::select_thread_count(5'000'000, 16, true) == 4,
+        L"OCR thread selection permits four threads for accurate large images");
+}
+
+std::string warm_worker_response_json(
+    std::uint64_t request_id,
+    std::string_view dependency_root,
+    std::uint64_t sequence,
+    std::string_view profile,
+    std::string_view result) {
+    return std::string(R"({"schemaVersion":1,"requestId":)") +
+           std::to_string(request_id) + R"(,"profile":")" +
+           std::string(profile) + R"(","dependencyRoot":")" +
+           std::string(dependency_root) + R"(","dependencySequence":)" +
+           std::to_string(sequence) + R"(,"ok":true,"result":)" +
+           std::string(result) + "}";
+}
+
+void test_warm_worker_protocol_and_state_machine() {
+    const auto expected_image = protocol_expectations();
+    const std::filesystem::path dependency_root(L"C:\\ocr-deps");
+    const std::string nested_result = ocr_protocol_json(
+        R"({"quad":[[10,10],[90,10],[90,30],[10,30]],"text":"warm","score":0.9})");
+    const std::string valid = warm_worker_response_json(
+        42,
+        R"(C:\\ocr-deps)",
+        99,
+        "rapidocr-v5-fast",
+        nested_result);
+    std::wstring error;
+    const auto parsed = airshot::ocr_test_support::parse_warm_worker_response(
+        valid,
+        42,
+        airshot::kOcrEngineRapidV5Fast,
+        dependency_root,
+        99,
+        expected_image,
+        &error);
+    expect(
+        parsed.has_value() && parsed->ok && parsed->output.ok &&
+            parsed->output.text == L"warm",
+        L"warm OCR response binds and parses the nested Stage 1 protocol");
+
+    expect(
+        !airshot::ocr_test_support::parse_warm_worker_response(
+            valid,
+            43,
+            airshot::kOcrEngineRapidV5Fast,
+            dependency_root,
+            99,
+            expected_image,
+            &error),
+        L"warm OCR response rejects stale request ids");
+    expect(
+        !airshot::ocr_test_support::parse_warm_worker_response(
+            valid,
+            42,
+            airshot::kOcrEngineRapidV5Accurate,
+            dependency_root,
+            99,
+            expected_image,
+            &error),
+        L"warm OCR response rejects profile changes");
+    expect(
+        !airshot::ocr_test_support::parse_warm_worker_response(
+            valid,
+            42,
+            airshot::kOcrEngineRapidV5Fast,
+            dependency_root,
+            100,
+            expected_image,
+            &error),
+        L"warm OCR response rejects dependency sequence changes");
+    expect(
+        !airshot::ocr_test_support::parse_warm_worker_response(
+            valid,
+            42,
+            airshot::kOcrEngineRapidV5Fast,
+            std::filesystem::path(L"C:\\other-deps"),
+            99,
+            expected_image,
+            &error),
+        L"warm OCR response rejects dependency root changes");
+
+    std::string wrong_image = valid;
+    const std::string from = R"("inputWidth":200)";
+    const std::string to = R"("inputWidth":199)";
+    const std::size_t image_position = wrong_image.find(from);
+    expect(image_position != std::string::npos, L"warm OCR image fixture contains width");
+    if (image_position != std::string::npos) {
+        wrong_image.replace(image_position, from.size(), to);
+        expect(
+            !airshot::ocr_test_support::parse_warm_worker_response(
+                wrong_image,
+                42,
+                airshot::kOcrEngineRapidV5Fast,
+                dependency_root,
+                99,
+                expected_image,
+                &error),
+            L"warm OCR response rejects mismatched image metadata");
+    }
+
+    expect(
+        airshot::ocr_test_support::warm_worker_key_matches(
+            true,
+            dependency_root,
+            99,
+            airshot::kOcrEngineRapidV5Fast,
+            2,
+            std::filesystem::path(L"c:\\OCR-DEPS"),
+            99,
+            airshot::kOcrEngineRapidV5Fast,
+            2),
+        L"warm OCR reuses a healthy matching dependency/profile key");
+    expect(
+        !airshot::ocr_test_support::warm_worker_key_matches(
+            false,
+            dependency_root,
+            99,
+            airshot::kOcrEngineRapidV5Fast,
+            2,
+            dependency_root,
+            99,
+            airshot::kOcrEngineRapidV5Fast,
+            2),
+        L"warm OCR discards a crashed process");
+    expect(
+        !airshot::ocr_test_support::warm_worker_key_matches(
+            true,
+            dependency_root,
+            99,
+            airshot::kOcrEngineRapidV5Fast,
+            2,
+            dependency_root,
+            100,
+            airshot::kOcrEngineRapidV5Fast,
+            2),
+        L"warm OCR restarts for dependency version changes");
+    expect(
+        !airshot::ocr_test_support::warm_worker_key_matches(
+            true,
+            dependency_root,
+            99,
+            airshot::kOcrEngineRapidV5Fast,
+            2,
+            dependency_root,
+            99,
+            airshot::kOcrEngineRapidV5Fast,
+            4),
+        L"warm OCR restarts when thread selection grows from 2 to 4");
+    expect(
+        !airshot::ocr_test_support::warm_worker_key_matches(
+            true,
+            dependency_root,
+            99,
+            airshot::kOcrEngineRapidV5Fast,
+            4,
+            dependency_root,
+            99,
+            airshot::kOcrEngineRapidV5Fast,
+            2),
+        L"warm OCR restarts when thread selection shrinks from 4 to 2");
+    expect(
+        airshot::ocr_test_support::warm_failure_allows_fallback(false, false),
+        L"warm OCR non-cancellation failure permits Stage 1 fallback");
+    expect(
+        !airshot::ocr_test_support::warm_failure_allows_fallback(true, false) &&
+            !airshot::ocr_test_support::warm_failure_allows_fallback(false, true),
+        L"warm OCR cancellation never triggers cold fallback");
+}
+
+void test_warm_worker_frame_limits() {
+    const std::array<char, 4> valid_header{
+        static_cast<char>(0x34), static_cast<char>(0x12), 0, 0};
+    const auto valid = airshot::ocr_test_support::decode_warm_frame_size(
+        valid_header,
+        64 * 1024);
+    expect(valid && *valid == 0x1234, L"warm OCR frame decodes little-endian length");
+    const std::array<char, 4> zero_header{};
+    expect(
+        !airshot::ocr_test_support::decode_warm_frame_size(zero_header, 64 * 1024),
+        L"warm OCR frame rejects zero length");
+    const std::array<char, 4> oversized_header{0, 0, 2, 0};
+    expect(
+        !airshot::ocr_test_support::decode_warm_frame_size(
+            oversized_header,
+            64 * 1024),
+        L"warm OCR frame rejects lengths above the configured bound");
+    expect(
+        !airshot::ocr_test_support::decode_warm_frame_size(
+            std::span<const char>(valid_header).first(3),
+            64 * 1024),
+        L"warm OCR frame rejects truncated headers");
 }
 
 void test_pre_requested_recognition_cancellation() {
@@ -807,10 +1382,17 @@ int wmain(int argc, wchar_t** argv) {
     test_signature_parser();
     test_signature_verifier();
     test_pre_requested_download_cancellation();
+    test_unconfigured_build_is_offline_and_unavailable();
     test_compiled_sequence_floor();
     test_sequence_high_watermark();
     test_locked_path_share_contract();
+    test_dependency_hash_cache_and_cancellation();
     test_manifest_verifier_cli_contract();
+    test_ocr_protocol_parser_and_ordering();
+    test_ocr_protocol_rejects_untrusted_fields();
+    test_ocr_preprocess_scaling_and_threads();
+    test_warm_worker_protocol_and_state_machine();
+    test_warm_worker_frame_limits();
     test_pre_requested_recognition_cancellation();
     if (failures == 0) {
         std::wcout << L"All OCR tests passed.\n";

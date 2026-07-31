@@ -364,8 +364,113 @@ void test_stitch_limits_and_compatibility() {
            L"compatibility stitching rejects aliased input");
 }
 
+void test_resume_baseline_and_keyboard_commands() {
+    Bitmap baseline(4, 4);
+    std::fill(
+        baseline.pixels.begin(),
+        baseline.pixels.end(),
+        static_cast<std::uint8_t>(17));
+    Bitmap refreshed(4, 4);
+    std::fill(
+        refreshed.pixels.begin(),
+        refreshed.pixels.end(),
+        static_cast<std::uint8_t>(93));
+    expect(
+        airshot::overlay_detail::replace_scroll_resume_baseline(
+            baseline,
+            std::move(refreshed)) &&
+            baseline.valid() && baseline.pixels.front() == 93,
+        L"resume replaces the comparison baseline with a fresh matching frame");
+
+    const Bitmap preserved = baseline;
+    Bitmap wrong_size(3, 4);
+    expect(
+        !airshot::overlay_detail::replace_scroll_resume_baseline(
+            baseline,
+            std::move(wrong_size)) &&
+            baseline.width == preserved.width &&
+            baseline.height == preserved.height &&
+            baseline.pixels == preserved.pixels,
+        L"resume rejects a changed capture size without losing the old baseline");
+    expect(
+        !airshot::overlay_detail::replace_scroll_resume_baseline(
+            baseline,
+            Bitmap{}) &&
+            baseline.pixels == preserved.pixels,
+        L"resume rejects a failed capture without losing the old baseline");
+
+    using airshot::overlay_detail::ScrollKeyboardCommand;
+    expect(
+        airshot::overlay_detail::scroll_keyboard_command('P') ==
+                ScrollKeyboardCommand::toggle_pause &&
+            airshot::overlay_detail::scroll_keyboard_command(VK_RETURN) ==
+                ScrollKeyboardCommand::finish &&
+            airshot::overlay_detail::scroll_keyboard_command(VK_ESCAPE) ==
+                ScrollKeyboardCommand::cancel &&
+            airshot::overlay_detail::scroll_keyboard_command('Q') ==
+                ScrollKeyboardCommand::none,
+        L"overlay keyboard forwarding maps P, Enter, and Escape deterministically");
+}
+
 void test_scroll_control_clicks() {
     const HINSTANCE instance = GetModuleHandleW(nullptr);
+    const auto click_button = [](HWND window, int center_dip) {
+        RECT bounds{};
+        GetClientRect(window, &bounds);
+        const int x = MulDiv(bounds.right, center_dip, 328);
+        const int y = bounds.bottom / 2;
+        SendMessageW(
+            window,
+            WM_LBUTTONDOWN,
+            MK_LBUTTON,
+            MAKELPARAM(x, y));
+        SendMessageW(
+            window,
+            WM_LBUTTONUP,
+            0,
+            MAKELPARAM(x, y));
+    };
+
+    airshot::overlay_detail::ScrollControlState pause_state;
+    bool pause_toggled = false;
+    int capture_ticks = 0;
+    pause_state.on_tick = [&] { ++capture_ticks; };
+    pause_state.on_toggle_pause = [&] {
+        pause_toggled = true;
+        pause_state.paused = !pause_state.paused;
+    };
+    const HWND pause_window = airshot::overlay_detail::create_scroll_control_window(
+        instance, nullptr, {100, 100, 400, 400}, &pause_state);
+    expect(pause_window != nullptr, L"pause control window is created");
+    if (pause_window) {
+        expect(
+            SendMessageW(
+                pause_window,
+                WM_MOUSEACTIVATE,
+                reinterpret_cast<WPARAM>(pause_window),
+                MAKELPARAM(HTCLIENT, WM_LBUTTONDOWN)) == MA_NOACTIVATE,
+            L"scroll controls never steal focus from the captured target");
+        click_button(pause_window, 141);
+        expect(
+            pause_toggled && pause_state.paused &&
+                !pause_state.finished && !pause_state.cancelled,
+            L"pause click toggles capture without completing it");
+        SendMessageW(
+            pause_window,
+            WM_TIMER,
+            airshot::overlay_detail::kScrollCaptureTimer,
+            0);
+        expect(
+            capture_ticks == 0,
+            L"paused scroll controls suppress scheduled frame capture");
+        pause_toggled = false;
+        pause_state.can_resume = false;
+        click_button(pause_window, 141);
+        expect(
+            !pause_toggled && pause_state.paused,
+            L"hard pause disables the continue action");
+        DestroyWindow(pause_window);
+    }
 
     airshot::overlay_detail::ScrollControlState finish_state;
     bool finished = false;
@@ -374,8 +479,7 @@ void test_scroll_control_clicks() {
         instance, nullptr, {100, 100, 400, 400}, &finish_state);
     expect(finish_window != nullptr, L"finish control window is created");
     if (finish_window) {
-        SendMessageW(finish_window, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(130, 25));
-        SendMessageW(finish_window, WM_LBUTTONUP, 0, MAKELPARAM(130, 25));
+        click_button(finish_window, 213);
         expect(finished && finish_state.finished && !finish_state.cancelled,
                L"finish click survives capture release");
         DestroyWindow(finish_window);
@@ -388,8 +492,7 @@ void test_scroll_control_clicks() {
         instance, nullptr, {100, 100, 400, 400}, &cancel_state);
     expect(cancel_window != nullptr, L"cancel control window is created");
     if (cancel_window) {
-        SendMessageW(cancel_window, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(200, 25));
-        SendMessageW(cancel_window, WM_LBUTTONUP, 0, MAKELPARAM(200, 25));
+        click_button(cancel_window, 285);
         expect(cancelled && cancel_state.cancelled && !cancel_state.finished,
                L"cancel click survives capture release");
         DestroyWindow(cancel_window);
@@ -407,6 +510,7 @@ int wmain() {
     test_bounded_large_frame_search();
     test_chunked_stitching();
     test_stitch_limits_and_compatibility();
+    test_resume_baseline_and_keyboard_commands();
     test_scroll_control_clicks();
     if (failures == 0) {
         std::wcout << L"All scroll tests passed.\n";

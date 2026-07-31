@@ -1,6 +1,7 @@
 #include "settings_window.h"
 
 #include "app_icon.h"
+#include "settings_window_policy.h"
 
 #include "airshot/ocr.h"
 #include "airshot/strings.h"
@@ -29,7 +30,7 @@ OWN-WORLD: A near-black precision rail, cool neutral canvas, open setting rows, 
 and cyan only for healthy workflow status.
 STORY: Users choose a capture destination, tune annotation and OCR, arrange tools, record shortcuts,
 and understand what Save will change.
-FIRST VIEWPORT: Five destinations live in a 224-DIP rail; the selected task opens beside a compact
+FIRST VIEWPORT: Six destinations live in a 224-DIP rail; the selected task opens beside a compact
 capture-pipeline strip, with Save state anchored to the bottom action bar.
 FORM: Capture Console, the chosen rail-and-open-row hybrid from the Stitch structure study
 (project 454227981142275123, seed stitch/450cf4261edd46d287f5f04e5a5a7428).
@@ -44,17 +45,62 @@ constexpr int kWorkAreaMargin = 8;
 constexpr int kTitleBarHeight = 48;
 constexpr int kRailWidth = 224;
 constexpr int kFooterTop = 656;
-constexpr int kCategoryCount = 5;
+constexpr int kCategoryCount = 6;
 constexpr int kCategoryTop = 96;
 constexpr int kCategoryPitch = 48;
 constexpr int kSettingRowHeight = 56;
 constexpr int kToolbarRowHeight = 40;
 constexpr int kToolbarVisibleRows = 11;
+constexpr int kUpdateSecurityTab = 5;
+constexpr int kUpdateToggleLeft = 258;
+constexpr int kUpdateToggleTop = 160;
+constexpr int kUpdateToggleRight = 886;
+constexpr int kUpdateToggleBottom = 216;
+
+[[nodiscard]] constexpr bool settings_tab_index_is_valid(int index) noexcept {
+    return index >= 0 && index < kCategoryCount;
+}
+
+[[nodiscard]] constexpr int settings_tab_index_or_default(int index) noexcept {
+    return settings_tab_index_is_valid(index) ? index : 0;
+}
+
+[[nodiscard]] constexpr int settings_tab_index_after_delta(
+    int index,
+    int delta) noexcept {
+    if (!settings_tab_index_is_valid(index)) {
+        return delta < 0 ? kCategoryCount - 1 : 0;
+    }
+    int result = (index + delta % kCategoryCount) % kCategoryCount;
+    if (result < 0) {
+        result += kCategoryCount;
+    }
+    return result;
+}
+
+[[nodiscard]] constexpr bool settings_update_toggle_hit_test(
+    long x,
+    long y) noexcept {
+    return x >= kUpdateToggleLeft && x <= kUpdateToggleRight &&
+           y >= kUpdateToggleTop && y <= kUpdateToggleBottom;
+}
+
+static_assert(settings_tab_index_after_delta(0, -1) == kUpdateSecurityTab);
+static_assert(settings_tab_index_after_delta(kUpdateSecurityTab, 1) == 0);
+static_assert(settings_tab_index_after_delta(-1, 1) == 0);
+static_assert(settings_tab_index_after_delta(kCategoryCount, -1) ==
+              kUpdateSecurityTab);
+static_assert(settings_tab_index_or_default(-1) == 0);
+static_assert(settings_tab_index_or_default(kCategoryCount) == 0);
+static_assert(settings_update_toggle_hit_test(828, 188));
+static_assert(!settings_update_toggle_hit_test(kUpdateToggleLeft - 1, 188));
+static_assert(!settings_update_toggle_hit_test(828, kUpdateToggleBottom + 1));
 
 enum class SettingsFocusKind {
     category,
     capture_annotation,
     capture_locked_tool,
+    capture_cursor,
     capture_output,
     capture_notifications,
     ocr_enabled,
@@ -74,6 +120,7 @@ enum class SettingsFocusKind {
     app_startup,
     theme,
     app_icon,
+    update_automatic,
     save,
     cancel,
     close,
@@ -118,7 +165,7 @@ struct SettingsState {
 
     // UI state
     AppConfig initial_config;
-    int active_tab{0}; // 0: 截图与输出, 1: 文本与 OCR, 2: 工具栏, 3: 快捷键, 4: 应用与外观
+    int active_tab{0}; // 0: 截图与输出, 1: 文本与 OCR, 2: 工具栏, 3: 快捷键, 4: 应用与外观, 5: 更新与安全
     int capturing_idx_{-1}; // capturing hotkey index
     int selected_tool_idx{-1};
     int toolbar_scroll_offset{};
@@ -570,7 +617,8 @@ bool toggle_tray_icon(SettingsState* state) {
             state->window,
             L"隐藏托盘图标后，Air Screenshot 仍会在后台运行，截图快捷键也会继续生效。\n\n"
             L"如需恢复图标，请运行：\n"
-            L"AirScreenshot.exe app settings\n\n"
+            L"AirScreenshot.exe app tray show\n\n"
+            L"也可以运行 app settings 重新打开本窗口。\n\n"
             L"确定隐藏托盘图标吗？",
             L"隐藏托盘图标",
             MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2);
@@ -595,14 +643,19 @@ bool accept_settings(SettingsState* state) {
     if (state->validator) {
         std::wstring validation_error;
         if (!state->validator(state->config, &validation_error)) {
-            state->active_tab = 3;
+            const bool hotkey_failure =
+                validation_error.find(L"快捷键") != std::wstring::npos ||
+                validation_error.find(L"组合") != std::wstring::npos;
+            if (hotkey_failure) {
+                state->active_tab = 3;
+            }
             enter_settings_modal(state);
             MessageBoxW(
                 state->window,
                 validation_error.empty()
                     ? L"所选全局快捷键当前不可用，请换一个组合。"
                     : validation_error.c_str(),
-                L"快捷键不可用",
+                hotkey_failure ? L"快捷键不可用" : L"无法保存设置",
                 MB_OK | MB_ICONWARNING);
             if (!leave_settings_modal(state)) {
                 return false;
@@ -755,11 +808,18 @@ bool system_high_contrast_enabled() {
            (high_contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
 }
 
-void refresh_settings_theme(SettingsState* state) {
+void refresh_settings_theme(
+    SettingsState* state,
+    bool system_colors_changed = false) {
     const bool light = should_use_light_theme(state->config.theme);
     const bool high_contrast = system_high_contrast_enabled();
-    if (state->is_light_theme == light && state->high_contrast == high_contrast &&
-        state->render_target) {
+    if (!settings_detail::settings_theme_resources_need_refresh(
+            state->is_light_theme,
+            state->high_contrast,
+            light,
+            high_contrast,
+            state->render_target.Get() != nullptr,
+            system_colors_changed)) {
         return;
     }
     state->is_light_theme = light;
@@ -1243,7 +1303,7 @@ void draw_nav_icon(
                     brush);
             }
         }
-    } else {
+    } else if (category == 4) {
         target->DrawEllipse(
             D2D1::Ellipse(D2D1::Point2F(x + 9, y + 9), 4.0f, 4.0f), brush, stroke);
         for (int index = 0; index < 8; ++index) {
@@ -1254,6 +1314,42 @@ void draw_nav_icon(
                 brush,
                 stroke);
         }
+    } else {
+        constexpr std::array<D2D1_POINT_2F, 8> shield_points{{
+            {9.0f, 0.0f},
+            {17.0f, 3.0f},
+            {16.0f, 10.0f},
+            {13.0f, 15.0f},
+            {9.0f, 18.0f},
+            {5.0f, 15.0f},
+            {2.0f, 10.0f},
+            {1.0f, 3.0f},
+        }};
+        for (std::size_t index = 0; index < shield_points.size(); ++index) {
+            const D2D1_POINT_2F first = shield_points[index];
+            const D2D1_POINT_2F second =
+                shield_points[(index + 1) % shield_points.size()];
+            target->DrawLine(
+                D2D1::Point2F(x + first.x, y + first.y),
+                D2D1::Point2F(x + second.x, y + second.y),
+                brush,
+                stroke);
+        }
+        target->DrawLine(
+            D2D1::Point2F(x + 9.0f, y + 4.0f),
+            D2D1::Point2F(x + 9.0f, y + 12.0f),
+            brush,
+            stroke);
+        target->DrawLine(
+            D2D1::Point2F(x + 5.5f, y + 8.5f),
+            D2D1::Point2F(x + 9.0f, y + 12.0f),
+            brush,
+            stroke);
+        target->DrawLine(
+            D2D1::Point2F(x + 12.5f, y + 8.5f),
+            D2D1::Point2F(x + 9.0f, y + 12.0f),
+            brush,
+            stroke);
     }
 }
 
@@ -1336,15 +1432,17 @@ std::vector<SettingsFocusTarget> settings_focus_targets(const SettingsState* sta
     for (int index = 0; index < kCategoryCount; ++index) {
         targets.push_back({SettingsFocusKind::category, index});
     }
-    if (state->active_tab == 0) {
+    const int active_tab = settings_tab_index_or_default(state->active_tab);
+    if (active_tab == 0) {
         targets.push_back({SettingsFocusKind::capture_annotation});
         if (state->config.annotation_enabled) {
             targets.push_back({SettingsFocusKind::capture_locked_tool});
         }
+        targets.push_back({SettingsFocusKind::capture_cursor});
         targets.push_back({SettingsFocusKind::capture_output, 0});
         targets.push_back({SettingsFocusKind::capture_output, 1});
         targets.push_back({SettingsFocusKind::capture_notifications});
-    } else if (state->active_tab == 1) {
+    } else if (active_tab == 1) {
         targets.push_back({SettingsFocusKind::ocr_enabled});
         if (state->config.ocr_enabled && !state->is_downloading) {
             for (int index = 0; index < static_cast<int>(kOcrEngineButtons.size()); ++index) {
@@ -1357,7 +1455,7 @@ std::vector<SettingsFocusTarget> settings_focus_targets(const SettingsState* sta
         targets.push_back({SettingsFocusKind::font_family});
         targets.push_back({SettingsFocusKind::text_bold});
         targets.push_back({SettingsFocusKind::text_italic});
-    } else if (state->active_tab == 2) {
+    } else if (active_tab == 2) {
         const auto tools = split_by_comma(state->config.toolbar_order);
         for (int index = 0; index < static_cast<int>(tools.size()); ++index) {
             targets.push_back({SettingsFocusKind::toolbar_item, index});
@@ -1372,14 +1470,14 @@ std::vector<SettingsFocusTarget> settings_focus_targets(const SettingsState* sta
                 targets.push_back({SettingsFocusKind::toolbar_move_down});
             }
         }
-    } else if (state->active_tab == 3) {
+    } else if (active_tab == 3) {
         if (state->config.ocr_enabled) {
             targets.push_back({SettingsFocusKind::global_ocr_enabled});
         }
         for (int index = 0; index < shortcut_count; ++index) {
             targets.push_back({SettingsFocusKind::shortcut, index});
         }
-    } else {
+    } else if (active_tab == 4) {
         targets.push_back({SettingsFocusKind::app_shell});
         if (state->config.shell_enabled) {
             targets.push_back({SettingsFocusKind::app_tray});
@@ -1391,6 +1489,8 @@ std::vector<SettingsFocusTarget> settings_focus_targets(const SettingsState* sta
         for (int index = 0; index < 3; ++index) {
             targets.push_back({SettingsFocusKind::app_icon, index});
         }
+    } else if (active_tab == kUpdateSecurityTab) {
+        targets.push_back({SettingsFocusKind::update_automatic});
     }
     if (settings_are_dirty(state) && !state->shortcut_error) {
         targets.push_back({SettingsFocusKind::save});
@@ -1424,12 +1524,15 @@ std::optional<D2D1_ROUNDED_RECT> settings_focus_bounds(
         case SettingsFocusKind::capture_locked_tool:
             rect = D2D1::RectF(258.0f, 282.0f, 886.0f, 338.0f);
             break;
+        case SettingsFocusKind::capture_cursor:
+            rect = D2D1::RectF(258.0f, 338.0f, 886.0f, 394.0f);
+            break;
         case SettingsFocusKind::capture_output:
-            rect = target.index == 0 ? D2D1::RectF(594.0f, 429.0f, 724.0f, 465.0f)
-                                     : D2D1::RectF(732.0f, 429.0f, 870.0f, 465.0f);
+            rect = target.index == 0 ? D2D1::RectF(594.0f, 485.0f, 724.0f, 521.0f)
+                                     : D2D1::RectF(732.0f, 485.0f, 870.0f, 521.0f);
             break;
         case SettingsFocusKind::capture_notifications:
-            rect = D2D1::RectF(258.0f, 478.0f, 886.0f, 534.0f);
+            rect = D2D1::RectF(258.0f, 534.0f, 886.0f, 590.0f);
             break;
         case SettingsFocusKind::ocr_enabled:
             rect = D2D1::RectF(258.0f, 150.0f, 886.0f, 206.0f);
@@ -1533,6 +1636,13 @@ std::optional<D2D1_ROUNDED_RECT> settings_focus_bounds(
                 static_cast<float>(left), 478.0f, static_cast<float>(right), 560.0f);
             break;
         }
+        case SettingsFocusKind::update_automatic:
+            rect = D2D1::RectF(
+                static_cast<float>(kUpdateToggleLeft),
+                static_cast<float>(kUpdateToggleTop),
+                static_cast<float>(kUpdateToggleRight),
+                static_cast<float>(kUpdateToggleBottom));
+            break;
         case SettingsFocusKind::save:
             rect = D2D1::RectF(776.0f, 670.0f, 888.0f, 710.0f);
             break;
@@ -1654,7 +1764,7 @@ bool activate_settings_focus(
     const SettingsFocusTarget& target) {
     switch (target.kind) {
         case SettingsFocusKind::category:
-            if (target.index >= 0 && target.index < kCategoryCount) {
+            if (settings_tab_index_is_valid(target.index)) {
                 state->active_tab = target.index;
                 state->capturing_idx_ = -1;
             }
@@ -1667,6 +1777,9 @@ bool activate_settings_focus(
                 state->config.annotation_locked_tool =
                     !state->config.annotation_locked_tool;
             }
+            break;
+        case SettingsFocusKind::capture_cursor:
+            state->config.capture_cursor = !state->config.capture_cursor;
             break;
         case SettingsFocusKind::capture_output:
             state->config.default_output = target.index == 1 ? L"file" : L"clipboard";
@@ -1813,6 +1926,10 @@ bool activate_settings_focus(
             }
             break;
         }
+        case SettingsFocusKind::update_automatic:
+            state->config.automatic_updates_enabled =
+                !state->config.automatic_updates_enabled;
+            break;
         case SettingsFocusKind::save:
             if (settings_are_dirty(state) && !state->shortcut_error) {
                 return accept_settings(state);
@@ -1885,10 +2002,12 @@ void draw_window_shell(SettingsState* state) {
         L"工具栏",
         L"快捷键",
         L"应用与外观",
+        L"更新与安全",
     };
+    const int active_tab = settings_tab_index_or_default(state->active_tab);
     for (int index = 0; index < kCategoryCount; ++index) {
         const float top = static_cast<float>(kCategoryTop + index * kCategoryPitch);
-        const bool selected = state->active_tab == index;
+        const bool selected = active_tab == index;
         const bool hovered =
             point_in_rect(state->mouse_pos, 12.0f, top, 212.0f, top + 40.0f);
         if (selected || hovered) {
@@ -2060,7 +2179,7 @@ void draw_capture_page(SettingsState* state) {
     draw_workflow_strip(state);
 
     draw_section_title(state, L"截图行为", 198.0f);
-    draw_row_group(state, 226.0f, 338.0f);
+    draw_row_group(state, 226.0f, 394.0f);
     const bool annotation_hovered =
         point_in_rect(state->mouse_pos, 256.0f, 226.0f, 888.0f, 282.0f);
     draw_setting_row(
@@ -2099,12 +2218,31 @@ void draw_capture_page(SettingsState* state) {
         locked_enabled,
         locked_hovered);
 
-    draw_section_title(state, L"默认结果", 386.0f);
-    draw_row_group(state, 414.0f, 534.0f);
+    const bool cursor_hovered =
+        point_in_rect(state->mouse_pos, 256.0f, 338.0f, 888.0f, 394.0f);
     draw_setting_row(
         state,
-        414.0f,
-        478.0f,
+        338.0f,
+        394.0f,
+        L"捕捉鼠标指针",
+        L"区域、窗口和屏幕截图会保留触发时的指针。",
+        cursor_hovered,
+        true,
+        false);
+    draw_switch(
+        state,
+        828,
+        354,
+        state->config.capture_cursor,
+        true,
+        cursor_hovered);
+
+    draw_section_title(state, L"默认结果", 442.0f);
+    draw_row_group(state, 470.0f, 590.0f);
+    draw_setting_row(
+        state,
+        470.0f,
+        534.0f,
         L"截图完成后",
         L"未手动选择操作时使用。",
         false);
@@ -2113,35 +2251,35 @@ void draw_capture_page(SettingsState* state) {
     draw_choice_button(
         state,
         594,
-        429,
+        485,
         724,
-        465,
+        521,
         L"复制到剪贴板",
         !default_file,
-        point_in_rect(state->mouse_pos, 594.0f, 429.0f, 724.0f, 465.0f));
+        point_in_rect(state->mouse_pos, 594.0f, 485.0f, 724.0f, 521.0f));
     draw_choice_button(
         state,
         732,
-        429,
+        485,
         870,
-        465,
+        521,
         L"保存为 PNG",
         default_file,
-        point_in_rect(state->mouse_pos, 732.0f, 429.0f, 870.0f, 465.0f));
+        point_in_rect(state->mouse_pos, 732.0f, 485.0f, 870.0f, 521.0f));
 
     const bool notification_hovered =
-        point_in_rect(state->mouse_pos, 256.0f, 478.0f, 888.0f, 534.0f);
+        point_in_rect(state->mouse_pos, 256.0f, 534.0f, 888.0f, 590.0f);
     draw_setting_row(
         state,
-        478.0f,
         534.0f,
+        590.0f,
         L"完成时显示通知",
         L"仅在后台操作完成后提醒。",
         notification_hovered);
     draw_switch(
         state,
         828,
-        494,
+        550,
         state->config.notifications_enabled,
         true,
         notification_hovered);
@@ -2943,6 +3081,73 @@ void draw_app_page(SettingsState* state) {
         state->text_grey_brush.Get());
 }
 
+void draw_update_security_page(SettingsState* state) {
+    draw_page_header(
+        state,
+        L"更新与安全",
+        L"管理自动更新偏好，并核对每次更新遵守的安全边界。");
+
+    draw_section_title(state, L"更新偏好", 132.0f);
+    draw_row_group(state, 160.0f, 216.0f);
+    const bool automatic_hovered = settings_update_toggle_hit_test(
+        state->mouse_pos.x,
+        state->mouse_pos.y);
+    draw_setting_row(
+        state,
+        160.0f,
+        216.0f,
+        L"自动检查并安全更新",
+        L"每天静默检查；关闭后自动暂存的版本也暂停安装。",
+        automatic_hovered,
+        true,
+        false);
+    draw_switch(
+        state,
+        828,
+        176,
+        state->config.automatic_updates_enabled,
+        true,
+        automatic_hovered);
+
+    draw_section_title(state, L"更新保护", 252.0f);
+    draw_row_group(state, 280.0f, 448.0f);
+    draw_setting_row(
+        state,
+        280.0f,
+        336.0f,
+        L"SHA256 + 发布签名",
+        L"更新包必须同时通过摘要校验与发布签名验证。",
+        false);
+    draw_setting_row(
+        state,
+        336.0f,
+        392.0f,
+        L"保护现有安装",
+        L"安装目录不可写时停止，不覆盖或破坏当前程序。",
+        false);
+    draw_setting_row(
+        state,
+        392.0f,
+        448.0f,
+        L"手动检查仍在托盘",
+        L"需要立即检查时，请使用托盘菜单中的“检查更新”。",
+        false,
+        true,
+        false);
+
+    draw_section_title(state, L"生效方式", 484.0f);
+    draw_row_group(state, 512.0f, 584.0f);
+    draw_setting_row(
+        state,
+        512.0f,
+        584.0f,
+        L"保存只更新偏好",
+        L"本页不会立即联网检查；自动检查按每日计划在后台执行。",
+        false,
+        true,
+        false);
+}
+
 void draw_footer(SettingsState* state) {
     auto* target = state->render_target.Get();
     target->FillRectangle(
@@ -3003,12 +3208,13 @@ void paint_settings(SettingsState* state) {
             : (state->is_light_theme ? D2D1::ColorF(0xF6F8FC)
                                      : D2D1::ColorF(0x0F141D)));
     draw_window_shell(state);
-    switch (state->active_tab) {
+    switch (settings_tab_index_or_default(state->active_tab)) {
         case 0: draw_capture_page(state); break;
         case 1: draw_ocr_page(state); break;
         case 2: draw_toolbar_page(state); break;
         case 3: draw_shortcuts_page(state); break;
         case 4: draw_app_page(state); break;
+        case kUpdateSecurityTab: draw_update_security_page(state); break;
         default: break;
     }
     draw_footer(state);
@@ -3077,23 +3283,27 @@ std::optional<SettingsFocusTarget> hit_test_settings(
         return SettingsFocusTarget{SettingsFocusKind::cancel};
     }
 
-    if (state->active_tab == 0) {
+    const int active_tab = settings_tab_index_or_default(state->active_tab);
+    if (active_tab == 0) {
         if (point_in_rect(point, 258.0f, 226.0f, 886.0f, 282.0f)) {
             return SettingsFocusTarget{SettingsFocusKind::capture_annotation};
         }
         if (point_in_rect(point, 258.0f, 282.0f, 886.0f, 338.0f)) {
             return available({SettingsFocusKind::capture_locked_tool});
         }
-        if (point_in_rect(point, 594.0f, 429.0f, 724.0f, 465.0f)) {
+        if (point_in_rect(point, 258.0f, 338.0f, 886.0f, 394.0f)) {
+            return SettingsFocusTarget{SettingsFocusKind::capture_cursor};
+        }
+        if (point_in_rect(point, 594.0f, 485.0f, 724.0f, 521.0f)) {
             return SettingsFocusTarget{SettingsFocusKind::capture_output, 0};
         }
-        if (point_in_rect(point, 732.0f, 429.0f, 870.0f, 465.0f)) {
+        if (point_in_rect(point, 732.0f, 485.0f, 870.0f, 521.0f)) {
             return SettingsFocusTarget{SettingsFocusKind::capture_output, 1};
         }
-        if (point_in_rect(point, 258.0f, 478.0f, 886.0f, 534.0f)) {
+        if (point_in_rect(point, 258.0f, 534.0f, 886.0f, 590.0f)) {
             return SettingsFocusTarget{SettingsFocusKind::capture_notifications};
         }
-    } else if (state->active_tab == 1) {
+    } else if (active_tab == 1) {
         if (point_in_rect(point, 258.0f, 150.0f, 886.0f, 206.0f)) {
             return SettingsFocusTarget{SettingsFocusKind::ocr_enabled};
         }
@@ -3127,7 +3337,7 @@ std::optional<SettingsFocusTarget> hit_test_settings(
         if (point_in_rect(point, 808.0f, 484.0f, 870.0f, 520.0f)) {
             return SettingsFocusTarget{SettingsFocusKind::text_italic};
         }
-    } else if (state->active_tab == 2) {
+    } else if (active_tab == 2) {
         const int item = toolbar_index_at_point(state, point);
         if (item >= 0) {
             return SettingsFocusTarget{SettingsFocusKind::toolbar_item, item};
@@ -3141,7 +3351,7 @@ std::optional<SettingsFocusTarget> hit_test_settings(
         if (point_in_rect(point, 784.0f, 274.0f, 886.0f, 312.0f)) {
             return available({SettingsFocusKind::toolbar_move_down});
         }
-    } else if (state->active_tab == 3) {
+    } else if (active_tab == 3) {
         if (point_in_rect(point, 258.0f, 192.0f, 886.0f, 240.0f)) {
             return available({SettingsFocusKind::global_ocr_enabled});
         }
@@ -3162,7 +3372,7 @@ std::optional<SettingsFocusTarget> hit_test_settings(
                 return SettingsFocusTarget{SettingsFocusKind::shortcut, index};
             }
         }
-    } else if (state->active_tab == 4) {
+    } else if (active_tab == 4) {
         if (point_in_rect(point, 258.0f, 152.0f, 886.0f, 208.0f)) {
             return SettingsFocusTarget{SettingsFocusKind::app_shell};
         }
@@ -3204,6 +3414,9 @@ std::optional<SettingsFocusTarget> hit_test_settings(
                 return SettingsFocusTarget{SettingsFocusKind::app_icon, index};
             }
         }
+    } else if (active_tab == kUpdateSecurityTab &&
+               settings_update_toggle_hit_test(point.x, point.y)) {
+        return SettingsFocusTarget{SettingsFocusKind::update_automatic};
     }
     return std::nullopt;
 }
@@ -3330,9 +3543,12 @@ LRESULT CALLBACK settings_proc(
             return 0;
 
         case WM_SETTINGCHANGE:
-        case WM_SYSCOLORCHANGE:
         case WM_THEMECHANGED:
             refresh_settings_theme(state);
+            return 0;
+
+        case WM_SYSCOLORCHANGE:
+            refresh_settings_theme(state, true);
             return 0;
 
         case WM_GETDLGCODE:
@@ -3534,8 +3750,11 @@ LRESULT CALLBACK settings_proc(
                 const int delta =
                     (w_param == VK_LEFT || w_param == VK_UP) ? -1 : 1;
                 int count = 0;
+                bool moved = false;
                 if (target.kind == SettingsFocusKind::category) {
-                    count = kCategoryCount;
+                    target.index =
+                        settings_tab_index_after_delta(target.index, delta);
+                    moved = true;
                 } else if (target.kind == SettingsFocusKind::capture_output) {
                     count = 2;
                 } else if (target.kind == SettingsFocusKind::ocr_engine ||
@@ -3545,6 +3764,9 @@ LRESULT CALLBACK settings_proc(
                 }
                 if (count > 0) {
                     target.index = (target.index + delta + count) % count;
+                    moved = true;
+                }
+                if (moved) {
                     state->keyboard_focus = target;
                     (void)activate_settings_focus(state, target);
                     state->keyboard_focus_visible = true;
@@ -3614,6 +3836,10 @@ LRESULT CALLBACK settings_proc(
                 size.cx,
                 size.cy,
                 SWP_NOZORDER | SWP_NOACTIVATE);
+            apply_app_icon_to_window(
+                window,
+                state->config.app_icon,
+                HIWORD(w_param));
             discard_resources(state);
             InvalidateRect(window, nullptr, TRUE);
             return 0;
@@ -3676,6 +3902,8 @@ HWND show_settings_window_async(
         return nullptr;
     }
     state->config = std::move(config);
+    state->config.toolbar_order =
+        normalize_toolbar_order(state->config.toolbar_order);
     state->config.default_output =
         _wcsicmp(state->config.default_output.c_str(), L"file") == 0 ? L"file" : L"clipboard";
     state->initial_config = state->config;

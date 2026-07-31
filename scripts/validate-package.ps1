@@ -376,6 +376,16 @@ $requiredOcrFiles = @(
     "models/rapidocr-v4-compat/dict.txt"
 )
 $ocrManifest = Get-Content -LiteralPath $ocrManifestPath -Raw | ConvertFrom-Json
+$installedOcrManifest = Join-Path $site "ocr\$ocrPackageId\.airshot-manifest.json"
+$installedOcrSignature = Join-Path $site "ocr\$ocrPackageId\.airshot-manifest.sig"
+if (-not (Test-Path -LiteralPath $installedOcrManifest -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $installedOcrSignature -PathType Leaf) -or
+    (Get-FileHash -LiteralPath $installedOcrManifest -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath $ocrManifestPath -Algorithm SHA256).Hash -or
+    (Get-FileHash -LiteralPath $installedOcrSignature -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath $ocrSignaturePath -Algorithm SHA256).Hash) {
+    throw "OCR 离线 payload 缺少与公开清单完全一致的签名安装元数据。"
+}
 $manifestProperties = @($ocrManifest.PSObject.Properties.Name)
 if ($manifestProperties.Count -ne 6 -or
     $manifestProperties -notcontains "schemaVersion" -or

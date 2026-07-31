@@ -6,7 +6,9 @@
 
 #include "airshot/capture.h"
 #include "airshot/clipboard.h"
+#include "airshot/host_policy.h"
 #include "airshot/output.h"
+#include "airshot/pin_workflow.h"
 #include "airshot/strings.h"
 #include "airshot/update_policy.h"
 
@@ -14,9 +16,12 @@
 #include <winrt/Windows.Foundation.Collections.h>
 
 #include <dwmapi.h>
+#include <commdlg.h>
 
 #include <chrono>
+#include <array>
 #include <exception>
+#include <limits>
 #include <new>
 #include <utility>
 
@@ -35,6 +40,7 @@ constexpr UINT kUpdateCompleted = WM_APP + 6;
 constexpr UINT kTransportCompleted = WM_APP + 7;
 constexpr UINT kTransientResponseDelivered = WM_APP + 8;
 constexpr UINT kTransientDeliveryFailed = WM_APP + 9;
+constexpr UINT kUpdateActivationCompleted = WM_APP + 10;
 constexpr UINT kIpcListenerFaulted = WM_APP + 11;
 
 constexpr int kHotkeyCapture = 1;
@@ -53,21 +59,20 @@ constexpr UINT kMenuAbout = 2006;
 constexpr UINT kMenuAutomaticUpdates = 2007;
 constexpr UINT kMenuRestorePins = 2008;
 constexpr UINT kMenuPinClipboard = 2009;
+constexpr UINT kMenuPinFile = 2010;
+constexpr UINT kMenuHideAllPins = 2011;
+constexpr UINT kMenuShowAllPins = 2012;
+constexpr UINT kMenuRepeatCapture = 2013;
 constexpr UINT_PTR kShutdownDrainTimer = 1;
 constexpr UINT_PTR kTransientIdleTimer = 2;
 constexpr UINT_PTR kUpdateTimer = 3;
+constexpr UINT_PTR kTrayRetryTimer = 4;
 
 constexpr auto kRequestTimeout = std::chrono::seconds(90);
 constexpr auto kRequestCancellationPoll = std::chrono::milliseconds(50);
 constexpr DWORD kTransientStartupTimeoutMs = 20000;
 constexpr DWORD kTransientSuccessGraceMs = 500;
 constexpr DWORD kTransientFailureTimeoutMs = 2000;
-constexpr std::size_t kMaximumPinCount = 32;
-constexpr std::size_t kMaximumPinBytes =
-    64ULL * 1024ULL * 1024ULL;
-constexpr std::size_t kMaximumTotalPinBytes =
-    192ULL * 1024ULL * 1024ULL;
-
 std::int64_t now_unix_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -95,7 +100,11 @@ std::wstring module_status_json(const AppConfig& config) {
     return data.Stringify().c_str();
 }
 
-std::wstring app_status_json(const AppConfig& config, bool transient) {
+std::wstring app_status_json(
+    const AppConfig& config,
+    bool transient,
+    bool hotkeys_available,
+    std::wstring_view runtime_error) {
     JsonObject data;
     data.SetNamedValue(L"running", JsonValue::CreateBooleanValue(true));
     data.SetNamedValue(L"transient", JsonValue::CreateBooleanValue(transient));
@@ -103,6 +112,14 @@ std::wstring app_status_json(const AppConfig& config, bool transient) {
     data.SetNamedValue(
         L"trayIconVisible",
         JsonValue::CreateBooleanValue(config.tray_icon_visible));
+    data.SetNamedValue(
+        L"hotkeysAvailable",
+        JsonValue::CreateBooleanValue(hotkeys_available));
+    if (!runtime_error.empty()) {
+        data.SetNamedValue(
+            L"runtimeError",
+            JsonValue::CreateStringValue(runtime_error));
+    }
     return data.Stringify().c_str();
 }
 
@@ -140,22 +157,73 @@ std::wstring launch_nonce_from_request(std::wstring_view request_text) {
     }
 }
 
+std::optional<std::filesystem::path> prompt_pin_image_path(HWND owner) {
+    std::array<wchar_t, 32768> path{};
+    constexpr wchar_t filter[] =
+        L"图片文件\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.ico;*.webp\0"
+        L"所有文件\0*.*\0";
+    OPENFILENAMEW dialog{sizeof(dialog)};
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter = filter;
+    dialog.lpstrFile = path.data();
+    dialog.nMaxFile = static_cast<DWORD>(path.size());
+    dialog.lpstrTitle = L"选择要贴出的图片";
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
+                   OFN_NOCHANGEDIR | OFN_DONTADDTORECENT;
+    if (!GetOpenFileNameW(&dialog)) {
+        return std::nullopt;
+    }
+    return std::filesystem::path(path.data());
+}
+
+std::optional<std::wstring> pin_budget_error_message(
+    PinBudgetStatus status,
+    bool replacing) {
+    switch (status) {
+        case PinBudgetStatus::allowed:
+            return std::nullopt;
+        case PinBudgetStatus::invalid_bitmap:
+            return L"贴图图像为空或像素数据无效。";
+        case PinBudgetStatus::pin_count_limit:
+            return L"当前贴图已达到 32 张上限，请先销毁部分贴图。";
+        case PinBudgetStatus::single_pin_limit:
+            return L"单张贴图超过 64 MiB 像素安全上限，请先缩小图片。";
+        case PinBudgetStatus::total_pin_limit:
+            return replacing
+                       ? L"替换后会超过 192 MiB 总像素安全上限，原贴图已保留。"
+                       : L"创建该贴图会超过 192 MiB 总像素安全上限，请先销毁部分贴图。";
+    }
+    return L"贴图像素预算校验失败。";
+}
+
 }  // namespace
 
 HostApp::HostApp(
     HINSTANCE instance, bool transient, std::wstring transient_launch_nonce)
     : instance_(instance),
       transient_(transient),
-      transient_launch_nonce_(std::move(transient_launch_nonce)) {}
+      transient_launch_nonce_(std::move(transient_launch_nonce)) {
+    mutex_ = CreateMutexW(nullptr, TRUE, kHostMutexName);
+    if (mutex_ && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(mutex_);
+        mutex_ = nullptr;
+    }
+}
 
 HostApp::~HostApp() {
     shutdown();
+    if (mutex_) {
+        ReleaseMutex(mutex_);
+        CloseHandle(mutex_);
+        mutex_ = nullptr;
+    }
 }
 
 int HostApp::run() {
     if (!initialize()) {
         return static_cast<int>(ExitCode::ipc_failed);
     }
+    initialized_ = true;
 
     int exit_code = static_cast<int>(ExitCode::success);
     MSG message{};
@@ -179,13 +247,7 @@ int HostApp::run() {
 }
 
 bool HostApp::initialize() {
-    mutex_ = CreateMutexW(nullptr, TRUE, kHostMutexName);
     if (!mutex_) {
-        return false;
-    }
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(mutex_);
-        mutex_ = nullptr;
         return false;
     }
 
@@ -309,6 +371,7 @@ void HostApp::shutdown() {
         KillTimer(window_, kShutdownDrainTimer);
         KillTimer(window_, kTransientIdleTimer);
         KillTimer(window_, kUpdateTimer);
+        KillTimer(window_, kTrayRetryTimer);
     }
     reject_pending_requests();
 
@@ -338,21 +401,24 @@ void HostApp::shutdown() {
         update_thread_.join();
     }
     update_running_.store(false, std::memory_order_release);
+    update_user_triggered_.store(false, std::memory_order_release);
     {
         std::lock_guard lock(update_mutex_);
         update_completion_.reset();
+    }
+    if (update_activation_thread_.joinable()) {
+        update_activation_thread_.join();
+    }
+    update_activation_running_.store(false, std::memory_order_release);
+    {
+        std::lock_guard lock(update_activation_mutex_);
+        update_activation_completion_.reset();
     }
 
     if (window_ && IsWindow(window_)) {
         DestroyWindow(window_);
     }
     window_ = nullptr;
-
-    if (mutex_) {
-        ReleaseMutex(mutex_);
-        CloseHandle(mutex_);
-        mutex_ = nullptr;
-    }
 }
 
 void HostApp::request_shutdown() {
@@ -366,6 +432,7 @@ void HostApp::request_shutdown() {
     if (window_) {
         KillTimer(window_, kTransientIdleTimer);
         KillTimer(window_, kUpdateTimer);
+        KillTimer(window_, kTrayRetryTimer);
         SetTimer(window_, kShutdownDrainTimer, 50, nullptr);
     }
     unregister_hotkeys();
@@ -394,6 +461,7 @@ void HostApp::request_shutdown() {
 void HostApp::maybe_finish_shutdown() {
     prune_closed_pin_windows();
     if (shutdown_complete_ || mode_ != UiMode::shutting_down ||
+        update_activation_running_.load(std::memory_order_acquire) ||
         !pipe_server_.wait_until_not_accepting(0) || pipe_server_.active_clients() != 0 ||
         responses_in_flight_.load(std::memory_order_acquire) != 0 || capture_session_ || capture_completion_ ||
         (settings_window_ && IsWindow(settings_window_)) || (about_window_ && IsWindow(about_window_)) ||
@@ -570,14 +638,18 @@ void HostApp::promote_to_persistent() {
     schedule_update_check(kUpdateInitialDelayMs);
 }
 
-void HostApp::apply_shell() {
-    unregister_hotkeys();
+void HostApp::apply_shell(bool hotkeys_already_registered) {
+    if (!hotkeys_already_registered) {
+        unregister_hotkeys();
+    }
     remove_tray();
     if (config_.shell_enabled) {
         if (config_.tray_icon_visible) {
             add_tray();
         }
-        (void)register_hotkeys();
+        if (!hotkeys_already_registered) {
+            (void)register_hotkeys();
+        }
     }
 }
 
@@ -590,8 +662,14 @@ bool HostApp::commit_config(AppConfig next, std::wstring* error) {
         error->clear();
     }
 
+    const bool startup_changed = startup_sync_required(
+        config_.shell_enabled,
+        config_.start_at_login,
+        next.shell_enabled,
+        next.start_at_login);
+
     std::wstring startup_error;
-    if (!sync_startup_task(next, &startup_error)) {
+    if (startup_changed && !sync_startup_task(next, &startup_error)) {
         if (error) {
             *error = startup_error.empty()
                 ? L"无法同步开机启动设置。"
@@ -603,7 +681,8 @@ bool HostApp::commit_config(AppConfig next, std::wstring* error) {
     std::wstring save_error;
     if (!config_store_.save(next, &save_error)) {
         std::wstring rollback_error;
-        const bool startup_rolled_back = sync_startup_task(config_, &rollback_error);
+        const bool startup_rolled_back =
+            !startup_changed || sync_startup_task(config_, &rollback_error);
         if (error) {
             *error = save_error.empty() ? L"无法保存 Air Screenshot 配置。" : std::move(save_error);
             if (!startup_rolled_back) {
@@ -627,33 +706,58 @@ void HostApp::prune_closed_pin_windows() {
     });
 }
 
-std::optional<std::wstring> HostApp::pin_capacity_error(
-    const Bitmap& bitmap) const {
-    if (!bitmap.valid()) {
-        return L"贴图图像为空或像素数据无效。";
-    }
-    const std::size_t bytes = bitmap.pixels.size();
-    if (bytes > kMaximumPinBytes) {
-        return L"单张贴图超过 64 MiB 像素安全上限，请先缩小图片。";
-    }
-    if (pin_windows_.size() >= kMaximumPinCount) {
-        return L"当前贴图已达到 32 张上限，请先关闭部分贴图。";
-    }
+std::size_t HostApp::total_pin_bytes() const noexcept {
     std::size_t total = 0;
     for (const auto& pin : pin_windows_) {
         if (!pin) {
             continue;
         }
-        const std::size_t pin_bytes = pin->bitmap_bytes();
-        if (pin_bytes > kMaximumTotalPinBytes - total) {
-            return L"当前贴图占用已达到 192 MiB 像素安全上限。";
+        const std::size_t bytes = pin->bitmap_bytes();
+        if (bytes > std::numeric_limits<std::size_t>::max() - total) {
+            return std::numeric_limits<std::size_t>::max();
         }
-        total += pin_bytes;
+        total += bytes;
     }
-    if (bytes > kMaximumTotalPinBytes - total) {
-        return L"创建该贴图会超过 192 MiB 总像素安全上限，请先关闭部分贴图。";
-    }
-    return std::nullopt;
+    return total;
+}
+
+std::optional<std::wstring> HostApp::pin_capacity_error(
+    const Bitmap& bitmap) const {
+    const PinBudgetPlan plan = plan_pin_bitmap_change(
+        pin_windows_.size(),
+        total_pin_bytes(),
+        0,
+        bitmap.valid() ? bitmap.pixels.size() : 0);
+    return pin_budget_error_message(plan.status, false);
+}
+
+std::optional<std::wstring> HostApp::pin_replacement_capacity_error(
+    std::size_t current_bytes,
+    const Bitmap& bitmap) const {
+    const PinBudgetPlan plan = plan_pin_bitmap_change(
+        pin_windows_.size(),
+        total_pin_bytes(),
+        current_bytes,
+        bitmap.valid() ? bitmap.pixels.size() : 0);
+    return pin_budget_error_message(plan.status, true);
+}
+
+std::unique_ptr<PinWindow> HostApp::create_pin_window(
+    Bitmap bitmap,
+    int x,
+    int y) {
+    return PinWindow::create(
+        instance_,
+        window_,
+        std::move(bitmap),
+        x,
+        y,
+        config_.tray_icon_visible,
+        [this](std::size_t current_bytes, const Bitmap& replacement) {
+            return pin_replacement_capacity_error(
+                current_bytes,
+                replacement);
+        });
 }
 
 void HostApp::suspend_pins_for_capture() {
@@ -695,12 +799,28 @@ void HostApp::add_tray() {
     wcscpy_s(tray_.szTip, kAppName);
     tray_added_ = Shell_NotifyIconW(NIM_ADD, &tray_) == TRUE;
     if (tray_added_) {
+        tray_retry_count_ = 0;
+        if (window_) {
+            KillTimer(window_, kTrayRetryTimer);
+        }
         tray_.uVersion = NOTIFYICON_VERSION_4;
         Shell_NotifyIconW(NIM_SETVERSION, &tray_);
+    } else if (window_ && config_.shell_enabled &&
+               config_.tray_icon_visible && tray_retry_count_ < 3) {
+        ++tray_retry_count_;
+        SetTimer(
+            window_,
+            kTrayRetryTimer,
+            static_cast<UINT>(500U * tray_retry_count_),
+            nullptr);
     }
 }
 
 void HostApp::remove_tray() {
+    if (window_) {
+        KillTimer(window_, kTrayRetryTimer);
+    }
+    tray_retry_count_ = 0;
     if (tray_added_) {
         Shell_NotifyIconW(NIM_DELETE, &tray_);
         tray_added_ = false;
@@ -804,15 +924,27 @@ bool HostApp::validate_hotkeys(
 
 bool HostApp::register_hotkeys(
     std::wstring* error,
-    bool notify_failure) {
+    bool notify_failure,
+    const AppConfig* config_override,
+    bool allow_while_settings) {
     if (error) {
         error->clear();
     }
-    if (!window_ || !config_.shell_enabled || mode_ != UiMode::idle) {
+    const AppConfig& hotkey_config =
+        config_override ? *config_override : config_;
+    const bool mode_allows_registration =
+        mode_ == UiMode::idle ||
+        (allow_while_settings && mode_ == UiMode::settings);
+    if (!window_ || !hotkey_config.shell_enabled) {
+        hotkeys_registered_ = false;
+        hotkey_runtime_error_.clear();
+        return true;
+    }
+    if (!mode_allows_registration) {
         return true;
     }
     bool capture_registered = false;
-    if (const auto capture = parse_hotkey(config_.capture_hotkey)) {
+    if (const auto capture = parse_hotkey(hotkey_config.capture_hotkey)) {
         if (!RegisterHotKey(window_, kHotkeyCapture, capture->modifiers, capture->virtual_key)) {
             if (error) {
                 *error = L"截图全局快捷键注册失败：" +
@@ -826,8 +958,8 @@ bool HostApp::register_hotkeys(
     }
 
     bool pin_registered = false;
-    if ((!error || error->empty()) && !config_.pin_hotkey.empty()) {
-        if (const auto pin = parse_hotkey(config_.pin_hotkey)) {
+    if ((!error || error->empty()) && !hotkey_config.pin_hotkey.empty()) {
+        if (const auto pin = parse_hotkey(hotkey_config.pin_hotkey)) {
             if (!RegisterHotKey(
                     window_,
                     kHotkeyPin,
@@ -847,9 +979,9 @@ bool HostApp::register_hotkeys(
 
     bool ocr_registered = false;
     if ((!error || error->empty()) &&
-        config_.ocr_enabled &&
-        config_.global_ocr_enabled) {
-        if (const auto ocr = parse_hotkey(config_.global_ocr_hotkey)) {
+        hotkey_config.ocr_enabled &&
+        hotkey_config.global_ocr_enabled) {
+        if (const auto ocr = parse_hotkey(hotkey_config.global_ocr_hotkey)) {
             if (!RegisterHotKey(window_, kHotkeyOcr, ocr->modifiers, ocr->virtual_key)) {
                 if (error) {
                     *error = L"OCR 全局快捷键注册失败：" +
@@ -865,19 +997,31 @@ bool HostApp::register_hotkeys(
 
     const bool succeeded =
         capture_registered &&
-        (config_.pin_hotkey.empty() || pin_registered) &&
-        (!config_.ocr_enabled || !config_.global_ocr_enabled || ocr_registered);
+        (hotkey_config.pin_hotkey.empty() || pin_registered) &&
+        (!hotkey_config.ocr_enabled || !hotkey_config.global_ocr_enabled || ocr_registered);
+    hotkeys_registered_ = succeeded;
     if (!succeeded) {
         UnregisterHotKey(window_, kHotkeyCapture);
         UnregisterHotKey(window_, kHotkeyOcr);
         UnregisterHotKey(window_, kHotkeyPin);
+        hotkey_runtime_error_ =
+            error && !error->empty()
+                ? *error
+                : std::wstring(strings::hotkey_conflict);
         if (notify_failure) {
-            notify(
-                kAppName,
-                error && !error->empty()
-                    ? *error
-                    : std::wstring(strings::hotkey_conflict));
+            if (tray_added_) {
+                notify(kAppName, hotkey_runtime_error_);
+            } else {
+                MessageBoxW(
+                    window_,
+                    (hotkey_runtime_error_ +
+                     L"\n\n托盘图标当前不可见。请关闭占用快捷键的程序，或运行 AirScreenshot.exe app settings 修改快捷键。").c_str(),
+                    L"Air Screenshot 快捷键不可用",
+                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+            }
         }
+    } else {
+        hotkey_runtime_error_.clear();
     }
     return succeeded;
 }
@@ -888,6 +1032,7 @@ void HostApp::unregister_hotkeys() {
         UnregisterHotKey(window_, kHotkeyOcr);
         UnregisterHotKey(window_, kHotkeyPin);
     }
+    hotkeys_registered_ = false;
 }
 
 void HostApp::show_tray_menu() {
@@ -900,6 +1045,7 @@ void HostApp::show_tray_menu() {
         return;
     }
     AppendMenuW(menu, MF_STRING, kMenuCapture, strings::tray_capture.data());
+    AppendMenuW(menu, MF_STRING, kMenuRepeatCapture, L"重复上次区域");
     const std::wstring pin_label =
         config_.pin_hotkey.empty()
             ? L"贴出剪贴板"
@@ -909,10 +1055,14 @@ void HostApp::show_tray_menu() {
         MF_STRING,
         kMenuPinClipboard,
         pin_label.c_str());
+    AppendMenuW(menu, MF_STRING, kMenuPinFile, L"从文件贴图…");
     AppendMenuW(menu, MF_STRING, kMenuSettings, strings::tray_settings.data());
     UINT update_flags = MF_STRING;
     const wchar_t* update_label = strings::tray_update.data();
-    if (update_running_.load(std::memory_order_acquire)) {
+    if (update_activation_running_.load(std::memory_order_acquire)) {
+        update_flags |= MF_GRAYED;
+        update_label = L"正在准备重启更新…";
+    } else if (update_running_.load(std::memory_order_acquire)) {
         update_flags |= MF_GRAYED;
         update_label = L"正在检查更新…";
     } else if (update_ready_) {
@@ -922,11 +1072,33 @@ void HostApp::show_tray_menu() {
     AppendMenuW(
         menu,
         MF_STRING |
+            (mode_ == UiMode::idle ? 0U : MF_GRAYED) |
             (config_.automatic_updates_enabled ? MF_CHECKED : MF_UNCHECKED),
         kMenuAutomaticUpdates,
         L"自动检查并下载更新");
     AppendMenuW(menu, MF_STRING, kMenuAbout, L"关于");
     if (!pin_windows_.empty()) {
+        std::vector<PinStateView> pin_states;
+        pin_states.reserve(pin_windows_.size());
+        for (const auto& pin : pin_windows_) {
+            if (pin) {
+                pin_states.push_back({
+                    pin->hidden(),
+                    pin->click_through(),
+                    false,
+                });
+            }
+        }
+        const PinStateCounts counts = summarize_pin_states(pin_states);
+        const std::wstring count_label = std::format(
+            L"贴图：可见 {} / 隐藏 {}",
+            counts.visible,
+            counts.hidden);
+        AppendMenuW(
+            menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            count_label.c_str());
         const bool has_click_through_pin =
             std::ranges::any_of(
                 pin_windows_,
@@ -940,6 +1112,12 @@ void HostApp::show_tray_menu() {
                 kMenuRestorePins,
                 L"恢复所有贴图交互");
         }
+        if (counts.visible > 0) {
+            AppendMenuW(menu, MF_STRING, kMenuHideAllPins, L"隐藏所有贴图");
+        }
+        if (counts.hidden > 0) {
+            AppendMenuW(menu, MF_STRING, kMenuShowAllPins, L"显示所有隐藏贴图");
+        }
         AppendMenuW(menu, MF_STRING, kMenuCloseAllPins, L"销毁所有贴图");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -951,6 +1129,7 @@ void HostApp::show_tray_menu() {
     const UINT selected =
         TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, window_, nullptr);
     DestroyMenu(menu);
+    PostMessageW(window_, WM_NULL, 0, 0);
     if (selected != 0) {
         PostMessageW(window_, WM_COMMAND, selected, 0);
     }
@@ -965,7 +1144,6 @@ bool HostApp::show_settings() {
     }
 
     mode_ = UiMode::settings;
-    unregister_hotkeys();
     settings_window_ = show_settings_window_async(
         window_,
         config_,
@@ -978,29 +1156,11 @@ bool HostApp::show_settings() {
 
             if (!edited) {
                 mode_ = UiMode::idle;
-                if (config_.shell_enabled) {
-                    (void)register_hotkeys();
-                }
-                return;
-            }
-
-            edited->automatic_updates_enabled =
-                config_.automatic_updates_enabled;
-            edited->last_update_check_unix =
-                config_.last_update_check_unix;
-            edited->warned_update_target =
-                config_.warned_update_target;
-            AppConfig previous_config = config_;
-            std::wstring error;
-            if (!commit_config(std::move(*edited), &error)) {
-                MessageBoxW(window_, error.c_str(), kAppName, MB_OK | MB_ICONERROR);
-                if (mode_ == UiMode::shutting_down) {
-                    maybe_finish_shutdown();
-                    return;
-                }
-                mode_ = UiMode::idle;
-                if (config_.shell_enabled) {
-                    (void)register_hotkeys();
+                if (keep_settings_launch_transient(
+                        transient_.load(std::memory_order_acquire),
+                        config_.shell_enabled)) {
+                    arm_transient_idle_shutdown(1);
+                    maybe_shutdown_idle_transient();
                 }
                 return;
             }
@@ -1011,63 +1171,119 @@ bool HostApp::show_settings() {
                         config_.tray_icon_visible);
                 }
             }
-            apply_shell();
-            if (!config_.shell_enabled && !transient_.load(std::memory_order_acquire)) {
-                request_shutdown();
+            mode_ = UiMode::idle;
+            if (transient_.load(std::memory_order_acquire)) {
+                if (config_.shell_enabled) {
+                    promote_to_persistent();
+                } else {
+                    arm_transient_idle_shutdown(1);
+                    maybe_shutdown_idle_transient();
+                }
                 return;
             }
-            if (mode_ != UiMode::shutting_down) {
-                mode_ = UiMode::idle;
-                if (config_.shell_enabled) {
-                    std::wstring hotkey_error;
-                    if (!register_hotkeys(&hotkey_error, false)) {
-                        unregister_hotkeys();
-                        std::wstring rollback_error;
-                        const bool rolled_back =
-                            commit_config(
-                                std::move(previous_config),
-                                &rollback_error);
-                        if (rolled_back) {
-                            for (const auto& pin : pin_windows_) {
-                                if (pin) {
-                                    pin->set_click_through_available(
-                                        config_.tray_icon_visible);
-                                }
-                            }
-                            apply_shell();
-                        }
-                        std::wstring message =
-                            hotkey_error.empty()
-                                ? std::wstring(strings::hotkey_conflict)
-                                : std::move(hotkey_error);
-                        message += rolled_back
-                                       ? L"\n\n本次更改未保存，已恢复此前设置。"
-                                       : L"\n\n无法自动恢复此前设置：" +
-                                             (rollback_error.empty()
-                                                  ? std::wstring(L"配置回滚失败。")
-                                                  : rollback_error);
-                        MessageBoxW(
-                            window_,
-                            message.c_str(),
-                            L"快捷键不可用",
-                            MB_OK | MB_ICONWARNING);
-                        if (rolled_back &&
-                            !config_.shell_enabled &&
-                            !transient_.load(std::memory_order_acquire)) {
-                            request_shutdown();
-                        }
-                    }
-                }
+
+            // The submit validator has already registered the committed
+            // hotkeys. Preserve that reservation while applying tray changes
+            // so another process cannot steal the combination after Save.
+            apply_shell(true);
+            if (!config_.shell_enabled) {
+                request_shutdown();
             }
         },
         [this](const AppConfig& candidate, std::wstring* error) {
-            return validate_hotkeys(candidate, error);
+            AppConfig next = candidate;
+            next.last_update_check_unix =
+                config_.last_update_check_unix;
+            next.warned_update_target =
+                config_.warned_update_target;
+            const AppConfig previous = config_;
+            const bool automatic_updates_changed =
+                previous.automatic_updates_enabled !=
+                next.automatic_updates_enabled;
+
+            const auto restore_previous_hotkeys =
+                [this, &previous](std::wstring* restore_error) {
+                    unregister_hotkeys();
+                    return register_hotkeys(
+                        restore_error,
+                        false,
+                        &previous,
+                        true);
+                };
+            const auto append_restore_failure =
+                [error](std::wstring_view restore_error) {
+                    if (!error) {
+                        return;
+                    }
+                    if (!error->empty()) {
+                        *error += L"\n\n";
+                    }
+                    *error += L"此前快捷键也无法恢复";
+                    if (!restore_error.empty()) {
+                        *error += L"：";
+                        *error += restore_error;
+                    } else {
+                        *error += L"。";
+                    }
+                };
+
+            // Keep the old shortcuts reserved throughout normal editing. The
+            // only vacancy is the bounded switch performed synchronously by
+            // Save; any failure restores the old set before the dialog returns.
+            unregister_hotkeys();
+            if (!validate_hotkeys(next, error)) {
+                std::wstring restore_error;
+                if (!restore_previous_hotkeys(&restore_error)) {
+                    append_restore_failure(restore_error);
+                }
+                return false;
+            }
+
+            std::wstring hotkey_error;
+            if (!register_hotkeys(
+                    &hotkey_error,
+                    false,
+                    &next,
+                    true)) {
+                if (error) {
+                    *error = hotkey_error.empty()
+                                 ? std::wstring(strings::hotkey_conflict)
+                                 : std::move(hotkey_error);
+                }
+                std::wstring restore_error;
+                if (!restore_previous_hotkeys(&restore_error)) {
+                    append_restore_failure(restore_error);
+                }
+                return false;
+            }
+
+            std::wstring commit_error;
+            if (!commit_config(std::move(next), &commit_error)) {
+                if (error) {
+                    *error = commit_error.empty()
+                                 ? L"无法保存 Air Screenshot 配置。"
+                                 : std::move(commit_error);
+                }
+                std::wstring restore_error;
+                if (!restore_previous_hotkeys(&restore_error)) {
+                    append_restore_failure(restore_error);
+                }
+                return false;
+            }
+            if (automatic_updates_changed) {
+                static_cast<void>(apply_automatic_update_preference(
+                    previous.automatic_updates_enabled));
+            }
+            return true;
         });
 
     if (!settings_window_ && mode_ == UiMode::settings) {
         mode_ = UiMode::idle;
-        if (config_.shell_enabled) {
-            (void)register_hotkeys();
+        if (keep_settings_launch_transient(
+                transient_.load(std::memory_order_acquire),
+                config_.shell_enabled)) {
+            arm_transient_idle_shutdown(1);
+            maybe_shutdown_idle_transient();
         }
     }
     return settings_window_ != nullptr;
@@ -1127,15 +1343,122 @@ void HostApp::capture_region(RegionAction action) {
     start_region_capture(std::move(request), nullptr, true);
 }
 
+CommandResponse HostApp::repeat_last_region(
+    CaptureOutput output,
+    const std::filesystem::path& requested_path) {
+    std::vector<DisplayMonitorGeometry> topology;
+    std::wstring topology_signature;
+    RepeatRegionResolution resolved;
+    try {
+        topology = current_display_topology();
+        topology_signature = display_topology_signature(topology);
+        resolved = resolve_repeat_region(
+            config_.last_region_capture,
+            topology);
+    } catch (...) {
+        CommandResponse response;
+        response.code = ExitCode::operation_failed;
+        response.message = L"无法读取当前显示器拓扑。";
+        return response;
+    }
+    if (!resolved) {
+        CommandResponse response;
+        response.code = ExitCode::operation_failed;
+        switch (resolved.status) {
+            case RepeatRegionStatus::no_history:
+                response.message = L"没有可重复的上次截图区域。请先完成一次区域截图。";
+                break;
+            case RepeatRegionStatus::invalid_history:
+                response.message = L"上次截图区域记录无效，无法重复截图。";
+                break;
+            case RepeatRegionStatus::no_displays:
+                response.message = L"无法读取当前显示器拓扑。";
+                break;
+            case RepeatRegionStatus::no_intersection:
+                response.message = L"上次截图区域与当前显示区域完全不相交，无法重复截图。";
+                break;
+            case RepeatRegionStatus::success:
+                break;
+        }
+        return response;
+    }
+
+    suspend_pins_for_capture();
+    Bitmap bitmap;
+    try {
+        bitmap = capture_rect(
+            resolved.bounds,
+            config_.capture_cursor);
+    } catch (...) {
+        bitmap = {};
+    }
+    resume_pins_after_capture();
+
+    CommandResponse response = output_bitmap(
+        std::move(bitmap),
+        output == CaptureOutput::interactive
+            ? CaptureOutput::clipboard
+            : output,
+        requested_path,
+        resolved.cropped
+            ? L"上次截图区域超过当前显示区域，已裁剪并完成截图。"
+            : resolved.topology_changed
+            ? L"已按当前显示器布局重复上次区域。"
+            : L"已重复上次区域截图。");
+    if (response.code != ExitCode::success) {
+        return response;
+    }
+
+    AppConfig next = config_;
+    next.last_region_capture = LastRegionCapture{
+        resolved.bounds,
+        std::move(topology_signature)};
+    std::wstring save_error;
+    if (!config_store_.save(next, &save_error)) {
+        response.message +=
+            L" 区域历史未保存：" +
+            (save_error.empty() ? std::wstring(L"无法写入配置文件。")
+                                : save_error);
+    } else {
+        config_ = std::move(next);
+    }
+    return response;
+}
+
 std::optional<std::wstring> HostApp::sync_region_config(const RegionResult& result) {
     if (result.code == ExitCode::operation_failed && result.bounds.empty()) {
         return std::nullopt;
     }
     const AppConfig& next = result.config;
-    const bool changed = config_.custom_color != next.custom_color ||
-                         config_.annotation_locked_tool != next.annotation_locked_tool ||
-                         config_.annotation_hidden_tools != next.annotation_hidden_tools ||
-                         config_.annotation_highlight_alpha != next.annotation_highlight_alpha;
+    const bool style_changed =
+        config_.custom_color != next.custom_color ||
+        config_.annotation_locked_tool != next.annotation_locked_tool ||
+        config_.annotation_hidden_tools != next.annotation_hidden_tools ||
+        config_.annotation_highlight_alpha != next.annotation_highlight_alpha ||
+        config_.annotation_tool_styles != next.annotation_tool_styles;
+    std::optional<LastRegionCapture> last_region =
+        config_.last_region_capture;
+    if (result.code == ExitCode::success &&
+        result.bounds.width() >= 2 && result.bounds.height() >= 2 &&
+        valid_display_topology_signature(result.topology_signature)) {
+        last_region = LastRegionCapture{
+            result.bounds,
+            result.topology_signature};
+    }
+    const bool region_changed =
+        last_region.has_value() != config_.last_region_capture.has_value() ||
+        (last_region && config_.last_region_capture &&
+         (last_region->bounds.left !=
+              config_.last_region_capture->bounds.left ||
+          last_region->bounds.top !=
+              config_.last_region_capture->bounds.top ||
+          last_region->bounds.right !=
+              config_.last_region_capture->bounds.right ||
+          last_region->bounds.bottom !=
+              config_.last_region_capture->bounds.bottom ||
+          last_region->topology_signature !=
+              config_.last_region_capture->topology_signature));
+    const bool changed = style_changed || region_changed;
     if (!changed) {
         return std::nullopt;
     }
@@ -1145,6 +1468,8 @@ std::optional<std::wstring> HostApp::sync_region_config(const RegionResult& resu
     updated.annotation_locked_tool = next.annotation_locked_tool;
     updated.annotation_hidden_tools = next.annotation_hidden_tools;
     updated.annotation_highlight_alpha = next.annotation_highlight_alpha;
+    updated.annotation_tool_styles = next.annotation_tool_styles;
+    updated.last_region_capture = std::move(last_region);
 
     std::wstring error;
     if (!config_store_.save(updated, &error)) {
@@ -1173,6 +1498,38 @@ void HostApp::schedule_update_check(DWORD fallback_delay_ms) {
     SetTimer(window_, kUpdateTimer, delay, nullptr);
 }
 
+bool HostApp::apply_automatic_update_preference(
+    bool previous_enabled) {
+    const AutomaticUpdateRuntimeAction action =
+        automatic_update_runtime_action(
+            previous_enabled,
+            config_.automatic_updates_enabled,
+            update_running_.load(std::memory_order_acquire),
+            update_user_triggered_.load(std::memory_order_acquire));
+    switch (action) {
+        case AutomaticUpdateRuntimeAction::none:
+            return false;
+        case AutomaticUpdateRuntimeAction::schedule:
+            schedule_update_check(kUpdateInitialDelayMs);
+            return false;
+        case AutomaticUpdateRuntimeAction::disable:
+            if (window_) {
+                KillTimer(window_, kUpdateTimer);
+            }
+            return false;
+        case AutomaticUpdateRuntimeAction::disable_and_cancel:
+            if (window_) {
+                KillTimer(window_, kUpdateTimer);
+            }
+            if (update_thread_.joinable()) {
+                update_thread_.request_stop();
+                return true;
+            }
+            return false;
+    }
+    return false;
+}
+
 bool HostApp::persist_update_config(
     AppConfig next,
     bool report_failure) {
@@ -1190,6 +1547,7 @@ bool HostApp::persist_update_config(
 }
 
 void HostApp::toggle_automatic_updates() {
+    const bool previous_enabled = config_.automatic_updates_enabled;
     AppConfig next = config_;
     next.automatic_updates_enabled =
         !next.automatic_updates_enabled;
@@ -1197,18 +1555,18 @@ void HostApp::toggle_automatic_updates() {
         return;
     }
 
+    const bool canceling_automatic_update =
+        apply_automatic_update_preference(previous_enabled);
     if (config_.automatic_updates_enabled) {
-        schedule_update_check(1'000);
         notify(
             L"自动更新已开启",
             L"Air Screenshot 将每天静默检查并下载经过验证的更新。");
     } else {
-        if (window_) {
-            KillTimer(window_, kUpdateTimer);
-        }
         notify(
             L"自动更新已关闭",
-            L"仍可从托盘菜单手动检查更新。");
+            canceling_automatic_update
+                ? L"正在停止后台自动下载；自动暂存的版本也会暂停安装，仍可手动检查更新。"
+                : L"自动暂存的版本会暂停安装；仍可从托盘菜单手动检查更新。");
     }
 }
 
@@ -1246,6 +1604,7 @@ void HostApp::check_for_updates(bool user_triggered) {
         }
         (void)persist_update_config(std::move(next), false);
         update_running_.store(false, std::memory_order_release);
+        update_user_triggered_.store(false, std::memory_order_release);
         schedule_update_check(
             user_triggered
                 ? kUpdateRetryDelayMs
@@ -1265,6 +1624,7 @@ void HostApp::check_for_updates(bool user_triggered) {
     }
 
     const HWND owner = window_;
+    update_user_triggered_.store(user_triggered, std::memory_order_release);
     try {
         update_thread_ = std::jthread(
             [this, owner, user_triggered](std::stop_token stop_token) {
@@ -1279,17 +1639,17 @@ void HostApp::check_for_updates(bool user_triggered) {
                         completion.result =
                             stage_latest_update(
                                 &completion.message,
-                                stop_token);
+                                stop_token,
+                                user_triggered
+                                    ? UpdateRequestSource::manual
+                                    : UpdateRequestSource::automatic);
                     }
                 } catch (const std::exception&) {
                     completion.result = UpdateStageResult::failed;
                     completion.message = L"检查更新时发生异常。";
                 }
 
-                if (stop_token.stop_requested()) {
-                    update_running_.store(false, std::memory_order_release);
-                    return;
-                }
+                completion.canceled = stop_token.stop_requested();
                 {
                     std::lock_guard lock(update_mutex_);
                     update_completion_.emplace(std::move(completion));
@@ -1298,10 +1658,12 @@ void HostApp::check_for_updates(bool user_triggered) {
                     std::lock_guard lock(update_mutex_);
                     update_completion_.reset();
                     update_running_.store(false, std::memory_order_release);
+                    update_user_triggered_.store(false, std::memory_order_release);
                 }
             });
     } catch (const std::exception&) {
         update_running_.store(false, std::memory_order_release);
+        update_user_triggered_.store(false, std::memory_order_release);
         if (user_triggered) {
             notify(
                 L"无法检查更新",
@@ -1320,7 +1682,8 @@ void HostApp::check_for_updates(bool user_triggered) {
 
 bool HostApp::can_restart_for_update() {
     prune_closed_pin_windows();
-    if (mode_ != UiMode::idle || capture_session_ ||
+    if (update_activation_running_.load(std::memory_order_acquire) ||
+        mode_ != UiMode::idle || capture_session_ ||
         capture_completion_ ||
         (settings_window_ && IsWindow(settings_window_)) ||
         (about_window_ && IsWindow(about_window_)) ||
@@ -1334,12 +1697,37 @@ bool HostApp::can_restart_for_update() {
 }
 
 void HostApp::activate_pending_update() {
-    if (!pending_update_available()) {
-        update_ready_ = false;
-        check_for_updates(true);
-        return;
+    std::wstring intent_error;
+    switch (mark_pending_update_manual(&intent_error)) {
+        case PendingUpdateManualResult::ready:
+            break;
+        case PendingUpdateManualResult::missing:
+            update_ready_ = false;
+            notify(
+                L"待安装版本已不存在",
+                L"请重新检查更新。");
+            return;
+        case PendingUpdateManualResult::invalid:
+            update_ready_ = false;
+            notify(
+                L"待安装版本已失效",
+                intent_error.empty()
+                    ? L"请重新检查更新。"
+                    : intent_error);
+            return;
+        case PendingUpdateManualResult::busy:
+            notify(
+                L"更新操作正在进行",
+                L"手动更新入口已保留，请稍后重试。");
+            return;
+        case PendingUpdateManualResult::failed:
+            notify(
+                L"无法确认手动更新",
+                intent_error.empty()
+                    ? L"手动更新入口已保留，请稍后重试。"
+                    : intent_error + L" 请稍后重试。");
+            return;
     }
-    update_ready_ = true;
     if (!can_restart_for_update()) {
         notify(
             L"更新将在稍后安装",
@@ -1347,16 +1735,50 @@ void HostApp::activate_pending_update() {
         return;
     }
 
-    std::wstring error;
-    if (!launch_pending_update(true, &error)) {
-        notify(
-            L"无法启动更新",
-            error.empty() ? L"已验证的更新暂时无法启动。" : error);
+    bool expected = false;
+    if (!update_activation_running_.compare_exchange_strong(
+            expected,
+            true,
+            std::memory_order_acq_rel)) {
         return;
     }
-    update_ready_ = false;
-    update_helper_launched_ = true;
-    request_shutdown();
+    mode_ = UiMode::update_activation;
+
+    if (update_activation_thread_.joinable()) {
+        update_activation_thread_.join();
+    }
+    const HWND owner = window_;
+    try {
+        update_activation_thread_ = std::jthread([this, owner] {
+            UpdateActivationCompletion completion;
+            if (launch_pending_update(true, &completion.message)) {
+                completion.result = UpdateActivationResult::launched;
+            } else if (completion.message.empty()) {
+                completion.result = UpdateActivationResult::unavailable;
+            } else {
+                completion.result = UpdateActivationResult::failed;
+            }
+            {
+                std::lock_guard lock(update_activation_mutex_);
+                update_activation_completion_.emplace(std::move(completion));
+            }
+            if (!PostMessageW(owner, kUpdateActivationCompleted, 0, 0)) {
+                std::lock_guard lock(update_activation_mutex_);
+                update_activation_completion_.reset();
+                update_activation_running_.store(false, std::memory_order_release);
+            }
+        });
+    } catch (const std::exception&) {
+        update_activation_running_.store(false, std::memory_order_release);
+        mode_ = UiMode::idle;
+        notify(
+            L"无法启动更新",
+            L"无法创建后台更新应用任务，请稍后重试。");
+        return;
+    }
+    notify(
+        L"正在准备更新",
+        L"Air Screenshot 正在后台启动已验证的更新，界面仍可正常响应。");
 }
 
 std::wstring HostApp::handle_pipe_request(
@@ -1507,11 +1929,18 @@ void HostApp::dispatch_command(const CaptureCommand& command, std::shared_ptr<Re
         return;
     }
 
+    if (command.mode == CaptureMode::repeat) {
+        complete_request(
+            request,
+            repeat_last_region(command.output, command.path));
+        return;
+    }
+
     if (command.mode == CaptureMode::window) {
         suspend_pins_for_capture();
         const auto captured = [this]() noexcept {
             try {
-                return capture_active_window();
+                return capture_active_window(config_.capture_cursor);
             } catch (...) {
                 return decltype(capture_active_window()){};
             }
@@ -1535,7 +1964,8 @@ void HostApp::dispatch_command(const CaptureCommand& command, std::shared_ptr<Re
     const auto captured = [this, &command]() noexcept {
         try {
             return capture_monitor(
-                monitor_selector(command.monitor));
+                monitor_selector(command.monitor),
+                config_.capture_cursor);
         } catch (...) {
             return decltype(capture_monitor(
                 monitor_selector(command.monitor))){};
@@ -1589,11 +2019,19 @@ void HostApp::dispatch_command(
         complete_request(request, std::move(response));
         return;
     }
+    if (command.action == PinAction::toggle_interaction) {
+        complete_request(request, toggle_pin_interaction());
+        return;
+    }
     if (mode_ != UiMode::idle) {
         complete_request(request, busy_response());
         return;
     }
-    complete_request(request, pin_clipboard());
+    complete_request(
+        request,
+        command.action == PinAction::file
+            ? pin_file(command.path)
+            : pin_clipboard());
 }
 
 void HostApp::dispatch_command(const ModuleCommand& command, std::shared_ptr<RequestContext> request) {
@@ -1655,7 +2093,11 @@ void HostApp::dispatch_command(const AppCommand& command, std::shared_ptr<Reques
         CommandResponse response;
         response.message = L"Air Screenshot 正在运行。";
         response.data_json =
-            app_status_json(config_, transient_.load(std::memory_order_acquire));
+            app_status_json(
+                config_,
+                transient_.load(std::memory_order_acquire),
+                !config_.shell_enabled || hotkeys_registered_,
+                hotkey_runtime_error_);
         complete_request(request, std::move(response));
         return;
     }
@@ -1666,12 +2108,56 @@ void HostApp::dispatch_command(const AppCommand& command, std::shared_ptr<Reques
         complete_request(request, std::move(response));
         return;
     }
+    if (command.action == AppAction::tray_show) {
+        if (mode_ != UiMode::idle) {
+            complete_request(request, busy_response());
+            return;
+        }
+        CommandResponse response;
+        if (!config_.shell_enabled) {
+            response.code = ExitCode::operation_failed;
+            response.message =
+                L"后台服务已关闭。请先运行 app settings 启用后台运行。";
+            complete_request(request, std::move(response));
+            return;
+        }
+        if (!config_.tray_icon_visible) {
+            AppConfig next = config_;
+            next.tray_icon_visible = true;
+            std::wstring error;
+            if (!commit_config(std::move(next), &error)) {
+                response.code = ExitCode::operation_failed;
+                response.message = error.empty()
+                                       ? L"无法保存托盘图标设置。"
+                                       : std::move(error);
+                complete_request(request, std::move(response));
+                return;
+            }
+        }
+        if (transient_.load(std::memory_order_acquire)) {
+            promote_to_persistent();
+            request->transient_generation.store(0, std::memory_order_release);
+        } else {
+            apply_shell();
+        }
+        response.message = tray_added_
+                               ? L"系统托盘图标已恢复。"
+                               : L"已请求恢复系统托盘图标；Explorer 可用后会自动重试。";
+        complete_request(request, std::move(response));
+        return;
+    }
     if (mode_ != UiMode::idle) {
         complete_request(request, busy_response());
         return;
     }
-    promote_to_persistent();
-    request->transient_generation.store(0, std::memory_order_release);
+    // A settings-only launch must remain transient while shell integration is
+    // disabled. Otherwise cancelling the dialog leaves an invisible host with
+    // neither tray nor hotkeys. Saving shell=true promotes it in the completion
+    // callback after the configuration transaction succeeds.
+    if (config_.shell_enabled) {
+        promote_to_persistent();
+        request->transient_generation.store(0, std::memory_order_release);
+    }
     if (!show_settings()) {
         CommandResponse response;
         response.code = ExitCode::operation_failed;
@@ -1741,25 +2227,16 @@ void HostApp::handle_capture_completion() {
     if (mode_ != UiMode::shutting_down) {
         mode_ = UiMode::idle;
     }
-    if (auto config_error = sync_region_config(completion.result)) {
-        if (!completion.result.message.empty()) {
-            completion.result.message += L" ";
-        }
-        completion.result.message += L"截图设置未保存：" + *config_error;
-    }
-
     if (completion.result.code == ExitCode::success && completion.result.action == RegionAction::pin) {
         prune_closed_pin_windows();
         const auto capacity_error =
             pin_capacity_error(completion.result.bitmap);
         std::unique_ptr<PinWindow> pin;
         if (!capacity_error) {
-            pin = PinWindow::create(instance_,
-                                    window_,
-                                    completion.result.bitmap,
-                                    completion.result.bounds.left,
-                                    completion.result.bounds.top,
-                                    config_.tray_icon_visible);
+            pin = create_pin_window(
+                completion.result.bitmap,
+                completion.result.bounds.left,
+                completion.result.bounds.top);
         }
         if (pin) {
             pin_windows_.push_back(std::move(pin));
@@ -1782,6 +2259,13 @@ void HostApp::handle_capture_completion() {
                            : reason + L" 剪贴板保底也失败：" +
                                  clipboard_error);
         }
+    }
+
+    if (auto config_error = sync_region_config(completion.result)) {
+        if (!completion.result.message.empty()) {
+            completion.result.message += L" ";
+        }
+        completion.result.message += L"截图设置未保存：" + *config_error;
     }
 
     if (completion.request) {
@@ -1814,10 +2298,15 @@ void HostApp::handle_update_completion() {
         update_completion_.reset();
     }
     update_running_.store(false, std::memory_order_release);
+    update_user_triggered_.store(false, std::memory_order_release);
     if (update_thread_.joinable()) {
         update_thread_.join();
     }
     if (!completion || mode_ == UiMode::shutting_down) {
+        return;
+    }
+    if (completion->canceled) {
+        schedule_update_check(1'000);
         return;
     }
 
@@ -1838,11 +2327,18 @@ void HostApp::handle_update_completion() {
     switch (completion->result) {
         case UpdateStageResult::staged:
             update_ready_ = true;
-            notify(
-                L"更新已准备好",
-                completion->user_triggered
-                    ? L"可从托盘菜单选择“立即重启并更新”；继续使用时，更新会在退出或下次启动时安装。"
-                    : L"新版本已通过校验，将在退出或下次启动时安装。");
+            if (!completion->user_triggered &&
+                !config_.automatic_updates_enabled) {
+                notify(
+                    L"更新已下载但自动安装已暂停",
+                    L"可从托盘菜单选择“立即重启并更新”，或重新开启自动更新。");
+            } else {
+                notify(
+                    L"更新已准备好",
+                    completion->user_triggered
+                        ? L"可从托盘菜单选择“立即重启并更新”；继续使用时，更新会在退出或下次启动时安装。"
+                        : L"新版本已通过校验，将在退出或下次启动时安装。");
+            }
             break;
         case UpdateStageResult::up_to_date:
             if (completion->user_triggered) {
@@ -1861,6 +2357,54 @@ void HostApp::handle_update_completion() {
                         ? L"暂时无法检查更新，请稍后重试。"
                         : completion->message);
             }
+            break;
+    }
+}
+
+void HostApp::handle_update_activation_completion() {
+    std::optional<UpdateActivationCompletion> completion;
+    {
+        std::lock_guard lock(update_activation_mutex_);
+        completion = std::move(update_activation_completion_);
+        update_activation_completion_.reset();
+    }
+    update_activation_running_.store(false, std::memory_order_release);
+    if (update_activation_thread_.joinable()) {
+        update_activation_thread_.join();
+    }
+    if (!completion) {
+        return;
+    }
+
+    if (mode_ == UiMode::shutting_down) {
+        if (completion->result == UpdateActivationResult::launched) {
+            update_ready_ = false;
+            update_helper_launched_ = true;
+        }
+        maybe_finish_shutdown();
+        return;
+    }
+
+    if (mode_ == UiMode::update_activation) {
+        mode_ = UiMode::idle;
+    }
+
+    switch (completion->result) {
+        case UpdateActivationResult::launched:
+            update_ready_ = false;
+            update_helper_launched_ = true;
+            request_shutdown();
+            break;
+        case UpdateActivationResult::unavailable:
+            update_ready_ = false;
+            check_for_updates(true);
+            break;
+        case UpdateActivationResult::failed:
+            notify(
+                L"无法启动更新",
+                completion->message.empty()
+                    ? L"已验证的更新暂时无法启动。"
+                    : completion->message);
             break;
     }
 }
@@ -1897,22 +2441,12 @@ CommandResponse HostApp::busy_response() const {
     return response;
 }
 
-CommandResponse HostApp::pin_clipboard() {
+CommandResponse HostApp::pin_bitmap(
+    Bitmap bitmap,
+    std::wstring_view description) {
     prune_closed_pin_windows();
-
-    std::wstring error;
-    auto visual = read_clipboard_visual(window_, &error);
-    if (!visual || !visual->bitmap.valid()) {
-        CommandResponse response;
-        response.code = ExitCode::operation_failed;
-        response.message =
-            error.empty()
-                ? L"剪贴板内容无法创建贴图。"
-                : std::move(error);
-        return response;
-    }
     if (const auto capacity_error =
-            pin_capacity_error(visual->bitmap)) {
+            pin_capacity_error(bitmap)) {
         CommandResponse response;
         response.code = ExitCode::operation_failed;
         response.message = *capacity_error;
@@ -1931,13 +2465,10 @@ CommandResponse HostApp::pin_clipboard() {
     position.x += cascade;
     position.y += cascade;
 
-    auto pin = PinWindow::create(
-        instance_,
-        window_,
-        std::move(visual->bitmap),
+    auto pin = create_pin_window(
+        std::move(bitmap),
         position.x,
-        position.y,
-        config_.tray_icon_visible);
+        position.y);
     if (!pin) {
         CommandResponse response;
         response.code = ExitCode::operation_failed;
@@ -1948,9 +2479,136 @@ CommandResponse HostApp::pin_clipboard() {
 
     CommandResponse response;
     response.message =
+        description.empty()
+            ? L"已创建贴图。"
+            : L"已贴出" + std::wstring(description) + L"。";
+    return response;
+}
+
+CommandResponse HostApp::pin_clipboard() {
+    std::wstring error;
+    auto visual = read_clipboard_visual(window_, &error);
+    if (!visual || !visual->bitmap.valid()) {
+        CommandResponse response;
+        response.code = ExitCode::operation_failed;
+        response.message =
+            error.empty()
+                ? L"剪贴板内容无法创建贴图。"
+                : std::move(error);
+        return response;
+    }
+    return pin_bitmap(
+        std::move(visual->bitmap),
         visual->description.empty()
-            ? L"已贴出剪贴板内容。"
-            : L"已贴出" + visual->description + L"。";
+            ? std::wstring_view{L"剪贴板内容"}
+            : std::wstring_view{visual->description});
+}
+
+CommandResponse HostApp::pin_file(
+    const std::filesystem::path& path) {
+    if (path.empty() || !path.is_absolute()) {
+        CommandResponse response;
+        response.code = ExitCode::invalid_arguments;
+        response.message = L"贴图文件路径必须是绝对路径。";
+        return response;
+    }
+    std::wstring error;
+    const std::filesystem::path normalized = path.lexically_normal();
+    auto bitmap = decode_local_image_file(normalized, &error);
+    if (!bitmap) {
+        CommandResponse response;
+        response.code = ExitCode::operation_failed;
+        response.message = error.empty()
+                               ? L"无法读取要贴出的图片文件。"
+                               : std::move(error);
+        return response;
+    }
+    const std::wstring description = normalized.filename().empty()
+                                         ? L"图片文件"
+                                         : normalized.filename().wstring();
+    return pin_bitmap(std::move(*bitmap), description);
+}
+
+CommandResponse HostApp::toggle_pin_interaction() {
+    prune_closed_pin_windows();
+    POINT cursor{};
+    if (!GetCursorPos(&cursor)) {
+        CommandResponse response;
+        response.code = ExitCode::operation_failed;
+        response.message = L"无法读取鼠标位置。";
+        return response;
+    }
+
+    struct OrderedPin {
+        std::size_t rank{};
+        PinWindow* pin{};
+    };
+    std::vector<OrderedPin> ordered;
+    ordered.reserve(pin_windows_.size());
+    for (const auto& pin : pin_windows_) {
+        if (!pin || !pin->hwnd() || !IsWindow(pin->hwnd())) {
+            continue;
+        }
+        std::size_t rank = 0;
+        for (HWND above = GetWindow(pin->hwnd(), GW_HWNDPREV);
+             above;
+             above = GetWindow(above, GW_HWNDPREV)) {
+            ++rank;
+        }
+        ordered.push_back({rank, pin.get()});
+    }
+    std::ranges::sort(
+        ordered,
+        [](const OrderedPin& left, const OrderedPin& right) {
+            return left.rank < right.rank;
+        });
+
+    std::vector<PinStateView> states;
+    states.reserve(ordered.size());
+    for (const OrderedPin& item : ordered) {
+        RECT bounds{};
+        const bool visible =
+            !item.pin->hidden() &&
+            IsWindowVisible(item.pin->hwnd()) &&
+            GetWindowRect(item.pin->hwnd(), &bounds);
+        states.push_back({
+            !visible,
+            item.pin->click_through(),
+            visible && PtInRect(&bounds, cursor),
+        });
+    }
+
+    const PinTogglePlan plan = plan_pin_toggle(states);
+    if (plan.action == PinToggleAction::toggle_target &&
+        plan.target_index < ordered.size()) {
+        PinWindow* target = ordered[plan.target_index].pin;
+        const bool enabling = !target->click_through();
+        if (!target->set_click_through(enabling)) {
+            CommandResponse response;
+            response.code = ExitCode::operation_failed;
+            response.message =
+                enabling && !config_.tray_icon_visible
+                    ? L"托盘图标隐藏时不能开启鼠标穿透；请先在设置中显示托盘图标。"
+                    : L"无法更改光标下贴图的鼠标穿透状态。";
+            return response;
+        }
+        if (enabling) {
+            PostMessageW(window_, WM_PIN_CLICK_THROUGH_ENABLED, 0, 0);
+        }
+        CommandResponse response;
+        response.message = enabling
+                               ? L"已开启光标下贴图的鼠标穿透。"
+                               : L"已关闭光标下贴图的鼠标穿透。";
+        return response;
+    }
+
+    const int restored = restore_pin_interaction();
+    CommandResponse response;
+    response.message = restored > 0
+                           ? std::format(
+                                 L"光标下没有贴图，已恢复 {} 张贴图的鼠标交互。",
+                                 restored)
+                           : L"光标下没有贴图，也没有需要恢复交互的贴图。";
     return response;
 }
 
@@ -1965,6 +2623,31 @@ int HostApp::restore_pin_interaction() {
         }
     }
     return restored;
+}
+
+int HostApp::hide_all_pins() {
+    prune_closed_pin_windows();
+    int hidden_count = 0;
+    for (const auto& pin : pin_windows_) {
+        if (pin && !pin->hidden()) {
+            pin->request_hide();
+            ++hidden_count;
+        }
+    }
+
+    return hidden_count;
+}
+
+int HostApp::show_all_pins() {
+    prune_closed_pin_windows();
+    int shown_count = 0;
+    for (const auto& pin : pin_windows_) {
+        if (pin && pin->hidden()) {
+            pin->request_show();
+            ++shown_count;
+        }
+    }
+    return shown_count;
 }
 
 CommandResponse HostApp::output_bitmap(Bitmap bitmap,
@@ -2063,6 +2746,10 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
         handle_update_completion();
         return 0;
     }
+    if (message == kUpdateActivationCompleted) {
+        handle_update_activation_completion();
+        return 0;
+    }
     if (message == kIpcListenerFaulted) {
         request_shutdown();
         return 0;
@@ -2110,6 +2797,23 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
     if (message == WM_COMMAND) {
         switch (LOWORD(w_param)) {
             case kMenuCapture: capture_region(RegionAction::interactive); break;
+            case kMenuRepeatCapture: {
+                if (mode_ != UiMode::idle) {
+                    notify(kAppName, L"请先结束当前前台操作，再重复上次区域。");
+                    break;
+                }
+                const CommandResponse response = repeat_last_region(
+                    CaptureOutput::clipboard);
+                if (response.code != ExitCode::success ||
+                    config_.notifications_enabled) {
+                    notify(
+                        response.code == ExitCode::success
+                            ? kAppName
+                            : L"无法重复上次区域",
+                        response.message);
+                }
+                break;
+            }
             case kMenuPinClipboard: {
                 if (mode_ != UiMode::idle) {
                     notify(kAppName, L"请先结束当前前台操作，再贴出剪贴板内容。");
@@ -2125,6 +2829,29 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
                 }
                 break;
             }
+            case kMenuPinFile: {
+                if (mode_ != UiMode::idle) {
+                    notify(kAppName, L"请先结束当前前台操作，再从文件创建贴图。");
+                    break;
+                }
+                mode_ = UiMode::pin_file_dialog;
+                const auto path = prompt_pin_image_path(window_);
+                CommandResponse response;
+                if (path && mode_ != UiMode::shutting_down) {
+                    response = pin_file(*path);
+                }
+                if (mode_ != UiMode::shutting_down) {
+                    mode_ = UiMode::idle;
+                }
+                if (path && response.code != ExitCode::success) {
+                    notify(
+                        L"无法从文件创建贴图",
+                        response.message.empty()
+                            ? L"图片文件无法读取。"
+                            : response.message);
+                }
+                break;
+            }
             case kMenuSettings: (void)show_settings(); break;
             case kMenuUpdate:
                 if (update_ready_) {
@@ -2134,7 +2861,15 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
                 }
                 break;
             case kMenuAutomaticUpdates:
-                toggle_automatic_updates();
+                // Do not let the tray mutate the same preference while the
+                // settings window owns an isolated draft. Saving that draft
+                // must never silently overwrite a concurrent tray change.
+                if (mode_ == UiMode::idle) {
+                    toggle_automatic_updates();
+                } else if (mode_ == UiMode::settings && settings_window_ &&
+                           IsWindow(settings_window_)) {
+                    SetForegroundWindow(settings_window_);
+                }
                 break;
             case kMenuAbout: (void)show_about(); break;
             case kMenuCloseAllPins:
@@ -2142,6 +2877,12 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
                     pin->request_close();
                 }
                 prune_closed_pin_windows();
+                break;
+            case kMenuHideAllPins:
+                (void)hide_all_pins();
+                break;
+            case kMenuShowAllPins:
+                (void)show_all_pins();
                 break;
             case kMenuRestorePins: {
                 const int restored = restore_pin_interaction();
@@ -2168,6 +2909,14 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
     if (message == WM_TIMER && w_param == kUpdateTimer) {
         KillTimer(window_, kUpdateTimer);
         check_for_updates(false);
+        return 0;
+    }
+    if (message == WM_TIMER && w_param == kTrayRetryTimer) {
+        KillTimer(window_, kTrayRetryTimer);
+        if (!tray_added_ && config_.shell_enabled &&
+            config_.tray_icon_visible && mode_ != UiMode::shutting_down) {
+            add_tray();
+        }
         return 0;
     }
     if (message == WM_QUERYENDSESSION) {

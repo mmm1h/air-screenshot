@@ -1,10 +1,12 @@
 #include "pin_window.h"
+#include "airshot/clipboard.h"
 #include "airshot/output.h"
 #include "airshot/pin_layout.h"
 #include <windowsx.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <cstring>
+#include <format>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -103,6 +105,324 @@ private:
     HMENU value_{};
 };
 
+class DropFilesScope {
+public:
+    explicit DropFilesScope(HDROP value) noexcept : value_(value) {}
+    ~DropFilesScope() {
+        if (value_) {
+            DragFinish(value_);
+        }
+    }
+    DropFilesScope(const DropFilesScope&) = delete;
+    DropFilesScope& operator=(const DropFilesScope&) = delete;
+
+private:
+    HDROP value_{};
+};
+
+constexpr wchar_t kScalePromptClass[] =
+    L"AirScreenshot.PinScalePrompt";
+
+struct ScalePromptState {
+    HWND window{};
+    HWND edit{};
+    int initial_percent{100};
+    std::optional<int> result;
+    bool done{};
+};
+
+[[nodiscard]] int scale_for_dpi(int value, UINT dpi) noexcept {
+    return MulDiv(value, static_cast<int>(dpi), 96);
+}
+
+LRESULT CALLBACK scale_prompt_proc(
+    HWND window,
+    UINT message,
+    WPARAM wparam,
+    LPARAM lparam) {
+    auto* state = reinterpret_cast<ScalePromptState*>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+        state = static_cast<ScalePromptState*>(create->lpCreateParams);
+        state->window = window;
+        SetWindowLongPtrW(
+            window,
+            GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(state));
+    }
+    if (!state) {
+        return DefWindowProcW(window, message, wparam, lparam);
+    }
+
+    switch (message) {
+        case WM_CREATE: {
+            const UINT dpi = std::max<UINT>(96, GetDpiForWindow(window));
+            const HFONT font = static_cast<HFONT>(
+                GetStockObject(DEFAULT_GUI_FONT));
+            const auto create_child = [&](const wchar_t* class_name,
+                                          const wchar_t* text,
+                                          DWORD style,
+                                          int x,
+                                          int y,
+                                          int width,
+                                          int height,
+                                          int id) {
+                HWND child = CreateWindowExW(
+                    0,
+                    class_name,
+                    text,
+                    WS_CHILD | WS_VISIBLE | style,
+                    scale_for_dpi(x, dpi),
+                    scale_for_dpi(y, dpi),
+                    scale_for_dpi(width, dpi),
+                    scale_for_dpi(height, dpi),
+                    window,
+                    reinterpret_cast<HMENU>(
+                        static_cast<INT_PTR>(id)),
+                    nullptr,
+                    nullptr);
+                if (child && font) {
+                    SendMessageW(
+                        child,
+                        WM_SETFONT,
+                        reinterpret_cast<WPARAM>(font),
+                        TRUE);
+                }
+                return child;
+            };
+            (void)create_child(
+                L"STATIC",
+                L"输入缩放百分比（10–1000）：",
+                0,
+                16,
+                14,
+                236,
+                20,
+                0);
+            state->edit = create_child(
+                L"EDIT",
+                L"",
+                WS_TABSTOP | WS_BORDER | ES_NUMBER | ES_AUTOHSCROLL,
+                16,
+                39,
+                176,
+                26,
+                100);
+            (void)create_child(
+                L"STATIC",
+                L"%",
+                0,
+                199,
+                43,
+                28,
+                20,
+                0);
+            (void)create_child(
+                L"BUTTON",
+                L"确定",
+                WS_TABSTOP | BS_DEFPUSHBUTTON,
+                78,
+                77,
+                82,
+                28,
+                IDOK);
+            (void)create_child(
+                L"BUTTON",
+                L"取消",
+                WS_TABSTOP,
+                168,
+                77,
+                82,
+                28,
+                IDCANCEL);
+            if (!state->edit) {
+                DestroyWindow(window);
+                return -1;
+            }
+            const std::wstring initial =
+                std::to_wstring(state->initial_percent);
+            SetWindowTextW(state->edit, initial.c_str());
+            SendMessageW(state->edit, EM_SETLIMITTEXT, 4, 0);
+            SendMessageW(state->edit, EM_SETSEL, 0, -1);
+            SetFocus(state->edit);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wparam) == IDOK) {
+                std::array<wchar_t, 16> text{};
+                GetWindowTextW(
+                    state->edit,
+                    text.data(),
+                    static_cast<int>(text.size()));
+                const auto parsed = parse_pin_scale_percent(text.data());
+                if (!parsed) {
+                    MessageBoxW(
+                        window,
+                        L"请输入 10 到 1000 之间的整数百分比。",
+                        L"缩放百分比",
+                        MB_OK | MB_ICONWARNING);
+                    SetFocus(state->edit);
+                    SendMessageW(state->edit, EM_SETSEL, 0, -1);
+                    return 0;
+                }
+                state->result = *parsed;
+                DestroyWindow(window);
+                return 0;
+            }
+            if (LOWORD(wparam) == IDCANCEL) {
+                DestroyWindow(window);
+                return 0;
+            }
+            break;
+        case WM_CLOSE:
+            DestroyWindow(window);
+            return 0;
+        case WM_DPICHANGED: {
+            const auto* suggested = reinterpret_cast<const RECT*>(lparam);
+            if (suggested) {
+                SetWindowPos(
+                    window,
+                    nullptr,
+                    suggested->left,
+                    suggested->top,
+                    suggested->right - suggested->left,
+                    suggested->bottom - suggested->top,
+                    SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            return 0;
+        }
+        case WM_DESTROY:
+            state->done = true;
+            state->window = nullptr;
+            return 0;
+        case WM_NCDESTROY:
+            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            break;
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+
+[[nodiscard]] std::optional<int> prompt_pin_scale_percent(
+    HWND owner,
+    int initial_percent) {
+    if (!owner || !IsWindow(owner)) {
+        return std::nullopt;
+    }
+    const HINSTANCE instance = reinterpret_cast<HINSTANCE>(
+        GetWindowLongPtrW(owner, GWLP_HINSTANCE));
+    static std::once_flag class_flag;
+    std::call_once(class_flag, [instance] {
+        WNDCLASSEXW window_class{sizeof(window_class)};
+        window_class.lpfnWndProc = scale_prompt_proc;
+        window_class.hInstance = instance;
+        window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        window_class.hbrBackground = reinterpret_cast<HBRUSH>(
+            COLOR_WINDOW + 1);
+        window_class.lpszClassName = kScalePromptClass;
+        RegisterClassExW(&window_class);
+    });
+
+    const UINT dpi = std::max<UINT>(96, GetDpiForWindow(owner));
+    RECT client{
+        0,
+        0,
+        scale_for_dpi(268, dpi),
+        scale_for_dpi(120, dpi),
+    };
+    AdjustWindowRectExForDpi(
+        &client,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        FALSE,
+        WS_EX_DLGMODALFRAME | WS_EX_TOOLWINDOW,
+        dpi);
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    RECT owner_bounds{};
+    GetWindowRect(owner, &owner_bounds);
+    int left = owner_bounds.left +
+               (owner_bounds.right - owner_bounds.left - width) / 2;
+    int top = owner_bounds.top +
+              (owner_bounds.bottom - owner_bounds.top - height) / 2;
+    const HMONITOR monitor = MonitorFromWindow(
+        owner,
+        MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitor_info{sizeof(monitor_info)};
+    if (monitor && GetMonitorInfoW(monitor, &monitor_info)) {
+        left = std::clamp(
+            left,
+            static_cast<int>(monitor_info.rcWork.left),
+            std::max(
+                static_cast<int>(monitor_info.rcWork.left),
+                static_cast<int>(monitor_info.rcWork.right) - width));
+        top = std::clamp(
+            top,
+            static_cast<int>(monitor_info.rcWork.top),
+            std::max(
+                static_cast<int>(monitor_info.rcWork.top),
+                static_cast<int>(monitor_info.rcWork.bottom) - height));
+    }
+
+    ScalePromptState state;
+    state.initial_percent = clamp_pin_scale_percent(initial_percent);
+    HWND window = CreateWindowExW(
+        WS_EX_DLGMODALFRAME | WS_EX_TOOLWINDOW,
+        kScalePromptClass,
+        L"缩放百分比",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        left,
+        top,
+        width,
+        height,
+        owner,
+        nullptr,
+        instance,
+        &state);
+    if (!window) {
+        return std::nullopt;
+    }
+    (void)SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE);
+    EnableWindow(owner, FALSE);
+    ShowWindow(window, SW_SHOW);
+    UpdateWindow(window);
+
+    MSG message{};
+    bool repost_quit = false;
+    WPARAM quit_code = 0;
+    while (!state.done) {
+        const BOOL status = GetMessageW(&message, nullptr, 0, 0);
+        if (status <= 0) {
+            if (status == 0) {
+                repost_quit = true;
+                quit_code = message.wParam;
+            }
+            break;
+        }
+        if (message.message == WM_KEYDOWN &&
+            (message.wParam == VK_RETURN || message.wParam == VK_ESCAPE)) {
+            SendMessageW(
+                window,
+                WM_COMMAND,
+                message.wParam == VK_RETURN ? IDOK : IDCANCEL,
+                0);
+            continue;
+        }
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    if (state.window && IsWindow(state.window)) {
+        DestroyWindow(state.window);
+    }
+    if (IsWindow(owner)) {
+        EnableWindow(owner, TRUE);
+        SetForegroundWindow(owner);
+    }
+    if (repost_quit) {
+        PostQuitMessage(static_cast<int>(quit_code));
+    }
+    return state.result;
+}
+
 }  // namespace
 
 void PinWindow::register_class(HINSTANCE instance) {
@@ -125,7 +445,8 @@ std::unique_ptr<PinWindow> PinWindow::create(
     Bitmap bitmap,
     int x,
     int y,
-    bool click_through_available) {
+    bool click_through_available,
+    ReplacementGuard replacement_guard) {
     if (!bitmap.valid()) {
         return nullptr;
     }
@@ -143,6 +464,7 @@ std::unique_ptr<PinWindow> PinWindow::create(
     }
     pin->owner_ = parent;
     pin->click_through_available_ = click_through_available;
+    pin->replacement_guard_ = std::move(replacement_guard);
     if (!pin->rebuild_native_bitmap()) {
         return nullptr;
     }
@@ -183,6 +505,7 @@ std::unique_ptr<PinWindow> PinWindow::create(
     // Keep Air Screenshot's own reference windows out of subsequent captures.
     // Older Windows releases safely degrade this affinity to WDA_MONITOR.
     (void)SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+    DragAcceptFiles(hwnd, TRUE);
     pin->notify_owner_ = true;
     pin->ensure_visible();
 
@@ -217,12 +540,19 @@ bool PinWindow::rebuild_native_bitmap() {
         }
         return false;
     }
-    std::memcpy(bits, bitmap_.pixels.data(), bitmap_.pixels.size());
+    if (!write_pin_visual_pixels(
+            bitmap_,
+            visual_effects_,
+            std::span<std::uint8_t>(
+                static_cast<std::uint8_t*>(bits),
+                bitmap_.pixels.size()))) {
+        DeleteObject(replacement);
+        return false;
+    }
     if (hbitmap_) {
         DeleteObject(hbitmap_);
     }
     hbitmap_ = replacement;
-    bitmap_bits_ = bits;
     return true;
 }
 
@@ -251,13 +581,20 @@ bool PinWindow::replace_bitmap(Bitmap bitmap) {
         }
         return false;
     }
-    std::memcpy(bits, bitmap.pixels.data(), bitmap.pixels.size());
+    if (!write_pin_visual_pixels(
+            bitmap,
+            visual_effects_,
+            std::span<std::uint8_t>(
+                static_cast<std::uint8_t*>(bits),
+                bitmap.pixels.size()))) {
+        DeleteObject(replacement);
+        return false;
+    }
     if (hbitmap_) {
         DeleteObject(hbitmap_);
     }
     bitmap_ = std::move(bitmap);
     hbitmap_ = replacement;
-    bitmap_bits_ = bits;
     return true;
 }
 
@@ -285,7 +622,6 @@ PinWindow::~PinWindow() {
     if (hbitmap_) {
         DeleteObject(hbitmap_);
         hbitmap_ = nullptr;
-        bitmap_bits_ = nullptr;
     }
 }
 
@@ -297,7 +633,50 @@ void PinWindow::request_close() noexcept {
         close_pending_ = true;
         return;
     }
+    lifecycle_ = transition_pin_lifecycle(
+        lifecycle_,
+        PinLifecycleAction::destroy);
     DestroyWindow(hwnd_);
+}
+
+void PinWindow::request_hide() noexcept {
+    if (!hwnd_ || !IsWindow(hwnd_) ||
+        lifecycle_ == PinLifecycleState::destroyed) {
+        return;
+    }
+    lifecycle_ = transition_pin_lifecycle(
+        lifecycle_,
+        PinLifecycleAction::hide);
+    visible_before_capture_ = false;
+    ShowWindow(hwnd_, SW_HIDE);
+}
+
+void PinWindow::request_show() noexcept {
+    if (!hwnd_ || !IsWindow(hwnd_) ||
+        lifecycle_ == PinLifecycleState::destroyed) {
+        return;
+    }
+    lifecycle_ = transition_pin_lifecycle(
+        lifecycle_,
+        PinLifecycleAction::show);
+    if (capture_suspend_depth_ != 0) {
+        visible_before_capture_ = true;
+        return;
+    }
+    ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+    SetWindowPos(
+        hwnd_,
+        topmost_ ? HWND_TOPMOST : HWND_NOTOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    ensure_visible();
+}
+
+bool PinWindow::hidden() const noexcept {
+    return lifecycle_ == PinLifecycleState::hidden;
 }
 
 bool PinWindow::click_through() const noexcept {
@@ -412,9 +791,12 @@ void PinWindow::resume_after_capture() noexcept {
         return;
     }
     --capture_suspend_depth_;
-    if (capture_suspend_depth_ == 0 && visible_before_capture_) {
+    if (capture_suspend_depth_ == 0) {
+        const bool restore = should_restore_pin_after_capture(
+            lifecycle_,
+            visible_before_capture_);
         visible_before_capture_ = false;
-        if (hwnd_ && IsWindow(hwnd_)) {
+        if (restore && hwnd_ && IsWindow(hwnd_)) {
             ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
             SetWindowPos(
                 hwnd_,
@@ -425,6 +807,78 @@ void PinWindow::resume_after_capture() noexcept {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
+    }
+}
+
+bool PinWindow::set_alpha(int alpha) noexcept {
+    if (!hwnd_ || !IsWindow(hwnd_)) {
+        return false;
+    }
+    const int candidate = std::clamp(alpha, 30, 255);
+    if (!SetLayeredWindowAttributes(
+            hwnd_, 0, static_cast<BYTE>(candidate), LWA_ALPHA)) {
+        return false;
+    }
+    alpha_ = candidate;
+    return true;
+}
+
+void PinWindow::zoom_by_steps(double steps) {
+    RECT rect{};
+    if (!GetWindowRect(hwnd_, &rect)) {
+        return;
+    }
+    const POINT center{
+        rect.left + (rect.right - rect.left) / 2,
+        rect.top + (rect.bottom - rect.top) / 2,
+    };
+    (void)resize_to_scale(scale_ * std::pow(1.1, steps), center);
+}
+
+void PinWindow::toggle_smooth_scaling() noexcept {
+    smooth_scaling_ = !smooth_scaling_;
+    if (hwnd_ && IsWindow(hwnd_)) {
+        InvalidateRect(hwnd_, nullptr, TRUE);
+    }
+}
+
+Bitmap PinWindow::visible_bitmap() const {
+    return render_pin_visual_bitmap(bitmap_, visual_effects_);
+}
+
+void PinWindow::toggle_visual_effect(
+    PinVisualEffectAction action) {
+    const PinVisualEffects previous = visual_effects_;
+    visual_effects_ = transition_pin_visual_effects(
+        visual_effects_,
+        action);
+    if (!rebuild_native_bitmap()) {
+        visual_effects_ = previous;
+        show_message(
+            L"无法切换贴图显示效果：内存或 GDI 资源不足。",
+            MB_OK | MB_ICONERROR);
+        return;
+    }
+    InvalidateRect(hwnd_, nullptr, TRUE);
+}
+
+void PinWindow::set_scale_percent(int percent) {
+    RECT rect{};
+    if (!GetWindowRect(hwnd_, &rect)) {
+        return;
+    }
+    const POINT center{
+        rect.left + (rect.right - rect.left) / 2,
+        rect.top + (rect.bottom - rect.top) / 2,
+    };
+    (void)resize_to_scale(
+        pin_scale_factor_from_percent(percent),
+        center);
+}
+
+void PinWindow::notify_click_through_enabled() const noexcept {
+    if (owner_ && IsWindow(owner_)) {
+        PostMessageW(owner_, WM_PIN_CLICK_THROUGH_ENABLED, 0, 0);
     }
 }
 
@@ -631,18 +1085,15 @@ LRESULT PinWindow::handle_message(UINT msg, WPARAM wparam, LPARAM lparam) {
             return HTCAPTION; // Allow dragging the window
 
         case WM_NCLBUTTONDBLCLK:
-            // Double click client area (translated to caption due to NCHITTEST) closes the window
-            request_close();
+            // A hidden pin remains recoverable from the tray. Destruction is
+            // deliberately reserved for Esc or the explicit menu command.
+            request_hide();
             return 0;
 
         case WM_MOUSEWHEEL: {
             short delta = GET_WHEEL_DELTA_WPARAM(wparam);
             if (GetKeyState(VK_CONTROL) & 0x8000) {
-                const int candidate = std::clamp(alpha_ + (delta > 0 ? 15 : -15), 30, 255);
-                if (SetLayeredWindowAttributes(
-                        hwnd_, 0, static_cast<BYTE>(candidate), LWA_ALPHA)) {
-                    alpha_ = candidate;
-                }
+                (void)set_alpha(alpha_ + (delta > 0 ? 15 : -15));
                 return 0;
             }
             POINT cursor_screen{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
@@ -655,9 +1106,19 @@ LRESULT PinWindow::handle_message(UINT msg, WPARAM wparam, LPARAM lparam) {
         }
 
         case WM_KEYDOWN: {
+            const bool control =
+                (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             if (wparam == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) {
                 std::wstring error;
-                if (!copy_bitmap_to_clipboard(bitmap_, &error)) {
+                Bitmap visible = visible_bitmap();
+                if (visible.empty()) {
+                    error = L"无法生成当前可见贴图效果。";
+                } else if (!copy_bitmap_to_clipboard(visible, &error)) {
+                    if (error.empty()) {
+                        error = L"无法复制当前可见贴图效果。";
+                    }
+                }
+                if (!error.empty()) {
                     show_message(error, MB_OK | MB_ICONERROR);
                 }
                 return 0;
@@ -679,22 +1140,47 @@ LRESULT PinWindow::handle_message(UINT msg, WPARAM wparam, LPARAM lparam) {
             } else if (wparam == 'T') {
                 (void)set_topmost(!topmost());
                 return 0;
+            } else if (wparam == 'S' && !control) {
+                toggle_smooth_scaling();
+                return 0;
+            } else if (wparam == 'G' && !control) {
+                toggle_visual_effect(
+                    PinVisualEffectAction::toggle_grayscale);
+                return 0;
+            } else if (wparam == 'I' && !control) {
+                toggle_visual_effect(
+                    PinVisualEffectAction::toggle_inverted);
+                return 0;
+            } else if (wparam == '0' && control) {
+                (void)set_alpha(255);
+                return 0;
             } else if (wparam == '0') {
                 fit_to_work_area();
                 return 0;
             } else if (wparam == '1') {
-                RECT rect{};
-                if (GetWindowRect(hwnd_, &rect)) {
-                    const POINT center{
-                        rect.left + (rect.right - rect.left) / 2,
-                        rect.top + (rect.bottom - rect.top) / 2,
-                    };
-                    (void)resize_to_scale(1.0, center);
+                set_scale_percent(100);
+                return 0;
+            } else if (wparam == VK_ADD || wparam == VK_OEM_PLUS) {
+                if (control) {
+                    (void)set_alpha(alpha_ + 15);
+                } else {
+                    zoom_by_steps(1.0);
+                }
+                return 0;
+            } else if (wparam == VK_SUBTRACT || wparam == VK_OEM_MINUS) {
+                if (control) {
+                    (void)set_alpha(alpha_ - 15);
+                } else {
+                    zoom_by_steps(-1.0);
                 }
                 return 0;
             }
             break;
         }
+
+        case WM_DROPFILES:
+            replace_from_drop(reinterpret_cast<HDROP>(wparam));
+            return 0;
 
         case WM_CONTEXTMENU: {
             POINT pt;
@@ -713,6 +1199,23 @@ LRESULT PinWindow::handle_message(UINT msg, WPARAM wparam, LPARAM lparam) {
         case WM_DISPLAYCHANGE:
             ensure_visible();
             return 0;
+
+        case WM_DPICHANGED: {
+            const auto* suggested =
+                reinterpret_cast<const RECT*>(lparam);
+            if (suggested) {
+                SetWindowPos(
+                    hwnd_,
+                    nullptr,
+                    suggested->left,
+                    suggested->top,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            ensure_visible();
+            return 0;
+        }
 
         case WM_SETTINGCHANGE:
             if (wparam == SPI_SETWORKAREA) {
@@ -756,9 +1259,12 @@ void PinWindow::paint() {
         MemoryDc mem_dc(hdc);
         SelectedObject selected_bitmap(mem_dc.get(), hbitmap_);
         if (mem_dc.get() && selected_bitmap.valid()) {
-            // Set high-quality stretching mode
-            SetStretchBltMode(hdc, HALFTONE);
-            SetBrushOrgEx(hdc, 0, 0, nullptr);
+            SetStretchBltMode(
+                hdc,
+                smooth_scaling_ ? HALFTONE : COLORONCOLOR);
+            if (smooth_scaling_) {
+                SetBrushOrgEx(hdc, 0, 0, nullptr);
+            }
 
             StretchBlt(hdc,
                        0,
@@ -792,8 +1298,12 @@ void PinWindow::show_context_menu(POINT screen_pos) {
         (void)leave_modal();
         return;
     }
-    AppendMenuW(menu.get(), MF_STRING, 1, L"复制 (Copy)\tCtrl+C");
-    AppendMenuW(menu.get(), MF_STRING, 2, L"保存 (Save...)");
+    AppendMenuW(
+        menu.get(),
+        MF_STRING,
+        1,
+        L"复制当前可见效果\tCtrl+C");
+    AppendMenuW(menu.get(), MF_STRING, 2, L"保存当前可见效果…");
     AppendMenuW(
         menu.get(),
         MF_STRING |
@@ -810,15 +1320,68 @@ void PinWindow::show_context_menu(POINT screen_pos) {
             ? L"鼠标穿透 (Click-through)"
             : L"鼠标穿透（需显示托盘图标）");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu.get(), MF_STRING, 10, L"原始尺寸 100%\t1");
+    const std::wstring scale_status = std::format(
+        L"当前缩放：{}%",
+        static_cast<int>(std::llround(scale_ * 100.0)));
+    const std::wstring alpha_status = std::format(
+        L"当前透明度：{}%",
+        static_cast<int>(std::llround(alpha_ * 100.0 / 255.0)));
+    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 20, scale_status.c_str());
+    AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 21, alpha_status.c_str());
+    AppendMenuW(menu.get(), MF_STRING, 15, L"放大\t+");
+    AppendMenuW(menu.get(), MF_STRING, 16, L"缩小\t-");
+    const int rounded_scale = static_cast<int>(
+        std::llround(scale_ * 100.0));
+    AppendMenuW(
+        menu.get(),
+        MF_STRING | (rounded_scale == 25 ? MF_CHECKED : MF_UNCHECKED),
+        22,
+        L"缩放 25%");
+    AppendMenuW(
+        menu.get(),
+        MF_STRING | (rounded_scale == 50 ? MF_CHECKED : MF_UNCHECKED),
+        23,
+        L"缩放 50%");
+    AppendMenuW(
+        menu.get(),
+        MF_STRING | (rounded_scale == 100 ? MF_CHECKED : MF_UNCHECKED),
+        10,
+        L"缩放 100%\t1");
+    AppendMenuW(
+        menu.get(),
+        MF_STRING | (rounded_scale == 200 ? MF_CHECKED : MF_UNCHECKED),
+        24,
+        L"缩放 200%");
+    AppendMenuW(menu.get(), MF_STRING, 25, L"输入缩放百分比…");
     AppendMenuW(menu.get(), MF_STRING, 11, L"适应屏幕\t0");
+    AppendMenuW(menu.get(), MF_STRING, 14, L"透明度重置 100%\tCtrl+0");
+    AppendMenuW(
+        menu.get(),
+        MF_STRING | (smooth_scaling_ ? MF_CHECKED : MF_UNCHECKED),
+        13,
+        smooth_scaling_
+            ? L"平滑缩放：开\tS"
+            : L"平滑缩放：关（像素）\tS");
+    AppendMenuW(
+        menu.get(),
+        MF_STRING |
+            (visual_effects_.grayscale ? MF_CHECKED : MF_UNCHECKED),
+        17,
+        L"灰度显示\tG");
+    AppendMenuW(
+        menu.get(),
+        MF_STRING |
+            (visual_effects_.inverted ? MF_CHECKED : MF_UNCHECKED),
+        18,
+        L"反色显示\tI");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, 5, L"顺时针旋转 90° (Rotate 90° CW)\tR");
     AppendMenuW(menu.get(), MF_STRING, 6, L"逆时针旋转 90° (Rotate 90° CCW)\tL");
     AppendMenuW(menu.get(), MF_STRING, 7, L"水平翻转 (Flip Horizontal)\tH");
     AppendMenuW(menu.get(), MF_STRING, 8, L"垂直翻转 (Flip Vertical)\tV");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu.get(), MF_STRING, 3, L"关闭 (Close)\tEsc / 双击");
+    AppendMenuW(menu.get(), MF_STRING, 12, L"隐藏（可从托盘恢复）\t双击");
+    AppendMenuW(menu.get(), MF_STRING, 3, L"销毁\tEsc");
 
     int selection = TrackPopupMenu(menu.get(),
                                    TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
@@ -835,19 +1398,35 @@ void PinWindow::show_context_menu(POINT screen_pos) {
 
     if (selection == 1) {
         std::wstring error;
-        if (!copy_bitmap_to_clipboard(bitmap_, &error)) {
+        Bitmap visible = visible_bitmap();
+        if (visible.empty()) {
+            error = L"无法生成当前可见贴图效果。";
+        } else if (!copy_bitmap_to_clipboard(visible, &error) &&
+                   error.empty()) {
+            error = L"无法复制当前可见贴图效果。";
+        }
+        if (!error.empty()) {
             show_message(error, MB_OK | MB_ICONERROR);
         }
     } else if (selection == 2) {
         std::optional<std::filesystem::path> path = prompt_png_path(hwnd_);
         if (!close_pending_ && path) {
             std::wstring error;
-            if (!save_png(bitmap_, *path, &error)) {
+            Bitmap visible = visible_bitmap();
+            if (visible.empty()) {
+                error = L"无法生成当前可见贴图效果。";
+            } else if (!save_png(visible, *path, &error) &&
+                       error.empty()) {
+                error = L"无法保存当前可见贴图效果。";
+            }
+            if (!error.empty()) {
                 show_message(error, MB_OK | MB_ICONERROR);
             }
         }
     } else if (selection == 3) {
         request_close();
+    } else if (selection == 12) {
+        request_hide();
     } else if (selection == 4) {
         const bool enabling = !click_through();
         if (!set_click_through(enabling)) {
@@ -855,13 +1434,7 @@ void PinWindow::show_context_menu(POINT screen_pos) {
                 L"无法更改贴图的鼠标穿透状态。",
                 MB_OK | MB_ICONERROR);
         } else if (enabling) {
-            if (owner_ && IsWindow(owner_)) {
-                PostMessageW(
-                    owner_,
-                    WM_PIN_CLICK_THROUGH_ENABLED,
-                    0,
-                    0);
-            }
+            notify_click_through_enabled();
         }
     } else if (selection == 9) {
         if (!set_topmost(!topmost())) {
@@ -870,16 +1443,37 @@ void PinWindow::show_context_menu(POINT screen_pos) {
                 MB_OK | MB_ICONERROR);
         }
     } else if (selection == 10) {
-        RECT rect{};
-        if (GetWindowRect(hwnd_, &rect)) {
-            const POINT center{
-                rect.left + (rect.right - rect.left) / 2,
-                rect.top + (rect.bottom - rect.top) / 2,
-            };
-            (void)resize_to_scale(1.0, center);
-        }
+        set_scale_percent(100);
     } else if (selection == 11) {
         fit_to_work_area();
+    } else if (selection == 13) {
+        toggle_smooth_scaling();
+    } else if (selection == 14) {
+        (void)set_alpha(255);
+    } else if (selection == 15) {
+        zoom_by_steps(1.0);
+    } else if (selection == 16) {
+        zoom_by_steps(-1.0);
+    } else if (selection == 17) {
+        toggle_visual_effect(
+            PinVisualEffectAction::toggle_grayscale);
+    } else if (selection == 18) {
+        toggle_visual_effect(
+            PinVisualEffectAction::toggle_inverted);
+    } else if (selection == 22) {
+        set_scale_percent(25);
+    } else if (selection == 23) {
+        set_scale_percent(50);
+    } else if (selection == 24) {
+        set_scale_percent(200);
+    } else if (selection == 25) {
+        const PinScalePromptPlan prompt_plan = plan_pin_scale_prompt(
+            prompt_pin_scale_percent(
+                hwnd_,
+                pin_scale_percent_from_factor(scale_)));
+        if (prompt_plan.apply) {
+            set_scale_percent(prompt_plan.percent);
+        }
     } else if (selection == 5) {
         rotate(true);
     } else if (selection == 6) {
@@ -890,6 +1484,56 @@ void PinWindow::show_context_menu(POINT screen_pos) {
         flip(false);
     }
     (void)leave_modal();
+}
+
+void PinWindow::replace_from_drop(HDROP drop) {
+    DropFilesScope drop_scope(drop);
+    if (!drop) {
+        return;
+    }
+    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    const UINT length =
+        count > 0 ? DragQueryFileW(drop, 0, nullptr, 0) : 0;
+    std::filesystem::path path;
+    if (length > 0 && length < 32768) {
+        std::wstring value(static_cast<std::size_t>(length) + 1, L'\0');
+        if (DragQueryFileW(
+                drop,
+                0,
+                value.data(),
+                static_cast<UINT>(value.size())) == length) {
+            value.resize(length);
+            path = std::move(value);
+        }
+    }
+    if (path.empty()) {
+        show_message(L"拖入内容不包含可读取的本地图片文件。", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    std::wstring error;
+    auto replacement = decode_local_image_file(path, &error);
+    if (!replacement) {
+        show_message(
+            error.empty() ? L"无法读取拖入的图片文件。" : error,
+            MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (replacement_guard_) {
+        if (auto budget_error = replacement_guard_(
+                bitmap_.pixels.size(), *replacement)) {
+            show_message(*budget_error, MB_OK | MB_ICONERROR);
+            return;
+        }
+    }
+    if (!replace_bitmap(std::move(*replacement))) {
+        show_message(
+            L"无法替换贴图：内存或 GDI 资源不足，原贴图已保留。",
+            MB_OK | MB_ICONERROR);
+        return;
+    }
+    fit_to_work_area();
+    InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
 void PinWindow::rotate(bool cw) {
@@ -917,29 +1561,17 @@ void PinWindow::rotate(bool cw) {
 }
 
 void PinWindow::flip(bool horizontal) {
-    if (bitmap_.empty() || !bitmap_bits_) return;
+    if (bitmap_.empty()) return;
 
-    if (horizontal) {
-        for (int y = 0; y < bitmap_.height; ++y) {
-            auto row = bitmap_.row(y);
-            for (int left = 0, right = bitmap_.width - 1; left < right; ++left, --right) {
-                auto* left_pixel =
-                    row.data() + static_cast<std::size_t>(left) * Bitmap::bytes_per_pixel;
-                auto* right_pixel =
-                    row.data() + static_cast<std::size_t>(right) * Bitmap::bytes_per_pixel;
-                for (std::size_t channel = 0; channel < Bitmap::bytes_per_pixel; ++channel) {
-                    std::swap(left_pixel[channel], right_pixel[channel]);
-                }
-            }
-        }
-    } else {
-        for (int top = 0, bottom = bitmap_.height - 1; top < bottom; ++top, --bottom) {
-            auto top_row = bitmap_.row(top);
-            auto bottom_row = bitmap_.row(bottom);
-            std::swap_ranges(top_row.begin(), top_row.end(), bottom_row.begin());
-        }
+    Bitmap transformed = horizontal
+                             ? flip_horizontal(bitmap_)
+                             : flip_vertical(bitmap_);
+    if (transformed.empty() || !replace_bitmap(std::move(transformed))) {
+        show_message(
+            L"无法翻转贴图：内存或 GDI 资源不足。",
+            MB_OK | MB_ICONERROR);
+        return;
     }
-    std::memcpy(bitmap_bits_, bitmap_.pixels.data(), bitmap_.pixels.size());
     InvalidateRect(hwnd_, nullptr, TRUE);
 }
 

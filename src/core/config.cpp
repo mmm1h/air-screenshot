@@ -500,6 +500,88 @@ bool is_integer_node(const JsonNode& node) {
         [](wchar_t character) { return character >= L'0' && character <= L'9'; });
 }
 
+std::optional<int> exact_integer(const JsonNode& node) noexcept {
+    if (!is_integer_node(node)) {
+        return std::nullopt;
+    }
+    const bool negative = node.number_lexeme.front() == L'-';
+    std::size_t index = negative ? 1U : 0U;
+    const std::int64_t limit =
+        static_cast<std::int64_t>(std::numeric_limits<int>::max()) +
+        (negative ? 1LL : 0LL);
+    std::int64_t parsed = 0;
+    for (; index < node.number_lexeme.size(); ++index) {
+        const int digit = node.number_lexeme[index] - L'0';
+        if (parsed > (limit - digit) / 10) {
+            return std::nullopt;
+        }
+        parsed = parsed * 10 + digit;
+    }
+    if (negative) {
+        parsed = -parsed;
+    }
+    if (parsed < std::numeric_limits<int>::min() ||
+        parsed > std::numeric_limits<int>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<int>(parsed);
+}
+
+bool parse_last_region_capture(
+    const JsonNode& node,
+    LastRegionCapture& result,
+    std::wstring* error) {
+    if (node.kind != JsonKind::object) {
+        set_config_error(
+            error,
+            L"配置字段 capture.lastRegion 必须是对象或 null。");
+        return false;
+    }
+    const auto* left_node = member(node, L"left");
+    const auto* top_node = member(node, L"top");
+    const auto* width_node = member(node, L"width");
+    const auto* height_node = member(node, L"height");
+    const auto* topology_node = member(node, L"topology");
+    if (!left_node || !top_node || !width_node || !height_node ||
+        !topology_node || topology_node->kind != JsonKind::string) {
+        set_config_error(
+            error,
+            L"配置字段 capture.lastRegion 缺少有效的 left、top、width、height 或 topology。");
+        return false;
+    }
+    const auto left = exact_integer(*left_node);
+    const auto top = exact_integer(*top_node);
+    const auto width = exact_integer(*width_node);
+    const auto height = exact_integer(*height_node);
+    if (!left || !top || !width || !height || *width < 2 ||
+        *height < 2 ||
+        !valid_display_topology_signature(topology_node->string)) {
+        set_config_error(
+            error,
+            L"配置字段 capture.lastRegion 的坐标、尺寸或拓扑签名无效。");
+        return false;
+    }
+    const std::int64_t right =
+        static_cast<std::int64_t>(*left) + *width;
+    const std::int64_t bottom =
+        static_cast<std::int64_t>(*top) + *height;
+    if (right > std::numeric_limits<int>::max() ||
+        bottom > std::numeric_limits<int>::max()) {
+        set_config_error(
+            error,
+            L"配置字段 capture.lastRegion 的坐标范围溢出。");
+        return false;
+    }
+    result.bounds = {
+        *left,
+        *top,
+        static_cast<int>(right),
+        static_cast<int>(bottom),
+    };
+    result.topology_signature = topology_node->string;
+    return true;
+}
+
 bool validate_optional_integer(
     const JsonNode& object,
     std::wstring_view section_name,
@@ -549,6 +631,136 @@ bool is_supported_app_icon(std::wstring_view value) {
            value == kAppIconPixelConsole;
 }
 
+constexpr std::array<std::wstring_view, 12> kAnnotationStyleTools{
+    L"rect",
+    L"ellipse",
+    L"line",
+    L"arrow",
+    L"pen",
+    L"text",
+    L"serial",
+    L"mosaic",
+    L"blur",
+    L"highlight",
+    L"watermark",
+    L"eraser",
+};
+
+[[nodiscard]] bool valid_style_color(std::wstring_view value) noexcept {
+    return value.size() == 7 && value.front() == L'#' &&
+           std::ranges::all_of(value.substr(1), [](wchar_t character) {
+               return (character >= L'0' && character <= L'9') ||
+                      (character >= L'a' && character <= L'f') ||
+                      (character >= L'A' && character <= L'F');
+           });
+}
+
+[[nodiscard]] bool enum_member(
+    std::wstring_view value,
+    std::initializer_list<std::wstring_view> supported) noexcept {
+    return std::ranges::find(supported, value) != supported.end();
+}
+
+bool validate_annotation_tool_styles(
+    const JsonNode& styles,
+    std::wstring* error) {
+    if (styles.kind != JsonKind::object) {
+        set_config_error(error, L"配置字段 annotation.toolStyles 必须是对象。");
+        return false;
+    }
+    for (const auto tool_id : kAnnotationStyleTools) {
+        const JsonNode* style = member(styles, tool_id);
+        if (!style) {
+            continue;
+        }
+        if (style->kind != JsonKind::object) {
+            set_config_error(
+                error,
+                std::format(
+                    L"配置字段 annotation.toolStyles.{} 必须是对象。",
+                    tool_id));
+            return false;
+        }
+        const std::wstring section =
+            std::format(L"annotation.toolStyles.{}", tool_id);
+        if (!validate_optional_kind(
+                *style, section, L"color", JsonKind::string, error) ||
+            !validate_optional_integer(
+                *style, section, L"width", error) ||
+            !validate_optional_integer(
+                *style, section, L"textSize", error) ||
+            !validate_optional_kind(
+                *style, section, L"textStyle", JsonKind::string, error) ||
+            !validate_optional_integer(
+                *style, section, L"highlightAlpha", error) ||
+            !validate_optional_integer(
+                *style, section, L"effectStrength", error) ||
+            !validate_optional_kind(
+                *style, section, L"effectRect", JsonKind::boolean, error) ||
+            !validate_optional_kind(
+                *style, section, L"fillStyle", JsonKind::string, error) ||
+            !validate_optional_kind(
+                *style, section, L"strokePattern", JsonKind::string, error) ||
+            !validate_optional_kind(
+                *style,
+                section,
+                L"arrowHeadStyle",
+                JsonKind::string,
+                error) ||
+            !validate_optional_kind(
+                *style,
+                section,
+                L"roundedRectangle",
+                JsonKind::boolean,
+                error)) {
+            return false;
+        }
+        if (const JsonNode* color = member(*style, L"color");
+            color && !valid_style_color(color->string)) {
+            set_config_error(
+                error,
+                std::format(L"配置字段 {}.color 必须是 #RRGGBB。", section));
+            return false;
+        }
+        if (const JsonNode* value = member(*style, L"textStyle");
+            value &&
+            !enum_member(value->string, {L"normal", L"dark", L"outline"})) {
+            set_config_error(
+                error,
+                std::format(L"配置字段 {}.textStyle 的枚举值无效。", section));
+            return false;
+        }
+        if (const JsonNode* value = member(*style, L"fillStyle");
+            value &&
+            !enum_member(value->string, {L"outline", L"translucent"})) {
+            set_config_error(
+                error,
+                std::format(L"配置字段 {}.fillStyle 的枚举值无效。", section));
+            return false;
+        }
+        if (const JsonNode* value = member(*style, L"strokePattern");
+            value && !enum_member(value->string, {L"solid", L"dashed"})) {
+            set_config_error(
+                error,
+                std::format(
+                    L"配置字段 {}.strokePattern 的枚举值无效。",
+                    section));
+            return false;
+        }
+        if (const JsonNode* value = member(*style, L"arrowHeadStyle");
+            value &&
+            !enum_member(value->string, {L"forward", L"reverse", L"both"})) {
+            set_config_error(
+                error,
+                std::format(
+                    L"配置字段 {}.arrowHeadStyle 的枚举值无效。",
+                    section));
+            return false;
+        }
+    }
+    return true;
+}
+
 bool validate_current_config(const JsonNode& root, std::wstring* error) {
     bool valid = true;
     const auto* annotation = validate_optional_section(root, L"annotation", error, valid);
@@ -579,6 +791,10 @@ bool validate_current_config(const JsonNode& root, std::wstring* error) {
                 set_config_error(error, L"配置字段 annotation.hiddenTools 必须是字符串数组。");
                 return false;
             }
+        }
+        if (const auto* styles = member(*annotation, L"toolStyles");
+            styles && !validate_annotation_tool_styles(*styles, error)) {
+            return false;
         }
     }
 
@@ -692,6 +908,8 @@ bool validate_current_config(const JsonNode& root, std::wstring* error) {
     if (capture) {
         if (!validate_optional_kind(
                 *capture, L"capture", L"defaultOutput", JsonKind::string, error) ||
+            !validate_optional_kind(
+                *capture, L"capture", L"includeCursor", JsonKind::boolean, error) ||
             !validate_optional_kind(*capture, L"capture", L"customColor", JsonKind::string, error) ||
             !validate_optional_kind(*capture, L"capture", L"theme", JsonKind::string, error)) {
             return false;
@@ -706,6 +924,16 @@ bool validate_current_config(const JsonNode& root, std::wstring* error) {
             theme->string != L"dark") {
             set_config_error(error, L"配置字段 capture.theme 不是受支持的枚举值。");
             return false;
+        }
+        if (const auto* last_region = member(*capture, L"lastRegion");
+            last_region && last_region->kind != JsonKind::null_value) {
+            LastRegionCapture parsed;
+            if (!parse_last_region_capture(
+                    *last_region,
+                    parsed,
+                    error)) {
+                return false;
+            }
         }
     }
     return true;
@@ -837,6 +1065,145 @@ std::wstring hidden_tools_from_json_node(const JsonNode& node, std::wstring_view
         joined += item.string;
     }
     return normalize_annotation_hidden_tools(joined);
+}
+
+[[nodiscard]] AnnotationToolStyleConfig default_annotation_tool_style(
+    std::wstring_view tool_id,
+    int legacy_highlight_alpha = 96) {
+    AnnotationToolStyleConfig style;
+    if (tool_id == L"highlight") {
+        style.color = L"#FADB14";
+        style.highlight_alpha =
+            std::clamp(legacy_highlight_alpha, 24, 192);
+    } else if (tool_id == L"watermark") {
+        style.color = L"#FF9696";
+    }
+    return style;
+}
+
+[[nodiscard]] std::wstring canonical_style_enum(
+    std::wstring_view value,
+    std::initializer_list<std::wstring_view> supported,
+    std::wstring_view fallback) {
+    return enum_member(value, supported)
+               ? std::wstring(value)
+               : std::wstring(fallback);
+}
+
+[[nodiscard]] std::wstring annotation_tool_styles_to_json(
+    const AppConfig& config) {
+    std::wstring result{L"{"};
+    bool first = true;
+    for (const std::wstring_view tool_id : kAnnotationStyleTools) {
+        const auto found = config.annotation_tool_styles.find(tool_id);
+        if (found == config.annotation_tool_styles.end()) {
+            continue;
+        }
+        const AnnotationToolStyleConfig& style = found->second;
+        if (!first) {
+            result += L",";
+        }
+        first = false;
+        result += quote_json(tool_id) + L":{\"color\":";
+        result += quote_json(
+            valid_style_color(style.color) ? style.color : L"#F5222D");
+        result += L",\"width\":" +
+                  std::to_wstring(std::clamp(style.width, 1, 50));
+        result += L",\"textSize\":" +
+                  std::to_wstring(std::clamp(style.text_size, 12, 96));
+        result += L",\"textStyle\":" +
+                  quote_json(canonical_style_enum(
+                      style.text_style,
+                      {L"normal", L"dark", L"outline"},
+                      L"normal"));
+        result += L",\"highlightAlpha\":" +
+                  std::to_wstring(
+                      std::clamp(style.highlight_alpha, 24, 192));
+        result += L",\"effectStrength\":" +
+                  std::to_wstring(
+                      std::clamp(style.effect_strength, 0, 100));
+        result += L",\"effectRect\":" +
+                  std::wstring(json_boolean(style.effect_rect));
+        result += L",\"fillStyle\":" +
+                  quote_json(canonical_style_enum(
+                      style.fill_style,
+                      {L"outline", L"translucent"},
+                      L"outline"));
+        result += L",\"strokePattern\":" +
+                  quote_json(canonical_style_enum(
+                      style.stroke_pattern,
+                      {L"solid", L"dashed"},
+                      L"solid"));
+        result += L",\"arrowHeadStyle\":" +
+                  quote_json(canonical_style_enum(
+                      style.arrow_head_style,
+                      {L"forward", L"reverse", L"both"},
+                      L"forward"));
+        result += L",\"roundedRectangle\":" +
+                  std::wstring(json_boolean(style.rounded_rectangle)) + L"}";
+    }
+    result += L"}";
+    return result;
+}
+
+void parse_annotation_tool_styles(
+    const JsonNode& annotation,
+    AppConfig& config) {
+    const JsonNode* styles = member(annotation, L"toolStyles");
+    if (!styles || styles->kind != JsonKind::object) {
+        return;
+    }
+    for (const std::wstring_view tool_id : kAnnotationStyleTools) {
+        const JsonNode* node = member(*styles, tool_id);
+        if (!node || node->kind != JsonKind::object) {
+            continue;
+        }
+        AnnotationToolStyleConfig style = default_annotation_tool_style(
+            tool_id,
+            config.annotation_highlight_alpha);
+        const std::wstring color = named_string(*node, L"color", style.color);
+        style.color = valid_style_color(color) ? color : style.color;
+        style.width = named_clamped_integer(
+            *node, L"width", style.width, 1, 50);
+        style.text_size = named_clamped_integer(
+            *node, L"textSize", style.text_size, 12, 96);
+        style.text_style = canonical_style_enum(
+            named_string(*node, L"textStyle", style.text_style),
+            {L"normal", L"dark", L"outline"},
+            style.text_style);
+        style.highlight_alpha = named_clamped_integer(
+            *node,
+            L"highlightAlpha",
+            style.highlight_alpha,
+            24,
+            192);
+        style.effect_strength = named_clamped_integer(
+            *node,
+            L"effectStrength",
+            style.effect_strength,
+            0,
+            100);
+        style.effect_rect = named_boolean(
+            *node, L"effectRect", style.effect_rect);
+        style.fill_style = canonical_style_enum(
+            named_string(*node, L"fillStyle", style.fill_style),
+            {L"outline", L"translucent"},
+            style.fill_style);
+        style.stroke_pattern = canonical_style_enum(
+            named_string(*node, L"strokePattern", style.stroke_pattern),
+            {L"solid", L"dashed"},
+            style.stroke_pattern);
+        style.arrow_head_style = canonical_style_enum(
+            named_string(
+                *node, L"arrowHeadStyle", style.arrow_head_style),
+            {L"forward", L"reverse", L"both"},
+            style.arrow_head_style);
+        style.rounded_rectangle = named_boolean(
+            *node, L"roundedRectangle", style.rounded_rectangle);
+        config.annotation_tool_styles.insert_or_assign(
+            std::wstring(tool_id),
+            std::move(style));
+    }
 }
 
 std::wstring serialize_json(const JsonNode& node) {
@@ -1466,6 +1833,92 @@ std::wstring normalize_annotation_hidden_tools(std::wstring_view value) {
     return result;
 }
 
+std::wstring normalize_toolbar_order(std::wstring_view value) {
+    const auto input_tokens = split_hidden_tools(value);
+    std::vector<std::wstring> ordered;
+    ordered.reserve(kAnnotationToolbarTools.size());
+
+    // Retain every known item in the user's relative order while removing
+    // duplicates and obsolete/unknown ids. Canonical casing is persisted so
+    // runtime and settings compare the same stable identifiers.
+    for (const auto& token : input_tokens) {
+        const auto known = std::ranges::find_if(
+            kAnnotationToolbarTools,
+            [&](std::wstring_view candidate) {
+                return tool_id_matches(token, candidate);
+            });
+        if (known == kAnnotationToolbarTools.end()) {
+            continue;
+        }
+        const bool duplicate = std::ranges::any_of(
+            ordered,
+            [&](const std::wstring& existing) {
+                return tool_id_matches(existing, *known);
+            });
+        if (!duplicate) {
+            ordered.emplace_back(*known);
+        }
+    }
+
+    const auto default_order = split_hidden_tools(kDefaultToolbarOrder);
+    for (std::size_t default_index = 0;
+         default_index < default_order.size();
+         ++default_index) {
+        const std::wstring& missing = default_order[default_index];
+        if (std::ranges::any_of(
+                ordered,
+                [&](const std::wstring& existing) {
+                    return tool_id_matches(existing, missing);
+                })) {
+            continue;
+        }
+
+        // Insert at the nearest default anchor without ever reordering items
+        // that were explicitly present in the saved customization.
+        auto insertion = ordered.end();
+        for (std::size_t previous = default_index; previous > 0; --previous) {
+            const auto anchor = std::ranges::find_if(
+                ordered,
+                [&](const std::wstring& existing) {
+                    return tool_id_matches(
+                        existing,
+                        default_order[previous - 1]);
+                });
+            if (anchor != ordered.end()) {
+                insertion = std::next(anchor);
+                break;
+            }
+        }
+        if (insertion == ordered.end()) {
+            for (std::size_t next = default_index + 1;
+                 next < default_order.size();
+                 ++next) {
+                const auto anchor = std::ranges::find_if(
+                    ordered,
+                    [&](const std::wstring& existing) {
+                        return tool_id_matches(
+                            existing,
+                            default_order[next]);
+                    });
+                if (anchor != ordered.end()) {
+                    insertion = anchor;
+                    break;
+                }
+            }
+        }
+        ordered.insert(insertion, missing);
+    }
+
+    std::wstring result;
+    for (const auto& tool : ordered) {
+        if (!result.empty()) {
+            result += L",";
+        }
+        result += tool;
+    }
+    return result;
+}
+
 bool annotation_tool_hidden(std::wstring_view hidden_tools, std::wstring_view tool_id) {
     const std::wstring normalized = normalize_annotation_hidden_tools(hidden_tools);
     for (const auto& token : split_hidden_tools(normalized)) {
@@ -1483,11 +1936,16 @@ std::wstring known_config_to_json(const AppConfig& config) {
     result += L",\"annotation\":{\"enabled\":" + std::wstring(json_boolean(config.annotation_enabled));
     result += L",\"lockedTool\":" + std::wstring(json_boolean(config.annotation_locked_tool));
     result += L",\"hiddenTools\":" + hidden_tools_to_json_array(config.annotation_hidden_tools);
-    result += L",\"toolbarOrder\":" + quote_json(config.toolbar_order);
+    result += L",\"toolbarOrder\":" +
+              quote_json(normalize_toolbar_order(config.toolbar_order));
     result += L",\"textFontFamily\":" + quote_json(config.text_font_family);
     result += L",\"textFontBold\":" + std::wstring(json_boolean(config.text_font_bold));
     result += L",\"textFontItalic\":" + std::wstring(json_boolean(config.text_font_italic));
-    result += L",\"highlightAlpha\":" + std::to_wstring(std::clamp(config.annotation_highlight_alpha, 24, 192)) + L"}";
+    result += L",\"highlightAlpha\":" +
+              std::to_wstring(
+                  std::clamp(config.annotation_highlight_alpha, 24, 192));
+    result += L",\"toolStyles\":" + annotation_tool_styles_to_json(config) +
+              L"}";
     result += L",\"ocr\":{\"enabled\":" + std::wstring(json_boolean(config.ocr_enabled));
     result += L",\"engine\":" + quote_json(normalize_ocr_engine(config.ocr_engine));
     result += L",\"downloadUrl\":" + quote_json(config.ocr_download_url) + L"}";
@@ -1519,6 +1977,32 @@ std::wstring known_config_to_json(const AppConfig& config) {
     result += L",\"toolSerial\":" + quote_json(config.tool_shortcut_serial);
     result += L",\"toolEraser\":" + quote_json(config.tool_shortcut_eraser) + L"}";
     result += L",\"capture\":{\"defaultOutput\":" + quote_json(config.default_output);
+    result += L",\"includeCursor\":" +
+              std::wstring(json_boolean(config.capture_cursor));
+    result += L",\"lastRegion\":";
+    if (config.last_region_capture) {
+        const RectI bounds = config.last_region_capture->bounds;
+        const std::int64_t width =
+            static_cast<std::int64_t>(bounds.right) - bounds.left;
+        const std::int64_t height =
+            static_cast<std::int64_t>(bounds.bottom) - bounds.top;
+        if (width >= 2 && height >= 2 &&
+            valid_display_topology_signature(
+                config.last_region_capture->topology_signature)) {
+            result += L"{\"left\":" + std::to_wstring(bounds.left);
+            result += L",\"top\":" + std::to_wstring(bounds.top);
+            result += L",\"width\":" + std::to_wstring(width);
+            result += L",\"height\":" + std::to_wstring(height);
+            result += L",\"topology\":" +
+                      quote_json(
+                          config.last_region_capture->topology_signature) +
+                      L"}";
+        } else {
+            result += L"null";
+        }
+    } else {
+        result += L"null";
+    }
     result += L",\"customColor\":" + quote_json(config.custom_color);
     result += L",\"theme\":" + quote_json(config.theme) + L"}}";
     return result;
@@ -1581,18 +2065,16 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text, std::wstr
         if (const auto* hidden_tools = member(*annotation, L"hiddenTools")) {
             config.annotation_hidden_tools = hidden_tools_from_json_node(*hidden_tools, L"");
         }
-        constexpr std::wstring_view feishu_style_order =
-            L"rect,ellipse,line,arrow,pen,text,serial,mosaic,highlight,watermark,pin,ocr,select,scroll,eraser,undo,redo,save,close,copy";
-        config.toolbar_order = named_string(*annotation, L"toolbarOrder", feishu_style_order);
-        if (config.toolbar_order == L"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,highlight,text,serial,eraser,undo,redo,ocr,scroll,pin,save,copy" ||
-            config.toolbar_order == L"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,highlight,text,serial,eraser,undo,redo,ocr,scroll,pin,copy,save,close" ||
-            config.toolbar_order == L"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,highlight,text,serial,eraser,undo,redo,ocr,scroll,pin,save,close,copy") {
-            config.toolbar_order = feishu_style_order;
-        }
+        config.toolbar_order = normalize_toolbar_order(
+            named_string(
+                *annotation,
+                L"toolbarOrder",
+                kDefaultToolbarOrder));
         config.text_font_family = named_string(*annotation, L"textFontFamily", L"Microsoft YaHei");
         config.text_font_bold = named_boolean(*annotation, L"textFontBold", false);
         config.text_font_italic = named_boolean(*annotation, L"textFontItalic", false);
         config.annotation_highlight_alpha = named_clamped_integer(*annotation, L"highlightAlpha", 96, 24, 192);
+        parse_annotation_tool_styles(*annotation, config);
     }
     if (const auto* ocr = member(*root, L"ocr")) {
         config.ocr_enabled = named_boolean(*ocr, L"enabled", true);
@@ -1653,6 +2135,21 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text, std::wstr
     }
     if (const auto* capture = member(*root, L"capture")) {
         config.default_output = named_string(*capture, L"defaultOutput", L"clipboard");
+        config.capture_cursor =
+            named_boolean(*capture, L"includeCursor", false);
+        if (config.schema_version <= kCurrentConfigSchemaVersion) {
+            if (const auto* last_region = member(*capture, L"lastRegion");
+                last_region && last_region->kind != JsonKind::null_value) {
+                LastRegionCapture parsed;
+                if (!parse_last_region_capture(
+                        *last_region,
+                        parsed,
+                        error)) {
+                    return std::nullopt;
+                }
+                config.last_region_capture = std::move(parsed);
+            }
+        }
         config.custom_color = named_string(*capture, L"customColor", L"#8000FF");
         config.theme = named_string(*capture, L"theme", L"system");
     }

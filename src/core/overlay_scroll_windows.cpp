@@ -3,9 +3,70 @@
 #include <commctrl.h>
 
 #include <algorithm>
+#include <array>
 #include <mutex>
 
 namespace airshot::overlay_detail {
+
+namespace {
+
+constexpr int kScrollControlWidthDip = 328;
+constexpr int kScrollControlHeightDip = 52;
+
+struct ScrollControlLayout {
+    RECT status{};
+    std::array<RECT, 3> buttons{};
+    int width{};
+    int height{};
+    int radius{};
+};
+
+[[nodiscard]] UINT window_dpi(HWND window) noexcept {
+    if (window && IsWindow(window)) {
+        const UINT dpi = GetDpiForWindow(window);
+        if (dpi != 0) {
+            return dpi;
+        }
+    }
+    return USER_DEFAULT_SCREEN_DPI;
+}
+
+[[nodiscard]] int scale_dip(UINT dpi, int value) noexcept {
+    return MulDiv(value, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI);
+}
+
+[[nodiscard]] ScrollControlLayout scroll_control_layout(HWND window) noexcept {
+    const UINT dpi = window_dpi(window);
+    const auto s = [dpi](int value) { return scale_dip(dpi, value); };
+    ScrollControlLayout layout;
+    layout.width = s(kScrollControlWidthDip);
+    layout.height = s(kScrollControlHeightDip);
+    layout.radius = std::max(2, s(7));
+    layout.status = {s(27), 0, s(104), layout.height};
+    layout.buttons = {
+        RECT{s(108), s(10), s(174), s(42)},
+        RECT{s(180), s(10), s(246), s(42)},
+        RECT{s(252), s(10), s(318), s(42)},
+    };
+    return layout;
+}
+
+[[nodiscard]] int scroll_button_at(HWND window, POINT point) noexcept {
+    const ScrollControlLayout layout = scroll_control_layout(window);
+    for (std::size_t index = 0; index < layout.buttons.size(); ++index) {
+        if (PtInRect(&layout.buttons[index], point)) {
+            return static_cast<int>(index) + 1;
+        }
+    }
+    return 0;
+}
+
+[[nodiscard]] bool pause_button_enabled(
+    const ScrollControlState& state) noexcept {
+    return !state.paused || state.can_resume;
+}
+
+}  // namespace
 
 LRESULT CALLBACK scroll_control_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
@@ -74,10 +135,13 @@ HWND create_scroll_control_window(HINSTANCE instance, HWND parent, const RectI& 
             RegisterClassExW(&wc);
         });
 
-        int w = 240;
-        int h = 50;
+        const UINT dpi = window_dpi(parent);
+        const int w = scale_dip(dpi, kScrollControlWidthDip);
+        const int h = scale_dip(dpi, kScrollControlHeightDip);
+        const int outer_gap = scale_dip(dpi, 8);
+        const int work_margin = scale_dip(dpi, 10);
         int x = selection.right - w;
-        int y = selection.bottom + 6;
+        int y = selection.bottom + outer_gap;
 
         RECT work_area{};
         MONITORINFO monitor_info{sizeof(monitor_info)};
@@ -98,12 +162,18 @@ HWND create_scroll_control_window(HINSTANCE instance, HWND parent, const RectI& 
         const int work_top = static_cast<int>(work_area.top);
         const int work_right = static_cast<int>(work_area.right);
         const int work_bottom = static_cast<int>(work_area.bottom);
-        x = std::clamp(x, work_left + 10, std::max(work_left + 10, work_right - w - 10));
-        if (y + h > work_bottom) y = selection.top - h - 6;
-        y = std::clamp(y, work_top + 10, std::max(work_top + 10, work_bottom - h - 10));
+        x = std::clamp(
+            x,
+            work_left + work_margin,
+            std::max(work_left + work_margin, work_right - w - work_margin));
+        if (y + h > work_bottom) y = selection.top - h - outer_gap;
+        y = std::clamp(
+            y,
+            work_top + work_margin,
+            std::max(work_top + work_margin, work_bottom - h - work_margin));
 
         HWND hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             L"AirScreenshot.ScrollControl",
             L"",
             WS_POPUP,
@@ -160,27 +230,30 @@ LRESULT CALLBACK scroll_control_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 if (wp == kScrollBlinkTimer) {
                     ++state->blink_counter;
                     InvalidateRect(hwnd, nullptr, FALSE);
-                } else if (wp == kScrollCaptureTimer && state->on_tick) {
+                } else if (wp == kScrollCaptureTimer &&
+                           !state->paused && state->on_tick) {
                     auto callback = state->on_tick;
                     callback();
                 }
                 return 0;
             }
+            case WM_MOUSEACTIVATE:
+                // The user must keep scrolling the captured application after
+                // clicking this palette. Never steal its foreground focus.
+                return MA_NOACTIVATE;
             case WM_SETTEXT: {
                 LRESULT res = DefWindowProcW(hwnd, msg, wp, lp);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return res;
             }
             case WM_MOUSEMOVE: {
-                int x = static_cast<short>(LOWORD(lp));
-                int y = static_cast<short>(HIWORD(lp));
                 const int previous_hover = state->hover_button;
-
-                if (x >= 110 && x <= 170 && y >= 10 && y <= 40) {
-                    state->hover_button = 1;
-                } else if (x >= 175 && x <= 230 && y >= 10 && y <= 40) {
-                    state->hover_button = 2;
-                } else {
+                const POINT point{
+                    static_cast<short>(LOWORD(lp)),
+                    static_cast<short>(HIWORD(lp))};
+                state->hover_button = scroll_button_at(hwnd, point);
+                if (state->hover_button == 1 &&
+                    !pause_button_enabled(*state)) {
                     state->hover_button = 0;
                 }
 
@@ -202,18 +275,18 @@ LRESULT CALLBACK scroll_control_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 return 0;
             }
             case WM_LBUTTONDOWN: {
-                int x = static_cast<short>(LOWORD(lp));
-                int y = static_cast<short>(HIWORD(lp));
-                if (x >= 110 && x <= 170 && y >= 10 && y <= 40) {
-                    state->pressed_button = 1;
-                    InvalidateRect(hwnd, nullptr, FALSE);
-                } else if (x >= 175 && x <= 230 && y >= 10 && y <= 40) {
-                    state->pressed_button = 2;
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                const POINT point{
+                    static_cast<short>(LOWORD(lp)),
+                    static_cast<short>(HIWORD(lp))};
+                state->pressed_button = scroll_button_at(hwnd, point);
+                if (state->pressed_button == 1 &&
+                    !pause_button_enabled(*state)) {
+                    state->pressed_button = 0;
                 }
                 if (state->pressed_button != 0) {
                     SetCapture(hwnd);
                 }
+                InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
             case WM_LBUTTONUP: {
@@ -221,19 +294,30 @@ LRESULT CALLBACK scroll_control_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 if (GetCapture() == hwnd) {
                     ReleaseCapture();
                 }
-                const int x = static_cast<short>(LOWORD(lp));
-                const int y = static_cast<short>(HIWORD(lp));
+                const POINT point{
+                    static_cast<short>(LOWORD(lp)),
+                    static_cast<short>(HIWORD(lp))};
                 state->pressed_button = 0;
-                if (pressed_button == 1) {
-                    if (x >= 110 && x <= 170 && y >= 10 && y <= 40) {
-                        complete(false);
-                        return 0;
+                const int released_button = scroll_button_at(hwnd, point);
+                if (pressed_button == released_button &&
+                    pressed_button == 1 &&
+                    pause_button_enabled(*state)) {
+                    auto callback = state->on_toggle_pause;
+                    if (callback) {
+                        callback();
                     }
-                } else if (pressed_button == 2) {
-                    if (x >= 175 && x <= 230 && y >= 10 && y <= 40) {
-                        complete(true);
-                        return 0;
-                    }
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (pressed_button == released_button &&
+                    pressed_button == 2) {
+                    complete(false);
+                    return 0;
+                }
+                if (pressed_button == released_button &&
+                    pressed_button == 3) {
+                    complete(true);
+                    return 0;
                 }
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
@@ -243,6 +327,8 @@ LRESULT CALLBACK scroll_control_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
+            case WM_ERASEBKGND:
+                return 1;
             case WM_PAINT: {
                 PAINTSTRUCT ps;
                 HDC hdc = BeginPaint(hwnd, &ps);
@@ -252,13 +338,41 @@ LRESULT CALLBACK scroll_control_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 
                 HDC mem_dc = CreateCompatibleDC(hdc);
                 HBITMAP mem_bm = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+                if (!mem_dc || !mem_bm) {
+                    if (mem_bm) DeleteObject(mem_bm);
+                    if (mem_dc) DeleteDC(mem_dc);
+                    EndPaint(hwnd, &ps);
+                    return 0;
+                }
                 HGDIOBJ old_bm = SelectObject(mem_dc, mem_bm);
 
-                HBRUSH bg_brush = CreateSolidBrush(RGB(20, 20, 23));
+                const ScrollControlLayout layout =
+                    scroll_control_layout(hwnd);
+                const UINT dpi = window_dpi(hwnd);
+                HIGHCONTRASTW high_contrast_info{
+                    sizeof(high_contrast_info)};
+                const bool high_contrast =
+                    SystemParametersInfoW(
+                        SPI_GETHIGHCONTRAST,
+                        sizeof(high_contrast_info),
+                        &high_contrast_info,
+                        0) &&
+                    (high_contrast_info.dwFlags & HCF_HIGHCONTRASTON) != 0;
+                const COLORREF background = high_contrast
+                                                ? GetSysColor(COLOR_WINDOW)
+                                                : RGB(20, 23, 29);
+                const COLORREF foreground = high_contrast
+                                                ? GetSysColor(COLOR_WINDOWTEXT)
+                                                : RGB(236, 240, 247);
+                const COLORREF border = high_contrast
+                                            ? GetSysColor(COLOR_WINDOWTEXT)
+                                            : RGB(55, 63, 76);
+
+                HBRUSH bg_brush = CreateSolidBrush(background);
                 FillRect(mem_dc, &rc, bg_brush);
                 DeleteObject(bg_brush);
 
-                HPEN border_pen = CreatePen(PS_SOLID, 1, RGB(60, 64, 70));
+                HPEN border_pen = CreatePen(PS_SOLID, 1, border);
                 HGDIOBJ old_pen = SelectObject(mem_dc, border_pen);
                 HGDIOBJ old_brush = SelectObject(mem_dc, GetStockObject(NULL_BRUSH));
                 Rectangle(mem_dc, 0, 0, rc.right, rc.bottom);
@@ -266,13 +380,29 @@ LRESULT CALLBACK scroll_control_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 SelectObject(mem_dc, old_pen);
                 DeleteObject(border_pen);
 
-                if (state->blink_counter % 2 == 0) {
-                    HBRUSH dot_brush = CreateSolidBrush(RGB(245, 34, 45));
-                    HPEN dot_pen = CreatePen(PS_SOLID, 1, RGB(245, 34, 45));
+                if (state->paused || state->blink_counter % 2 == 0) {
+                    const COLORREF dot_color =
+                        state->paused
+                            ? (high_contrast
+                                   ? GetSysColor(COLOR_HIGHLIGHT)
+                                   : RGB(242, 174, 68))
+                            : (high_contrast
+                                   ? GetSysColor(COLOR_HIGHLIGHT)
+                                   : RGB(66, 213, 221));
+                    HBRUSH dot_brush = CreateSolidBrush(dot_color);
+                    HPEN dot_pen = CreatePen(PS_SOLID, 1, dot_color);
                     HGDIOBJ prev_brush = SelectObject(mem_dc, dot_brush);
                     HGDIOBJ prev_pen = SelectObject(mem_dc, dot_pen);
 
-                    Ellipse(mem_dc, 12, 21, 20, 29);
+                    const int dot_left = scale_dip(dpi, 12);
+                    const int dot_top = scale_dip(dpi, 22);
+                    const int dot_size = std::max(4, scale_dip(dpi, 8));
+                    Ellipse(
+                        mem_dc,
+                        dot_left,
+                        dot_top,
+                        dot_left + dot_size,
+                        dot_top + dot_size);
 
                     SelectObject(mem_dc, prev_brush);
                     SelectObject(mem_dc, prev_pen);
@@ -283,49 +413,116 @@ LRESULT CALLBACK scroll_control_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 wchar_t text_buf[128] = L"";
                 GetWindowTextW(hwnd, text_buf, 128);
 
-                SetTextColor(mem_dc, RGB(230, 230, 230));
+                SetTextColor(mem_dc, foreground);
                 SetBkMode(mem_dc, TRANSPARENT);
-                HFONT font = CreateFontW(14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
+                HFONT font = CreateFontW(
+                    -std::max(9, scale_dip(dpi, 13)),
+                    0,
+                    0,
+                    0,
+                    FW_SEMIBOLD,
+                    FALSE,
+                    FALSE,
+                    FALSE,
+                    DEFAULT_CHARSET,
+                    OUT_DEFAULT_PRECIS,
+                    CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY,
+                    DEFAULT_PITCH | FF_DONTCARE,
+                    L"Microsoft YaHei UI");
                 HGDIOBJ old_font = SelectObject(mem_dc, font);
 
-                RECT text_rc{26, 0, 105, rc.bottom};
-                DrawTextW(mem_dc, text_buf, -1, &text_rc, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+                RECT text_rc = layout.status;
+                DrawTextW(
+                    mem_dc,
+                    text_buf,
+                    -1,
+                    &text_rc,
+                    DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
 
-                RECT ok_rc{110, 10, 170, 40};
-                COLORREF ok_bg = RGB(0, 102, 255);
-                if (state->pressed_button == 1) ok_bg = RGB(0, 77, 204);
-                else if (state->hover_button == 1) ok_bg = RGB(51, 136, 255);
+                auto draw_button = [&](int button,
+                                       const wchar_t* label,
+                                       bool primary,
+                                       bool enabled) {
+                    const RECT bounds = layout.buttons[
+                        static_cast<std::size_t>(button - 1)];
+                    COLORREF fill = high_contrast
+                                        ? GetSysColor(COLOR_BTNFACE)
+                                        : RGB(35, 41, 51);
+                    COLORREF outline = high_contrast
+                                           ? GetSysColor(COLOR_BTNTEXT)
+                                           : RGB(77, 87, 103);
+                    COLORREF text = high_contrast
+                                        ? GetSysColor(COLOR_BTNTEXT)
+                                        : RGB(220, 226, 236);
+                    if (!enabled) {
+                        fill = high_contrast
+                                   ? GetSysColor(COLOR_BTNFACE)
+                                   : RGB(30, 34, 42);
+                        outline = high_contrast
+                                      ? GetSysColor(COLOR_GRAYTEXT)
+                                      : RGB(49, 55, 66);
+                        text = high_contrast
+                                   ? GetSysColor(COLOR_GRAYTEXT)
+                                   : RGB(105, 114, 129);
+                    } else if (primary) {
+                        fill = high_contrast
+                                   ? GetSysColor(COLOR_HIGHLIGHT)
+                                   : RGB(39, 100, 231);
+                        outline = fill;
+                        text = high_contrast
+                                   ? GetSysColor(COLOR_HIGHLIGHTTEXT)
+                                   : RGB(255, 255, 255);
+                    }
+                    if (enabled && state->pressed_button == button) {
+                        fill = high_contrast
+                                   ? GetSysColor(COLOR_HIGHLIGHT)
+                                   : (primary ? RGB(30, 85, 200)
+                                              : RGB(24, 29, 37));
+                    } else if (enabled && state->hover_button == button) {
+                        fill = high_contrast
+                                   ? GetSysColor(COLOR_HIGHLIGHT)
+                                   : (primary ? RGB(58, 119, 244)
+                                              : RGB(48, 57, 70));
+                        if (high_contrast) {
+                            text = GetSysColor(COLOR_HIGHLIGHTTEXT);
+                        }
+                    }
 
-                HBRUSH ok_brush = CreateSolidBrush(ok_bg);
-                HPEN ok_pen = CreatePen(PS_SOLID, 1, ok_bg);
-                HGDIOBJ prev_ok_pen = SelectObject(mem_dc, ok_pen);
-                HGDIOBJ prev_ok_brush = SelectObject(mem_dc, ok_brush);
-                RoundRect(mem_dc, ok_rc.left, ok_rc.top, ok_rc.right, ok_rc.bottom, 6, 6);
-                SelectObject(mem_dc, prev_ok_brush);
-                SelectObject(mem_dc, prev_ok_pen);
-                DeleteObject(ok_brush);
-                DeleteObject(ok_pen);
+                    HBRUSH brush = CreateSolidBrush(fill);
+                    HPEN pen = CreatePen(PS_SOLID, 1, outline);
+                    HGDIOBJ previous_pen = SelectObject(mem_dc, pen);
+                    HGDIOBJ previous_brush = SelectObject(mem_dc, brush);
+                    RoundRect(
+                        mem_dc,
+                        bounds.left,
+                        bounds.top,
+                        bounds.right,
+                        bounds.bottom,
+                        layout.radius,
+                        layout.radius);
+                    SelectObject(mem_dc, previous_brush);
+                    SelectObject(mem_dc, previous_pen);
+                    DeleteObject(brush);
+                    DeleteObject(pen);
 
-                SetTextColor(mem_dc, RGB(255, 255, 255));
-                DrawTextW(mem_dc, L"完成", -1, &ok_rc, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+                    SetTextColor(mem_dc, text);
+                    RECT label_bounds = bounds;
+                    DrawTextW(
+                        mem_dc,
+                        label,
+                        -1,
+                        &label_bounds,
+                        DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+                };
 
-                RECT cancel_rc{175, 10, 230, 40};
-                COLORREF cancel_bg = RGB(35, 38, 41);
-                if (state->pressed_button == 2) cancel_bg = RGB(20, 22, 24);
-                else if (state->hover_button == 2) cancel_bg = RGB(50, 55, 60);
-
-                HBRUSH cancel_brush = CreateSolidBrush(cancel_bg);
-                HPEN cancel_pen = CreatePen(PS_SOLID, 1, RGB(90, 95, 100));
-                HGDIOBJ prev_cancel_pen = SelectObject(mem_dc, cancel_pen);
-                HGDIOBJ prev_cancel_brush = SelectObject(mem_dc, cancel_brush);
-                RoundRect(mem_dc, cancel_rc.left, cancel_rc.top, cancel_rc.right, cancel_rc.bottom, 6, 6);
-                SelectObject(mem_dc, prev_cancel_brush);
-                SelectObject(mem_dc, prev_cancel_pen);
-                DeleteObject(cancel_brush);
-                DeleteObject(cancel_pen);
-
-                SetTextColor(mem_dc, RGB(200, 200, 200));
-                DrawTextW(mem_dc, L"取消", -1, &cancel_rc, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+                draw_button(
+                    1,
+                    state->paused ? L"继续" : L"暂停",
+                    false,
+                    pause_button_enabled(*state));
+                draw_button(2, L"完成", true, true);
+                draw_button(3, L"取消", false, true);
 
                 SelectObject(mem_dc, old_font);
                 DeleteObject(font);
@@ -352,14 +549,44 @@ LRESULT CALLBACK scroll_control_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 return DefWindowProcW(hwnd, msg, wp, lp);
             }
-            case WM_KEYDOWN: {
-                if (wp == VK_RETURN) {
-                    complete(false);
-                    return 0;
+            case WM_DPICHANGED: {
+                const auto* suggested =
+                    reinterpret_cast<const RECT*>(lp);
+                if (suggested) {
+                    SetWindowPos(
+                        hwnd,
+                        nullptr,
+                        suggested->left,
+                        suggested->top,
+                        suggested->right - suggested->left,
+                        suggested->bottom - suggested->top,
+                        SWP_NOACTIVATE | SWP_NOZORDER);
                 }
-                if (wp == VK_ESCAPE) {
-                    complete(true);
-                    return 0;
+                InvalidateRect(hwnd, nullptr, TRUE);
+                return 0;
+            }
+            case WM_KEYDOWN: {
+                // Fallback for accessibility tools that explicitly direct a
+                // key here. Normal keyboard input is forwarded to the hidden
+                // overlay owner because this palette never activates.
+                switch (scroll_keyboard_command(wp)) {
+                    case ScrollKeyboardCommand::finish:
+                        complete(false);
+                        return 0;
+                    case ScrollKeyboardCommand::cancel:
+                        complete(true);
+                        return 0;
+                    case ScrollKeyboardCommand::toggle_pause:
+                        if (pause_button_enabled(*state)) {
+                            auto callback = state->on_toggle_pause;
+                            if (callback) {
+                                callback();
+                            }
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                        }
+                        return 0;
+                    case ScrollKeyboardCommand::none:
+                        break;
                 }
                 break;
             }

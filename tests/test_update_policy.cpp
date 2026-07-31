@@ -1,3 +1,4 @@
+#include "airshot/host_policy.h"
 #include "airshot/update_policy.h"
 
 #include <iostream>
@@ -52,6 +53,28 @@ int wmain() {
     expect(
         airshot::should_show_update_target_warning(true, first, second),
         L"a manual check always reports an unusable target");
+
+    expect(
+        airshot::cancel_update_when_automatic_is_disabled(true, false),
+        L"disabling automatic updates cancels an in-flight automatic task");
+    expect(
+        !airshot::cancel_update_when_automatic_is_disabled(true, true),
+        L"disabling automatic updates preserves an in-flight user task");
+    expect(
+        !airshot::cancel_update_when_automatic_is_disabled(false, false),
+        L"disabling automatic updates does not cancel an idle worker");
+    expect(
+        airshot::automatic_update_runtime_action(false, true, false, false) ==
+            airshot::AutomaticUpdateRuntimeAction::schedule,
+        L"enabling automatic updates requests scheduling");
+    expect(
+        airshot::automatic_update_runtime_action(true, false, true, false) ==
+            airshot::AutomaticUpdateRuntimeAction::disable_and_cancel,
+        L"disabling automatic updates cancels only an automatic worker");
+    expect(
+        airshot::automatic_update_runtime_action(true, false, true, true) ==
+            airshot::AutomaticUpdateRuntimeAction::disable,
+        L"disabling automatic updates keeps a manual worker alive");
 
     if (failures == 0) {
         std::wcout << L"update policy tests passed\n";

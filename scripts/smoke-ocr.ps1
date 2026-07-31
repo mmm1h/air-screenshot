@@ -57,6 +57,7 @@ if ($missing.Count -gt 0) {
 }
 
 Add-Type -AssemblyName System.Drawing
+$originalDataDirectory = $env:AIRSHOT_DATA_DIR
 $temporaryDirectory = Join-Path (
     [IO.Path]::GetTempPath()
 ) ("airshot-ocr-smoke-" + [guid]::NewGuid().ToString("N"))
@@ -65,6 +66,10 @@ $image = Join-Path $temporaryDirectory "input.png"
 $expectedText = "AirOCR123中文测试"
 
 try {
+    $isolatedDataDirectory = Join-Path $temporaryDirectory "data"
+    New-Item -ItemType Directory -Path $isolatedDataDirectory | Out-Null
+    $env:AIRSHOT_DATA_DIR = $isolatedDataDirectory
+
     $bitmap = [Drawing.Bitmap]::new(1000, 240)
     $graphics = [Drawing.Graphics]::FromImage($bitmap)
     $font = [Drawing.Font]::new(
@@ -141,5 +146,10 @@ try {
     }
 }
 finally {
+    if ($null -eq $originalDataDirectory) {
+        Remove-Item Env:\AIRSHOT_DATA_DIR -ErrorAction SilentlyContinue
+    } else {
+        $env:AIRSHOT_DATA_DIR = $originalDataDirectory
+    }
     Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }

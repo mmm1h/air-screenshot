@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace airshot::overlay_detail {
@@ -28,7 +30,29 @@ enum class Tool {
     watermark,
 };
 
-[[nodiscard]] inline float tool_cursor_radius(
+[[nodiscard]] constexpr bool tool_uses_bitmap_effect_preview(
+    Tool tool) noexcept {
+    return tool == Tool::mosaic || tool == Tool::blur ||
+           tool == Tool::highlight;
+}
+
+[[nodiscard]] constexpr bool should_persist_tool_style(
+    Tool active_tool,
+    bool has_selected_annotation) noexcept {
+    return active_tool != Tool::select || !has_selected_annotation;
+}
+
+[[nodiscard]] constexpr bool effect_geometry_mode_available(
+    Tool active_tool,
+    Tool style_tool,
+    bool has_selected_annotation) noexcept {
+    const bool effect_tool =
+        style_tool == Tool::mosaic || style_tool == Tool::blur;
+    return effect_tool &&
+           !(active_tool == Tool::select && has_selected_annotation);
+}
+
+[[nodiscard]] inline float tool_visual_radius(
     Tool tool,
     float width) noexcept {
     const float safe_width =
@@ -55,10 +79,32 @@ enum class Tool {
     }
 }
 
+[[nodiscard]] inline float tool_cursor_radius(
+    Tool tool,
+    float width) noexcept {
+    return tool_visual_radius(tool, width);
+}
+
 enum class TextStyle {
     normal,
     dark,
     outline,
+};
+
+enum class ShapeFillStyle {
+    outline,
+    translucent,
+};
+
+enum class StrokePattern {
+    solid,
+    dashed,
+};
+
+enum class ArrowHeadStyle {
+    forward,
+    reverse,
+    both,
 };
 
 enum class DragMode {
@@ -74,6 +120,35 @@ enum class DragMode {
     left,
     annotate
 };
+
+enum class InteractionSettleMode {
+    commit,
+    cancel,
+};
+
+enum class InteractionCommand {
+    undo,
+    redo,
+    copy,
+    save,
+    ocr,
+    close,
+};
+
+[[nodiscard]] constexpr InteractionSettleMode
+interaction_settle_mode(InteractionCommand command) noexcept {
+    switch (command) {
+        case InteractionCommand::copy:
+        case InteractionCommand::save:
+        case InteractionCommand::ocr:
+            return InteractionSettleMode::commit;
+        case InteractionCommand::undo:
+        case InteractionCommand::redo:
+        case InteractionCommand::close:
+            return InteractionSettleMode::cancel;
+    }
+    return InteractionSettleMode::cancel;
+}
 
 enum class AnnotationHandle {
     none,
@@ -100,7 +175,347 @@ struct Annotation {
     int alpha{255};
     int serial{};
     TextStyle text_style{TextStyle::normal};
+    ShapeFillStyle fill_style{ShapeFillStyle::outline};
+    StrokePattern stroke_pattern{StrokePattern::solid};
+    ArrowHeadStyle arrow_head_style{ArrowHeadStyle::forward};
+    bool rounded_rectangle{};
+    // Text layout is measured with the same GDI font and flags used by the
+    // bitmap renderer. Keeping the result on the annotation makes selection,
+    // hit testing and the live preview agree with the committed image.
+    RectI measured_text_bounds{};
 };
+
+struct ToolStyleState {
+    COLORREF color{RGB(245, 34, 45)};
+    float width{4.0F};
+    float text_size{18.0F};
+    TextStyle text_style{TextStyle::normal};
+    int highlight_alpha{96};
+    int effect_strength{50};
+    bool effect_rect{};
+    ShapeFillStyle fill_style{ShapeFillStyle::outline};
+    StrokePattern stroke_pattern{StrokePattern::solid};
+    ArrowHeadStyle arrow_head_style{ArrowHeadStyle::forward};
+    bool rounded_rectangle{};
+};
+
+inline constexpr std::size_t kToolStyleCount =
+    static_cast<std::size_t>(Tool::watermark) + 1;
+
+[[nodiscard]] constexpr std::size_t tool_style_index(Tool tool) noexcept {
+    const auto index = static_cast<std::size_t>(tool);
+    return index < kToolStyleCount ? index : 0;
+}
+
+class ToolStylePalette {
+public:
+    explicit ToolStylePalette(int highlight_alpha = 96) noexcept {
+        styles_[tool_style_index(Tool::highlight)].color =
+            RGB(250, 219, 20);
+        styles_[tool_style_index(Tool::highlight)].highlight_alpha =
+            std::clamp(highlight_alpha, 24, 192);
+        styles_[tool_style_index(Tool::watermark)].color =
+            RGB(255, 150, 150);
+    }
+
+    [[nodiscard]] ToolStyleState& for_tool(Tool tool) noexcept {
+        return styles_[tool_style_index(tool)];
+    }
+
+    [[nodiscard]] const ToolStyleState& for_tool(
+        Tool tool) const noexcept {
+        return styles_[tool_style_index(tool)];
+    }
+
+private:
+    std::array<ToolStyleState, kToolStyleCount> styles_{};
+};
+
+[[nodiscard]] inline int serial_digit_count(int serial) noexcept {
+    unsigned int value = serial < 0
+                             ? static_cast<unsigned int>(
+                                   -(static_cast<long long>(serial)))
+                             : static_cast<unsigned int>(serial);
+    int digits = 1;
+    while (value >= 10) {
+        value /= 10;
+        ++digits;
+    }
+    return digits + (serial < 0 ? 1 : 0);
+}
+
+[[nodiscard]] inline float serial_font_size(
+    float width,
+    int serial) noexcept {
+    const float base = tool_visual_radius(Tool::serial, width);
+    const int extra_digits = std::max(0, serial_digit_count(serial) - 2);
+    const float scale = std::max(
+        0.55F,
+        1.0F - static_cast<float>(extra_digits) * 0.08F);
+    return std::max(8.0F, base * scale);
+}
+
+[[nodiscard]] inline float serial_visual_radius(
+    float width,
+    int serial) noexcept {
+    const float base = tool_visual_radius(Tool::serial, width);
+    const int digits = serial_digit_count(serial);
+    const int extra_digits = std::max(0, serial_digit_count(serial) - 2);
+    const float expanded =
+        base + static_cast<float>(extra_digits) *
+                   std::max(2.0F, width * 0.5F);
+    const float text_half_width =
+        static_cast<float>(digits) * serial_font_size(width, serial) *
+            0.32F +
+        std::max(2.0F, width * 0.5F);
+    return std::max(expanded, text_half_width);
+}
+
+[[nodiscard]] inline float annotation_visual_radius(
+    const Annotation& annotation) noexcept {
+    if (annotation.tool == Tool::serial) {
+        return serial_visual_radius(annotation.width, annotation.serial);
+    }
+    return tool_visual_radius(annotation.tool, annotation.width);
+}
+
+[[nodiscard]] inline float arrow_head_length(float width) noexcept {
+    const float safe_width =
+        std::isfinite(width) ? std::max(1.0F, width) : 1.0F;
+    return std::clamp(8.0F + safe_width * 2.0F, 10.0F, 34.0F);
+}
+
+struct ArrowHeadWings {
+    POINT first{};
+    POINT second{};
+};
+
+[[nodiscard]] inline ArrowHeadWings arrow_head_wings(
+    POINT tip,
+    POINT tail,
+    float width) noexcept {
+    const double dx = static_cast<double>(tip.x - tail.x);
+    const double dy = static_cast<double>(tip.y - tail.y);
+    const double shaft_length = std::hypot(dx, dy);
+    if (shaft_length <= 0.0) {
+        return {tip, tip};
+    }
+    const double angle = std::atan2(dy, dx);
+    const double length = std::min(
+        static_cast<double>(arrow_head_length(width)),
+        std::max(3.0, shaft_length * 0.65));
+    constexpr double kWingAngle = 0.48;
+    return {
+        {
+            tip.x - static_cast<long>(
+                        std::lround(std::cos(angle + kWingAngle) * length)),
+            tip.y - static_cast<long>(
+                        std::lround(std::sin(angle + kWingAngle) * length)),
+        },
+        {
+            tip.x - static_cast<long>(
+                        std::lround(std::cos(angle - kWingAngle) * length)),
+            tip.y - static_cast<long>(
+                        std::lround(std::sin(angle - kWingAngle) * length)),
+        },
+    };
+}
+
+[[nodiscard]] constexpr bool arrow_has_start_head(
+    ArrowHeadStyle style) noexcept {
+    return style == ArrowHeadStyle::reverse || style == ArrowHeadStyle::both;
+}
+
+[[nodiscard]] constexpr bool arrow_has_end_head(
+    ArrowHeadStyle style) noexcept {
+    return style == ArrowHeadStyle::forward || style == ArrowHeadStyle::both;
+}
+
+[[nodiscard]] inline float rounded_rectangle_radius(
+    RectI bounds,
+    float width) noexcept {
+    bounds = bounds.normalized();
+    const float maximum = static_cast<float>(
+        std::max(0, std::min(bounds.width(), bounds.height()))) * 0.5F;
+    const float requested = std::clamp(
+        4.0F + (std::isfinite(width) ? width : 1.0F),
+        5.0F,
+        18.0F);
+    return std::min(maximum, requested);
+}
+
+[[nodiscard]] inline double ellipse_signed_distance(
+    RectI bounds,
+    POINT point) noexcept {
+    bounds = bounds.normalized();
+    const double radius_x =
+        std::max(0.5, static_cast<double>(bounds.width()) * 0.5);
+    const double radius_y =
+        std::max(0.5, static_cast<double>(bounds.height()) * 0.5);
+    const double center_x =
+        (static_cast<double>(bounds.left) + bounds.right) * 0.5;
+    const double center_y =
+        (static_cast<double>(bounds.top) + bounds.bottom) * 0.5;
+    const double x = std::abs(static_cast<double>(point.x) - center_x);
+    const double y = std::abs(static_cast<double>(point.y) - center_y);
+    const bool inside =
+        (x * x) / (radius_x * radius_x) +
+            (y * y) / (radius_y * radius_y) <=
+        1.0;
+    if (x == 0.0 && y == 0.0) {
+        const double distance = std::min(radius_x, radius_y);
+        return inside ? -distance : distance;
+    }
+
+    constexpr double kHalfPi = 1.57079632679489661923;
+    double parameter = std::atan2(y * radius_x, x * radius_y);
+    parameter = std::clamp(parameter, 0.0, kHalfPi);
+    for (int iteration = 0; iteration < 12; ++iteration) {
+        const double cosine = std::cos(parameter);
+        const double sine = std::sin(parameter);
+        const double ellipse_x = radius_x * cosine;
+        const double ellipse_y = radius_y * sine;
+        const double tangent_x = -radius_x * sine;
+        const double tangent_y = radius_y * cosine;
+        const double delta_x = ellipse_x - x;
+        const double delta_y = ellipse_y - y;
+        const double first =
+            delta_x * tangent_x + delta_y * tangent_y;
+        const double second =
+            tangent_x * tangent_x + tangent_y * tangent_y +
+            delta_x * (-radius_x * cosine) +
+            delta_y * (-radius_y * sine);
+        if (!std::isfinite(second) || std::abs(second) < 1.0e-9) {
+            break;
+        }
+        const double next = std::clamp(
+            parameter - first / second,
+            0.0,
+            kHalfPi);
+        if (std::abs(next - parameter) < 1.0e-7) {
+            parameter = next;
+            break;
+        }
+        parameter = next;
+    }
+    const double closest_x = radius_x * std::cos(parameter);
+    const double closest_y = radius_y * std::sin(parameter);
+    const double distance = std::hypot(closest_x - x, closest_y - y);
+    return inside ? -distance : distance;
+}
+
+[[nodiscard]] inline double rounded_rectangle_signed_distance(
+    RectI bounds,
+    POINT point,
+    double radius) noexcept {
+    bounds = bounds.normalized();
+    const double half_width =
+        std::max(0.5, static_cast<double>(bounds.width()) * 0.5);
+    const double half_height =
+        std::max(0.5, static_cast<double>(bounds.height()) * 0.5);
+    radius = std::clamp(
+        std::isfinite(radius) ? radius : 0.0,
+        0.0,
+        std::min(half_width, half_height));
+    const double center_x =
+        (static_cast<double>(bounds.left) + bounds.right) * 0.5;
+    const double center_y =
+        (static_cast<double>(bounds.top) + bounds.bottom) * 0.5;
+    const double local_x =
+        std::abs(static_cast<double>(point.x) - center_x) -
+        (half_width - radius);
+    const double local_y =
+        std::abs(static_cast<double>(point.y) - center_y) -
+        (half_height - radius);
+    const double outside = std::hypot(
+        std::max(0.0, local_x),
+        std::max(0.0, local_y));
+    const double inside = std::min(std::max(local_x, local_y), 0.0);
+    return outside + inside - radius;
+}
+
+[[nodiscard]] inline bool shape_annotation_hit_test(
+    const Annotation& annotation,
+    POINT point,
+    double hit_margin = 6.0) noexcept {
+    if (annotation.tool != Tool::rectangle &&
+        annotation.tool != Tool::ellipse) {
+        return false;
+    }
+    const RectI bounds = RectI{
+        annotation.start.x,
+        annotation.start.y,
+        annotation.end.x,
+        annotation.end.y,
+    }.normalized();
+    if (bounds.width() <= 0 || bounds.height() <= 0) {
+        return false;
+    }
+    const double safe_width =
+        std::isfinite(annotation.width)
+            ? std::clamp(static_cast<double>(annotation.width), 1.0, 4096.0)
+            : 1.0;
+    const double tolerance =
+        safe_width * 0.5 +
+        std::max(0.0, std::isfinite(hit_margin) ? hit_margin : 0.0);
+    const double signed_distance =
+        annotation.tool == Tool::ellipse
+            ? ellipse_signed_distance(bounds, point)
+            : rounded_rectangle_signed_distance(
+                  bounds,
+                  point,
+                  annotation.rounded_rectangle
+                      ? rounded_rectangle_radius(bounds, annotation.width)
+                      : 0.0);
+    return annotation.fill_style == ShapeFillStyle::translucent
+               ? signed_distance <= tolerance
+               : std::abs(signed_distance) <= tolerance;
+}
+
+[[nodiscard]] inline bool annotation_is_committable(
+    const Annotation& annotation) noexcept {
+    constexpr int kMinimumBoxExtent = 2;
+    constexpr double kMinimumLineLength = 3.0;
+    const long delta_x = annotation.end.x - annotation.start.x;
+    const long delta_y = annotation.end.y - annotation.start.y;
+
+    switch (annotation.tool) {
+        case Tool::rectangle:
+        case Tool::ellipse:
+            return std::abs(delta_x) >= kMinimumBoxExtent &&
+                   std::abs(delta_y) >= kMinimumBoxExtent;
+        case Tool::line:
+        case Tool::arrow:
+            return std::hypot(
+                       static_cast<double>(delta_x),
+                       static_cast<double>(delta_y)) >=
+                   kMinimumLineLength;
+        case Tool::mosaic:
+        case Tool::blur:
+            if (annotation.alpha <= 0) {
+                return false;
+            }
+            if (annotation.points.empty()) {
+                return std::abs(delta_x) >= kMinimumBoxExtent &&
+                       std::abs(delta_y) >= kMinimumBoxExtent;
+            }
+            return true;
+        case Tool::pen:
+        case Tool::highlight:
+            // A click is an intentional dot for freehand tools.
+            return !annotation.points.empty();
+        case Tool::text:
+            return !annotation.text.empty();
+        case Tool::serial:
+        case Tool::watermark:
+            return true;
+        case Tool::eraser:
+        case Tool::select:
+        case Tool::none:
+            return false;
+    }
+    return false;
+}
 
 struct AnnotationControlHandle {
     AnnotationHandle kind{AnnotationHandle::none};
@@ -140,10 +555,202 @@ struct ToolbarButton {
     std::wstring disabled_reason;
 };
 
+inline constexpr unsigned int kOverlayBaseDpi = 96U;
+
+[[nodiscard]] constexpr int scale_overlay_ui_px(
+    int value,
+    unsigned int dpi) noexcept {
+    const auto effective_dpi = dpi == 0U ? kOverlayBaseDpi : dpi;
+    const auto product =
+        static_cast<std::int64_t>(value) * effective_dpi;
+    const auto half = static_cast<std::int64_t>(kOverlayBaseDpi / 2U);
+    const auto rounded = product >= 0
+                             ? (product + half) / kOverlayBaseDpi
+                             : (product - half) / kOverlayBaseDpi;
+    return static_cast<int>(std::clamp<std::int64_t>(
+        rounded,
+        std::numeric_limits<int>::min(),
+        std::numeric_limits<int>::max()));
+}
+
+struct OverlayUiMetrics {
+    unsigned int dpi{kOverlayBaseDpi};
+
+    [[nodiscard]] constexpr int px(int value) const noexcept {
+        return scale_overlay_ui_px(value, dpi);
+    }
+
+    [[nodiscard]] constexpr float px(float value) const noexcept {
+        const auto effective_dpi = dpi == 0U ? kOverlayBaseDpi : dpi;
+        return value * static_cast<float>(effective_dpi) /
+               static_cast<float>(kOverlayBaseDpi);
+    }
+};
+
+struct ToolbarMetrics {
+    int button_width;
+    int button_height;
+    int spacing;
+    int padding;
+    unsigned int dpi{kOverlayBaseDpi};
+};
+
+struct ToolbarRow {
+    std::vector<std::pair<std::wstring, std::wstring>> items;
+    int width{};
+};
+
+[[nodiscard]] inline int toolbar_item_width(
+    std::wstring_view id,
+    const ToolbarMetrics& metrics) noexcept {
+    const OverlayUiMetrics ui{metrics.dpi};
+    if (id == L"drag") return ui.px(20);
+    if (id == L"|") return ui.px(9);
+    if (id == L"text_size_btn") return ui.px(86);
+    if (id == L"mosaic_strength_slider" ||
+        id == L"watermark_opacity_slider") return ui.px(188);
+    if (id == L"watermark_text") return ui.px(122);
+    if (id == L"watermark_apply" || id == L"watermark_clear") return ui.px(54);
+    if (id.starts_with(L"effect_") || id.starts_with(L"mode_")) return ui.px(68);
+    if (id.starts_with(L"fill_") || id.starts_with(L"stroke_") ||
+        id.starts_with(L"corner_") || id.starts_with(L"head_")) {
+        return ui.px(58);
+    }
+    return metrics.button_width;
+}
+
+[[nodiscard]] inline int toolbar_row_width(
+    const std::vector<std::pair<std::wstring, std::wstring>>& items,
+    const ToolbarMetrics& metrics) noexcept {
+    int width = 0;
+    for (std::size_t index = 0; index < items.size(); ++index) {
+        if (index > 0) {
+            width += metrics.spacing;
+        }
+        width += toolbar_item_width(items[index].first, metrics);
+    }
+    return width;
+}
+
+inline void trim_toolbar_row(
+    ToolbarRow& row,
+    const ToolbarMetrics& metrics) {
+    while (!row.items.empty() && row.items.back().first == L"|") {
+        row.items.pop_back();
+    }
+    row.width = toolbar_row_width(row.items, metrics);
+}
+
+[[nodiscard]] inline std::vector<ToolbarRow> wrap_toolbar_items(
+    const std::vector<std::pair<std::wstring, std::wstring>>& items,
+    const ToolbarMetrics& metrics,
+    const RectI& bounds) {
+    const int available_width = std::max(
+        metrics.button_width,
+        bounds.width() - 2 * metrics.padding);
+    std::vector<ToolbarRow> rows;
+    ToolbarRow current;
+    for (const auto& item : items) {
+        const bool separator = item.first == L"|";
+        if (separator && current.items.empty()) {
+            continue;
+        }
+        const int width = toolbar_item_width(item.first, metrics);
+        const int next_width = current.items.empty()
+                                   ? width
+                                   : current.width + metrics.spacing + width;
+        if (!current.items.empty() && next_width > available_width) {
+            trim_toolbar_row(current, metrics);
+            if (!current.items.empty()) {
+                rows.push_back(std::move(current));
+            }
+            current = {};
+            if (separator) {
+                continue;
+            }
+        }
+        current.width = current.items.empty()
+                            ? width
+                            : current.width + metrics.spacing + width;
+        current.items.push_back(item);
+    }
+    trim_toolbar_row(current, metrics);
+    if (!current.items.empty()) {
+        rows.push_back(std::move(current));
+    }
+    return rows;
+}
+
+[[nodiscard]] inline int toolbar_width(
+    const std::vector<ToolbarRow>& rows,
+    const ToolbarMetrics& metrics) noexcept {
+    int width = 0;
+    for (const auto& row : rows) {
+        width = std::max(width, row.width);
+    }
+    return width + 2 * metrics.padding;
+}
+
+[[nodiscard]] inline int toolbar_height(
+    const std::vector<ToolbarRow>& rows,
+    const ToolbarMetrics& metrics) noexcept {
+    if (rows.empty()) {
+        return 0;
+    }
+    return static_cast<int>(rows.size()) * metrics.button_height +
+           static_cast<int>(rows.size() - 1) * metrics.spacing +
+           2 * metrics.padding;
+}
+
+[[nodiscard]] inline int clamp_toolbar_axis(
+    int value,
+    int size,
+    int minimum,
+    int maximum) noexcept {
+    if (size >= maximum - minimum) {
+        return minimum;
+    }
+    return std::clamp(value, minimum, maximum - size);
+}
+
+inline void place_toolbar_rows(
+    std::vector<ToolbarButton>& target,
+    const std::vector<ToolbarRow>& rows,
+    const ToolbarMetrics& metrics,
+    int left,
+    int top) {
+    target.clear();
+    int y = top + metrics.padding;
+    for (const auto& row : rows) {
+        int x = left + metrics.padding;
+        for (const auto& item : row.items) {
+            const int width = toolbar_item_width(item.first, metrics);
+            target.push_back({
+                item.first,
+                item.second,
+                {x, y, x + width, y + metrics.button_height},
+            });
+            x += width + metrics.spacing;
+        }
+        y += metrics.button_height + metrics.spacing;
+    }
+}
+
 struct AnnotationGeometry {
     POINT start{};
     POINT end{};
 };
+
+[[nodiscard]] inline POINT orthogonal_endpoint(
+    POINT anchor,
+    POINT cursor) noexcept {
+    const long delta_x = cursor.x - anchor.x;
+    const long delta_y = cursor.y - anchor.y;
+    if (std::abs(delta_x) >= std::abs(delta_y)) {
+        return {cursor.x, anchor.y};
+    }
+    return {anchor.x, cursor.y};
+}
 
 [[nodiscard]] inline AnnotationGeometry constrained_annotation_geometry(
     Tool tool,
@@ -272,6 +879,174 @@ struct AnnotationGeometry {
     };
 }
 
+[[nodiscard]] inline RectI constrained_selection_rect(
+    POINT anchor,
+    POINT cursor,
+    RectI bounds,
+    bool constrain_square,
+    bool from_center) noexcept {
+    bounds = bounds.normalized();
+    if (bounds.empty()) {
+        return {};
+    }
+
+    anchor.x = std::clamp(
+        anchor.x,
+        static_cast<long>(bounds.left),
+        static_cast<long>(bounds.right));
+    anchor.y = std::clamp(
+        anchor.y,
+        static_cast<long>(bounds.top),
+        static_cast<long>(bounds.bottom));
+    const POINT local_anchor{
+        anchor.x - bounds.left,
+        anchor.y - bounds.top,
+    };
+    const POINT local_cursor{
+        cursor.x - bounds.left,
+        cursor.y - bounds.top,
+    };
+    const AnnotationGeometry geometry = fit_annotation_geometry_to_canvas(
+        constrained_annotation_geometry(
+            Tool::rectangle,
+            local_anchor,
+            local_cursor,
+            constrain_square,
+            from_center),
+        local_anchor,
+        bounds.width(),
+        bounds.height(),
+        from_center,
+        constrain_square);
+    return RectI{
+        static_cast<int>(geometry.start.x) + bounds.left,
+        static_cast<int>(geometry.start.y) + bounds.top,
+        static_cast<int>(geometry.end.x) + bounds.left,
+        static_cast<int>(geometry.end.y) + bounds.top,
+    }.normalized();
+}
+
+[[nodiscard]] inline RectI resize_selection_from_corner(
+    RectI original,
+    DragMode mode,
+    POINT cursor,
+    RectI bounds,
+    bool preserve_aspect,
+    bool from_center) noexcept {
+    original = original.normalized();
+    bounds = bounds.normalized();
+    const bool moves_left =
+        mode == DragMode::top_left || mode == DragMode::bottom_left;
+    const bool moves_right =
+        mode == DragMode::top_right || mode == DragMode::bottom_right;
+    const bool moves_top =
+        mode == DragMode::top_left || mode == DragMode::top_right;
+    const bool moves_bottom =
+        mode == DragMode::bottom_left || mode == DragMode::bottom_right;
+    if ((!moves_left && !moves_right) || (!moves_top && !moves_bottom) ||
+        original.empty() || bounds.empty()) {
+        return original;
+    }
+
+    POINT anchor{};
+    if (from_center) {
+        anchor = {
+            original.left + original.width() / 2,
+            original.top + original.height() / 2,
+        };
+    } else {
+        anchor = {
+            moves_left ? original.right : original.left,
+            moves_top ? original.bottom : original.top,
+        };
+    }
+
+    long delta_x = cursor.x - anchor.x;
+    long delta_y = cursor.y - anchor.y;
+    if (preserve_aspect && original.height() > 0) {
+        const double aspect =
+            static_cast<double>(original.width()) /
+            static_cast<double>(original.height());
+        long absolute_x = std::abs(delta_x);
+        long absolute_y = std::abs(delta_y);
+        if (static_cast<double>(absolute_x) >=
+            static_cast<double>(absolute_y) * aspect) {
+            absolute_y = static_cast<long>(std::lround(
+                static_cast<double>(absolute_x) / aspect));
+        } else {
+            absolute_x = static_cast<long>(std::lround(
+                static_cast<double>(absolute_y) * aspect));
+        }
+        const long sign_x =
+            delta_x < 0 ? -1L : (delta_x > 0 ? 1L : (moves_left ? -1L : 1L));
+        const long sign_y =
+            delta_y < 0 ? -1L : (delta_y > 0 ? 1L : (moves_top ? -1L : 1L));
+        delta_x = absolute_x * sign_x;
+        delta_y = absolute_y * sign_y;
+    }
+
+    const POINT local_anchor{
+        anchor.x - bounds.left,
+        anchor.y - bounds.top,
+    };
+    AnnotationGeometry geometry{};
+    if (from_center) {
+        geometry = {
+            {local_anchor.x - delta_x, local_anchor.y - delta_y},
+            {local_anchor.x + delta_x, local_anchor.y + delta_y},
+        };
+    } else {
+        geometry = {
+            local_anchor,
+            {local_anchor.x + delta_x, local_anchor.y + delta_y},
+        };
+    }
+    geometry = fit_annotation_geometry_to_canvas(
+        geometry,
+        local_anchor,
+        bounds.width(),
+        bounds.height(),
+        from_center,
+        preserve_aspect);
+    return RectI{
+        static_cast<int>(geometry.start.x) + bounds.left,
+        static_cast<int>(geometry.start.y) + bounds.top,
+        static_cast<int>(geometry.end.x) + bounds.left,
+        static_cast<int>(geometry.end.y) + bounds.top,
+    }.normalized();
+}
+
+[[nodiscard]] inline int keyboard_selection_step(
+    bool accelerated) noexcept {
+    return accelerated ? 10 : 1;
+}
+
+[[nodiscard]] inline RectI translate_selection_within_bounds(
+    RectI selection,
+    int delta_x,
+    int delta_y,
+    RectI bounds) noexcept {
+    selection = selection.normalized();
+    bounds = bounds.normalized();
+    if (selection.empty() || bounds.empty()) {
+        return selection;
+    }
+    const int width = selection.width();
+    const int height = selection.height();
+    if (width > bounds.width() || height > bounds.height()) {
+        return selection;
+    }
+    const int left = std::clamp(
+        selection.left + delta_x,
+        bounds.left,
+        bounds.right - width);
+    const int top = std::clamp(
+        selection.top + delta_y,
+        bounds.top,
+        bounds.bottom - height);
+    return {left, top, left + width, top + height};
+}
+
 [[nodiscard]] inline RectI annotation_bounds(
     const Annotation& annotation) noexcept {
     if (!annotation.points.empty()) {
@@ -287,17 +1062,10 @@ struct AnnotationGeometry {
             bounds.right = std::max(bounds.right, static_cast<int>(point.x));
             bounds.bottom = std::max(bounds.bottom, static_cast<int>(point.y));
         }
-        float radius_scale = 0.5F;
-        if (annotation.tool == Tool::mosaic ||
-            annotation.tool == Tool::blur) {
-            radius_scale = 3.5F;
-        } else if (annotation.tool == Tool::highlight) {
-            radius_scale = 1.7F;
-        }
         const int radius = std::max(
             2,
             static_cast<int>(
-                std::ceil(annotation.width * radius_scale)));
+                std::ceil(annotation_visual_radius(annotation))));
         bounds.left -= radius;
         bounds.top -= radius;
         bounds.right += radius + 1;
@@ -306,6 +1074,9 @@ struct AnnotationGeometry {
     }
 
     if (annotation.tool == Tool::text) {
+        if (!annotation.measured_text_bounds.empty()) {
+            return annotation.measured_text_bounds;
+        }
         std::size_t line_count = 1;
         double current_line = 0.0;
         double longest_line = 0.0;
@@ -331,17 +1102,27 @@ struct AnnotationGeometry {
             18,
             static_cast<int>(std::ceil(
                 line_count * std::max(1.0F, annotation.width) * 1.35F)));
-        return {
+        RectI bounds{
             annotation.start.x,
             annotation.start.y,
             annotation.start.x + width,
             annotation.start.y + height,
         };
+        if (annotation.text_style == TextStyle::dark) {
+            bounds.right += 8;
+            bounds.bottom += 6;
+        } else if (annotation.text_style == TextStyle::outline) {
+            bounds.left -= 2;
+            bounds.top -= 2;
+            bounds.right += 2;
+            bounds.bottom += 2;
+        }
+        return bounds;
     }
 
     if (annotation.tool == Tool::serial) {
         const int radius = static_cast<int>(
-            std::ceil(8.0F + annotation.width * 1.5F));
+            std::ceil(annotation_visual_radius(annotation)));
         return {
             annotation.start.x - radius,
             annotation.start.y - radius,
@@ -361,7 +1142,8 @@ struct AnnotationGeometry {
     if (annotation.tool == Tool::arrow) {
         padding = std::max(
             padding,
-            static_cast<int>(std::ceil(10.0F + annotation.width * 2.0F)));
+            static_cast<int>(std::ceil(
+                arrow_head_length(annotation.width))));
     }
     if (annotation.tool == Tool::rectangle ||
         annotation.tool == Tool::ellipse ||
@@ -526,6 +1308,12 @@ inline void translate_annotation(
         point.x += delta_x;
         point.y += delta_y;
     }
+    if (!annotation.measured_text_bounds.empty()) {
+        annotation.measured_text_bounds.left += delta_x;
+        annotation.measured_text_bounds.right += delta_x;
+        annotation.measured_text_bounds.top += delta_y;
+        annotation.measured_text_bounds.bottom += delta_y;
+    }
 }
 
 [[nodiscard]] inline POINT clamp_annotation_translation(
@@ -574,7 +1362,8 @@ inline void translate_annotation(
     POINT cursor,
     int canvas_width,
     int canvas_height,
-    bool preserve_aspect = false) noexcept {
+    bool preserve_aspect = false,
+    bool from_center = false) noexcept {
     constexpr int kMinimumExtent = 2;
     if (handle == AnnotationHandle::none ||
         canvas_width <= 0 ||
@@ -596,6 +1385,43 @@ inline void translate_annotation(
         (handle == AnnotationHandle::start_point ||
          handle == AnnotationHandle::end_point)) {
         Annotation updated = original;
+        if (from_center) {
+            const long center_sum_x = original.start.x + original.end.x;
+            const long center_sum_y = original.start.y + original.end.y;
+            cursor.x = std::clamp(
+                cursor.x,
+                std::max(0L, center_sum_x - canvas_width),
+                std::min(static_cast<long>(canvas_width), center_sum_x));
+            cursor.y = std::clamp(
+                cursor.y,
+                std::max(0L, center_sum_y - canvas_height),
+                std::min(static_cast<long>(canvas_height), center_sum_y));
+            const POINT opposite{
+                center_sum_x - cursor.x,
+                center_sum_y - cursor.y,
+            };
+            if (std::hypot(
+                    static_cast<double>(cursor.x - opposite.x),
+                    static_cast<double>(cursor.y - opposite.y)) <
+                static_cast<double>(kMinimumExtent)) {
+                return original;
+            }
+            if (handle == AnnotationHandle::start_point) {
+                updated.start = cursor;
+                updated.end = opposite;
+            } else {
+                updated.start = opposite;
+                updated.end = cursor;
+            }
+            const POINT correction = clamp_annotation_translation(
+                updated,
+                0,
+                0,
+                canvas_width,
+                canvas_height);
+            translate_annotation(updated, correction.x, correction.y);
+            return updated;
+        }
         const POINT fixed =
             handle == AnnotationHandle::start_point
                 ? original.end
@@ -674,21 +1500,86 @@ inline void translate_annotation(
         (moves_left || moves_right) &&
         (moves_top || moves_bottom);
 
+    const auto centered_axis = [kMinimumExtent](
+                                   int source_minimum,
+                                   int source_maximum,
+                                   int safe_minimum,
+                                   int safe_maximum,
+                                   int requested,
+                                   bool moves_minimum,
+                                   bool moves_maximum,
+                                   int* target_minimum,
+                                   int* target_maximum) noexcept {
+        if ((!moves_minimum && !moves_maximum) ||
+            source_maximum - source_minimum < kMinimumExtent) {
+            return true;
+        }
+        const int center_sum = source_minimum + source_maximum;
+        if (moves_minimum) {
+            const int minimum = std::max(
+                safe_minimum,
+                center_sum - safe_maximum);
+            const int maximum =
+                (center_sum - kMinimumExtent) / 2;
+            if (minimum > maximum) {
+                return false;
+            }
+            *target_minimum = std::clamp(requested, minimum, maximum);
+            *target_maximum = center_sum - *target_minimum;
+        } else {
+            const int minimum =
+                (center_sum + kMinimumExtent + 1) / 2;
+            const int maximum = std::min(
+                safe_maximum,
+                center_sum - safe_minimum);
+            if (minimum > maximum) {
+                return false;
+            }
+            *target_maximum = std::clamp(requested, minimum, maximum);
+            *target_minimum = center_sum - *target_maximum;
+        }
+        return true;
+    };
+
     if (preserve_aspect && corner &&
         source.width() >= kMinimumExtent &&
         source.height() >= kMinimumExtent) {
-        const int fixed_x = moves_left ? source.right : source.left;
-        const int fixed_y = moves_top ? source.bottom : source.top;
+        const int fixed_x = from_center
+                                ? source.left + source.right
+                                : (moves_left ? source.right : source.left);
+        const int fixed_y = from_center
+                                ? source.top + source.bottom
+                                : (moves_top ? source.bottom : source.top);
         const int x_sign = moves_left ? -1 : 1;
         const int y_sign = moves_top ? -1 : 1;
-        const int requested_width = std::abs(
-            static_cast<int>(cursor.x) - fixed_x);
-        const int requested_height = std::abs(
-            static_cast<int>(cursor.y) - fixed_y);
-        const int maximum_width =
-            x_sign < 0 ? fixed_x - safe_left : safe_right - fixed_x;
-        const int maximum_height =
-            y_sign < 0 ? fixed_y - safe_top : safe_bottom - fixed_y;
+        const int requested_width = from_center
+                                        ? std::abs(
+                                              static_cast<int>(cursor.x) * 2 -
+                                              fixed_x)
+                                        : std::abs(
+                                              static_cast<int>(cursor.x) -
+                                              fixed_x);
+        const int requested_height = from_center
+                                         ? std::abs(
+                                               static_cast<int>(cursor.y) * 2 -
+                                               fixed_y)
+                                         : std::abs(
+                                               static_cast<int>(cursor.y) -
+                                               fixed_y);
+        const int maximum_width = from_center
+                                      ? std::min(
+                                            fixed_x - safe_left * 2,
+                                            safe_right * 2 - fixed_x)
+                                      : (x_sign < 0
+                                             ? fixed_x - safe_left
+                                             : safe_right - fixed_x);
+        const int maximum_height = from_center
+                                       ? std::min(
+                                             fixed_y - safe_top * 2,
+                                             safe_bottom * 2 - fixed_y)
+                                       : (y_sign < 0
+                                              ? fixed_y - safe_top
+                                              : safe_bottom - fixed_y);
         const double minimum_scale = std::max(
             static_cast<double>(kMinimumExtent) / source.width(),
             static_cast<double>(kMinimumExtent) / source.height());
@@ -713,10 +1604,64 @@ inline void translate_annotation(
         const int target_height = std::max(
             kMinimumExtent,
             static_cast<int>(std::lround(source.height() * scale)));
-        if (moves_left) left = fixed_x - target_width;
-        else right = fixed_x + target_width;
-        if (moves_top) top = fixed_y - target_height;
-        else bottom = fixed_y + target_height;
+        if (from_center) {
+            const int requested_x = moves_left
+                                        ? (fixed_x - target_width) / 2
+                                        : (fixed_x + target_width + 1) / 2;
+            const int requested_y = moves_top
+                                        ? (fixed_y - target_height) / 2
+                                        : (fixed_y + target_height + 1) / 2;
+            if (!centered_axis(
+                    source.left,
+                    source.right,
+                    safe_left,
+                    safe_right,
+                    requested_x,
+                    moves_left,
+                    moves_right,
+                    &left,
+                    &right) ||
+                !centered_axis(
+                    source.top,
+                    source.bottom,
+                    safe_top,
+                    safe_bottom,
+                    requested_y,
+                    moves_top,
+                    moves_bottom,
+                    &top,
+                    &bottom)) {
+                return original;
+            }
+        } else {
+            if (moves_left) left = fixed_x - target_width;
+            else right = fixed_x + target_width;
+            if (moves_top) top = fixed_y - target_height;
+            else bottom = fixed_y + target_height;
+        }
+    } else if (from_center) {
+        if (!centered_axis(
+                source.left,
+                source.right,
+                safe_left,
+                safe_right,
+                static_cast<int>(cursor.x),
+                moves_left,
+                moves_right,
+                &left,
+                &right) ||
+            !centered_axis(
+                source.top,
+                source.bottom,
+                safe_top,
+                safe_bottom,
+                static_cast<int>(cursor.y),
+                moves_top,
+                moves_bottom,
+                &top,
+                &bottom)) {
+            return original;
+        }
     } else {
         if (moves_left && source.width() >= kMinimumExtent) {
             if (safe_left > right - kMinimumExtent) {
@@ -907,6 +1852,112 @@ inline void translate_annotation(
         }
     }
     return result;
+}
+
+[[nodiscard]] inline bool append_stroke_point_bounded(
+    std::vector<POINT>& points,
+    POINT point,
+    double minimum_distance,
+    std::size_t maximum_points = 200000) {
+    maximum_points = std::max<std::size_t>(1, maximum_points);
+    if (points.empty()) {
+        points.push_back(point);
+        return true;
+    }
+    if (points.size() >= maximum_points) {
+        return false;
+    }
+    const double safe_distance =
+        std::isfinite(minimum_distance)
+            ? std::max(0.0, minimum_distance)
+            : 0.0;
+    const double delta_x =
+        static_cast<double>(point.x - points.back().x);
+    const double delta_y =
+        static_cast<double>(point.y - points.back().y);
+    if (std::hypot(delta_x, delta_y) < safe_distance) {
+        return false;
+    }
+    points.push_back(point);
+    return true;
+}
+
+[[nodiscard]] inline std::vector<POINT> smooth_polyline(
+    const std::vector<POINT>& points,
+    unsigned int passes = 2,
+    std::size_t maximum_points = 200000) {
+    if (points.size() <= 2 || passes == 0) {
+        return points;
+    }
+    maximum_points = std::max<std::size_t>(2, maximum_points);
+    std::vector<POINT> current = points;
+    if (current.size() > maximum_points) {
+        current.resize(maximum_points);
+        current.back() = points.back();
+    }
+    for (unsigned int pass = 0; pass < passes; ++pass) {
+        std::vector<POINT> next;
+        next.reserve(current.size());
+        next.push_back(current.front());
+        for (std::size_t index = 1;
+             index + 1 < current.size() && next.size() + 1 < maximum_points;
+             ++index) {
+            const POINT smoothed{
+                static_cast<long>(std::lround(
+                    (static_cast<double>(current[index - 1].x) +
+                     2.0 * static_cast<double>(current[index].x) +
+                     static_cast<double>(current[index + 1].x)) /
+                    4.0)),
+                static_cast<long>(std::lround(
+                    (static_cast<double>(current[index - 1].y) +
+                     2.0 * static_cast<double>(current[index].y) +
+                     static_cast<double>(current[index + 1].y)) /
+                    4.0)),
+            };
+            if (smoothed.x != next.back().x ||
+                smoothed.y != next.back().y) {
+                next.push_back(smoothed);
+            }
+        }
+        if (current.back().x != next.back().x ||
+            current.back().y != next.back().y) {
+            next.push_back(current.back());
+        }
+        current = std::move(next);
+        if (current.size() <= 2) {
+            break;
+        }
+    }
+    return current;
+}
+
+inline void normalize_annotation_stroke(Annotation& annotation) {
+    if ((annotation.tool != Tool::pen &&
+         annotation.tool != Tool::highlight &&
+         annotation.tool != Tool::mosaic &&
+         annotation.tool != Tool::blur) ||
+        annotation.points.size() <= 1) {
+        return;
+    }
+    const double spacing =
+        annotation.tool == Tool::mosaic || annotation.tool == Tool::blur
+            ? std::max(
+                  2.0,
+                  static_cast<double>(annotation.width) * 1.75)
+            : (annotation.tool == Tool::pen
+                   ? std::clamp(
+                         static_cast<double>(annotation.width) * 0.35,
+                         1.5,
+                         4.0)
+                   : 2.0);
+    annotation.points = resample_polyline(annotation.points, spacing);
+    if (annotation.tool == Tool::pen) {
+        annotation.points = smooth_polyline(annotation.points, 2);
+    }
+    if (!annotation.points.empty()) {
+        annotation.start = annotation.points.front();
+        annotation.end = annotation.points.back();
+    }
 }
 
 [[nodiscard]] inline int next_serial_number(

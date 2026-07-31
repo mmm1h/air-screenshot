@@ -258,6 +258,38 @@ void test_highlight_alpha_is_sampling_independent() {
            L"highlight center applies configured alpha exactly once");
     expect(channel(sparse_result, 32, 16, 3) == 255,
            L"highlight output remains opaque");
+
+    Annotation self_overlapping = sparse;
+    self_overlapping.points = {
+        {4, 16}, {59, 16}, {4, 16}, {59, 16}, {4, 16}};
+    const auto self_overlapping_result =
+        airshot::overlay_detail::render_annotations(
+            solid_bitmap(64, 32, RGB(255, 255, 255)),
+            {self_overlapping},
+            config);
+    expect(
+        self_overlapping_result.valid() &&
+            channel(self_overlapping_result, 32, 16, 0) == 159 &&
+            channel(self_overlapping_result, 32, 16, 1) == 159 &&
+            channel(self_overlapping_result, 32, 16, 2) == 159,
+        L"dense and self-crossing highlight strokes apply alpha once through one coverage mask");
+
+    Annotation normalized_sparse = sparse;
+    Annotation normalized_dense = dense;
+    airshot::overlay_detail::normalize_annotation_stroke(normalized_sparse);
+    airshot::overlay_detail::normalize_annotation_stroke(normalized_dense);
+    const bool same_normalized_points =
+        normalized_sparse.points.size() == normalized_dense.points.size() &&
+        std::equal(
+            normalized_sparse.points.begin(),
+            normalized_sparse.points.end(),
+            normalized_dense.points.begin(),
+            [](POINT left, POINT right) {
+                return left.x == right.x && left.y == right.y;
+            });
+    expect(
+        same_normalized_points,
+        L"highlight preview and commit normalization is independent of pointer event density");
 }
 
 void test_effect_strokes_are_sampling_independent() {
@@ -321,6 +353,120 @@ void test_effect_strokes_are_sampling_independent() {
     }
 }
 
+void test_text_measurement_matches_final_gdi_rendering() {
+    using airshot::overlay_detail::Annotation;
+    using airshot::overlay_detail::TextStyle;
+    using airshot::overlay_detail::Tool;
+
+    airshot::AppConfig config;
+    config.text_font_family = L"Microsoft YaHei";
+    config.text_font_bold = true;
+    config.text_font_italic = true;
+
+    Annotation latin;
+    latin.tool = Tool::text;
+    latin.start = {24, 20};
+    latin.end = latin.start;
+    latin.text = L"Air Screenshot 2026";
+    latin.color = RGB(0, 0, 0);
+    latin.width = 24.0F;
+    expect(
+        airshot::overlay_detail::refresh_text_annotation_bounds(
+            latin, config) &&
+            !latin.measured_text_bounds.empty(),
+        L"bold italic Latin text is measured through the final GDI typography path");
+    const auto measured_latin =
+        airshot::overlay_detail::measure_text_annotation_bounds(latin, config);
+    const auto latin_bounds =
+        airshot::overlay_detail::annotation_bounds(latin);
+    expect(
+        measured_latin.left == latin_bounds.left &&
+            measured_latin.top == latin_bounds.top &&
+            measured_latin.right == latin_bounds.right &&
+            measured_latin.bottom == latin_bounds.bottom,
+        L"cached text selection bounds exactly match a fresh GDI measurement");
+
+    Annotation cjk_single = latin;
+    cjk_single.text = L"截图工具";
+    cjk_single.measured_text_bounds = {};
+    Annotation cjk_multiline = latin;
+    cjk_multiline.text = L"截图工具\nAir 2026";
+    cjk_multiline.measured_text_bounds = {};
+    expect(
+        airshot::overlay_detail::refresh_text_annotation_bounds(
+            cjk_single, config) &&
+            airshot::overlay_detail::refresh_text_annotation_bounds(
+                cjk_multiline, config) &&
+            cjk_single.measured_text_bounds.width() > 0 &&
+            cjk_multiline.measured_text_bounds.width() > 0 &&
+            cjk_multiline.measured_text_bounds.height() >
+                cjk_single.measured_text_bounds.height(),
+        L"GDI measurement handles CJK and mixed multiline text with bold italic typography");
+
+    Annotation normal = cjk_multiline;
+    normal.text_style = TextStyle::normal;
+    normal.measured_text_bounds = {};
+    Annotation dark = normal;
+    dark.text_style = TextStyle::dark;
+    Annotation outline = normal;
+    outline.text_style = TextStyle::outline;
+    const bool measured_styles =
+        airshot::overlay_detail::refresh_text_annotation_bounds(
+            normal, config) &&
+        airshot::overlay_detail::refresh_text_annotation_bounds(
+            dark, config) &&
+        airshot::overlay_detail::refresh_text_annotation_bounds(
+            outline, config);
+    expect(
+        measured_styles &&
+            dark.measured_text_bounds.left ==
+                normal.measured_text_bounds.left &&
+            dark.measured_text_bounds.top ==
+                normal.measured_text_bounds.top &&
+            dark.measured_text_bounds.right >=
+                normal.measured_text_bounds.right &&
+            dark.measured_text_bounds.right <=
+                normal.measured_text_bounds.right + 8 &&
+            dark.measured_text_bounds.bottom ==
+                normal.measured_text_bounds.bottom + 6 &&
+            outline.measured_text_bounds.left ==
+                normal.measured_text_bounds.left - 2 &&
+            outline.measured_text_bounds.top ==
+                normal.measured_text_bounds.top - 2 &&
+            outline.measured_text_bounds.right ==
+                normal.measured_text_bounds.right + 2 &&
+            outline.measured_text_bounds.bottom ==
+                normal.measured_text_bounds.bottom + 2,
+        L"normal, dark, and outline measurements include the exact final-render padding");
+
+    const auto rendered = airshot::overlay_detail::render_annotations(
+        solid_bitmap(320, 160, RGB(255, 255, 255)),
+        {latin},
+        config);
+    bool changed_pixel = false;
+    bool changed_outside_measurement = false;
+    if (rendered.valid()) {
+        for (int y = 0; y < rendered.height; ++y) {
+            for (int x = 0; x < rendered.width; ++x) {
+                const bool changed =
+                    channel(rendered, x, y, 0) != 255 ||
+                    channel(rendered, x, y, 1) != 255 ||
+                    channel(rendered, x, y, 2) != 255;
+                if (!changed) {
+                    continue;
+                }
+                changed_pixel = true;
+                if (!latin.measured_text_bounds.contains(POINT{x, y})) {
+                    changed_outside_measurement = true;
+                }
+            }
+        }
+    }
+    expect(
+        rendered.valid() && changed_pixel && !changed_outside_measurement,
+        L"final GDI text pixels stay inside the bounds used for selection and hit testing");
+}
+
 void test_single_click_pen_draws_dot() {
     using airshot::overlay_detail::Annotation;
     using airshot::overlay_detail::Tool;
@@ -374,6 +520,92 @@ void test_shape_tools_are_outline_only() {
                channel(result, 48, 16, 1) == 255 &&
                channel(result, 48, 16, 2) == 255,
            L"ellipse interior remains transparent");
+}
+
+void test_product_shape_styles_and_zero_strength_effects() {
+    using airshot::overlay_detail::Annotation;
+    using airshot::overlay_detail::ShapeFillStyle;
+    using airshot::overlay_detail::StrokePattern;
+    using airshot::overlay_detail::Tool;
+
+    Annotation filled_rectangle;
+    filled_rectangle.tool = Tool::rectangle;
+    filled_rectangle.start = {4, 4};
+    filled_rectangle.end = {36, 36};
+    filled_rectangle.color = RGB(255, 0, 0);
+    filled_rectangle.width = 2.0F;
+    filled_rectangle.fill_style = ShapeFillStyle::translucent;
+
+    Annotation rounded_rectangle = filled_rectangle;
+    rounded_rectangle.start = {44, 4};
+    rounded_rectangle.end = {76, 36};
+    rounded_rectangle.rounded_rectangle = true;
+
+    Annotation filled_ellipse = filled_rectangle;
+    filled_ellipse.tool = Tool::ellipse;
+    filled_ellipse.start = {84, 4};
+    filled_ellipse.end = {116, 36};
+
+    const auto filled = airshot::overlay_detail::render_annotations(
+        solid_bitmap(120, 40, RGB(255, 255, 255)),
+        {filled_rectangle, rounded_rectangle, filled_ellipse},
+        airshot::AppConfig{});
+    expect(filled.valid(), L"translucent shape rendering succeeds");
+    expect(
+        channel(filled, 20, 20, 2) == 255 &&
+            channel(filled, 20, 20, 1) == 191 &&
+            channel(filled, 20, 20, 0) == 191 &&
+            channel(filled, 100, 20, 1) == 191,
+        L"rectangle and ellipse use the same exact 25 percent fill");
+    expect(
+        channel(filled, 45, 5, 0) == 255 &&
+            channel(filled, 45, 5, 1) == 255 &&
+            channel(filled, 45, 5, 2) == 255,
+        L"rounded rectangle leaves its outside corner untouched");
+
+    Annotation dashed_line;
+    dashed_line.tool = Tool::line;
+    dashed_line.start = {4, 8};
+    dashed_line.end = {91, 8};
+    dashed_line.color = RGB(0, 0, 0);
+    dashed_line.width = 2.0F;
+    dashed_line.stroke_pattern = StrokePattern::dashed;
+    const auto dashed = airshot::overlay_detail::render_annotations(
+        solid_bitmap(96, 16, RGB(255, 255, 255)),
+        {dashed_line},
+        airshot::AppConfig{});
+    int dark_pixels = 0;
+    int light_pixels = 0;
+    if (dashed.valid()) {
+        for (int x = 5; x < 91; ++x) {
+            if (channel(dashed, x, 8, 0) < 64) {
+                ++dark_pixels;
+            } else if (channel(dashed, x, 8, 0) > 240) {
+                ++light_pixels;
+            }
+        }
+    }
+    expect(
+        dashed.valid() && dark_pixels > 0 && light_pixels > 0,
+        L"dashed strokes contain visible marks and gaps");
+
+    const auto base = patterned_bitmap(64, 32);
+    for (const Tool tool : {Tool::mosaic, Tool::blur}) {
+        Annotation zero_strength;
+        zero_strength.tool = tool;
+        zero_strength.points = {{8, 16}, {56, 16}};
+        zero_strength.width = 8.0F;
+        zero_strength.alpha = 0;
+        const auto result = airshot::overlay_detail::render_annotations(
+            base,
+            {zero_strength},
+            airshot::AppConfig{});
+        expect(
+            result.valid() && result.pixels == base.pixels,
+            tool == Tool::mosaic
+                ? L"zero-strength mosaic is visibly a no-op"
+                : L"zero-strength blur is visibly a no-op");
+    }
 }
 
 void test_overlay_close_lifecycle() {
@@ -487,6 +719,168 @@ void test_text_prompt_supports_editing_existing_text() {
         L"text prompt commits edited multiline text");
     if (IsWindow(prompt)) {
         DestroyWindow(prompt);
+    }
+}
+
+void test_text_prompt_uses_annotation_typography_and_style() {
+    bool completed = false;
+    const HWND prompt = airshot::overlay_detail::show_text_prompt(
+        nullptr,
+        POINT{20, 20},
+        RGB(255, 0, 0),
+        22.0F,
+        true,
+        [&](std::optional<std::wstring>) { completed = true; },
+        L"styled",
+        L"Consolas",
+        true,
+        true,
+        airshot::overlay_detail::TextStyle::dark);
+    expect(prompt != nullptr, L"styled text prompt is created");
+    if (!prompt) {
+        return;
+    }
+
+    const HWND edit = GetDlgItem(prompt, 100);
+    const HFONT font = edit
+                           ? reinterpret_cast<HFONT>(
+                                 SendMessageW(edit, WM_GETFONT, 0, 0))
+                           : nullptr;
+    LOGFONTW description{};
+    const int font_bytes = font
+                               ? GetObjectW(
+                                     font,
+                                     static_cast<int>(sizeof(description)),
+                                     &description)
+                               : 0;
+    expect(
+        edit != nullptr && font_bytes == sizeof(description) &&
+            _wcsicmp(description.lfFaceName, L"Consolas") == 0 &&
+            description.lfWeight == FW_BOLD && description.lfItalic != 0,
+        L"text prompt uses configured font family, bold, italic, and size");
+
+    COLORREF prompt_text_color = CLR_INVALID;
+    COLORREF prompt_background = CLR_INVALID;
+    if (edit) {
+        HDC dc = GetDC(edit);
+        if (dc) {
+            SendMessageW(
+                prompt,
+                WM_CTLCOLOREDIT,
+                reinterpret_cast<WPARAM>(dc),
+                reinterpret_cast<LPARAM>(edit));
+            prompt_text_color = GetTextColor(dc);
+            prompt_background = GetBkColor(dc);
+            ReleaseDC(edit, dc);
+        }
+    }
+    expect(
+        prompt_text_color == RGB(255, 255, 255) &&
+            prompt_background == RGB(31, 35, 41),
+        L"dark text prompt matches the final dark annotation style");
+
+    SendMessageW(prompt, WM_COMMAND, MAKEWPARAM(IDCANCEL, 0), 0);
+    expect(completed && !IsWindow(prompt), L"styled text prompt closes cleanly");
+    if (IsWindow(prompt)) {
+        DestroyWindow(prompt);
+    }
+}
+
+void test_selection_size_prompt_validates_without_side_effects() {
+    bool completed = false;
+    std::optional<airshot::overlay_detail::SelectionSizeInput> result;
+    const HWND prompt =
+        airshot::overlay_detail::show_selection_size_prompt(
+            nullptr,
+            POINT{20, 20},
+            320,
+            180,
+            1920,
+            1080,
+            true,
+            [&](std::optional<
+                    airshot::overlay_detail::SelectionSizeInput> input) {
+                result = std::move(input);
+                completed = true;
+            });
+    expect(
+        prompt != nullptr,
+        L"selection size prompt is created for F2 dimension entry");
+    if (!prompt) {
+        return;
+    }
+
+    const HWND width = GetDlgItem(prompt, 201);
+    const HWND height = GetDlgItem(prompt, 202);
+    const HWND center = GetDlgItem(prompt, 203);
+    const HWND error = GetDlgItem(prompt, 204);
+    expect(
+        width && height && center && error &&
+            SendMessageW(center, BM_GETCHECK, 0, 0) == BST_CHECKED,
+        L"selection size prompt exposes numeric inputs and defaults to center anchoring");
+
+    if (width) {
+        SetWindowTextW(width, L"1");
+    }
+    SendMessageW(prompt, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+    expect(
+        IsWindow(prompt) && !completed &&
+            error && GetWindowTextLengthW(error) > 0,
+        L"invalid dimensions keep the prompt open and do not commit a selection change");
+
+    if (width) {
+        SetWindowTextW(width, L"640");
+    }
+    if (height) {
+        SetWindowTextW(height, L"480");
+    }
+    if (center) {
+        SendMessageW(center, BM_SETCHECK, BST_UNCHECKED, 0);
+    }
+    SendMessageW(prompt, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+    expect(
+        completed && result && result->width == 640 &&
+            result->height == 480 &&
+            result->anchor ==
+                airshot::SelectionSizeAnchor::top_left &&
+            !IsWindow(prompt),
+        L"valid dimensions commit once with the selected top-left anchor");
+    if (IsWindow(prompt)) {
+        DestroyWindow(prompt);
+    }
+
+    bool cancel_completed = false;
+    std::optional<airshot::overlay_detail::SelectionSizeInput> cancel_result;
+    const HWND cancel_prompt =
+        airshot::overlay_detail::show_selection_size_prompt(
+            nullptr,
+            POINT{20, 20},
+            100,
+            100,
+            1920,
+            1080,
+            false,
+            [&](std::optional<
+                    airshot::overlay_detail::SelectionSizeInput> input) {
+                cancel_result = std::move(input);
+                cancel_completed = true;
+            });
+    expect(
+        cancel_prompt != nullptr,
+        L"selection size prompt is created for cancellation testing");
+    if (cancel_prompt) {
+        SendMessageW(
+            cancel_prompt,
+            WM_COMMAND,
+            MAKEWPARAM(IDCANCEL, BN_CLICKED),
+            0);
+        expect(
+            cancel_completed && !cancel_result &&
+                !IsWindow(cancel_prompt),
+            L"cancelling size entry closes without changing the selection");
+        if (IsWindow(cancel_prompt)) {
+            DestroyWindow(cancel_prompt);
+        }
     }
 }
 
@@ -629,11 +1023,15 @@ int wmain() {
     test_ordered_annotation_rendering();
     test_highlight_alpha_is_sampling_independent();
     test_effect_strokes_are_sampling_independent();
+    test_text_measurement_matches_final_gdi_rendering();
     test_single_click_pen_draws_dot();
     test_shape_tools_are_outline_only();
+    test_product_shape_styles_and_zero_strength_effects();
     test_overlay_close_lifecycle();
     test_text_prompt_deactivation_cancels_draft();
     test_text_prompt_supports_editing_existing_text();
+    test_text_prompt_uses_annotation_typography_and_style();
+    test_selection_size_prompt_validates_without_side_effects();
     test_watermark_alpha();
     test_atomic_png_output();
     if (failures == 0) {

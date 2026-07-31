@@ -161,6 +161,7 @@ add_library(airshot_core STATIC
     src/core/bitmap.cpp
     src/core/capture.cpp
     src/core/capture_modern.cpp
+    src/core/capture_uia.cpp
     src/core/clipboard.cpp
     src/core/command.cpp
     src/core/common.cpp
@@ -178,6 +179,7 @@ add_library(airshot_core STATIC
     src/core/overlay_window.cpp
     src/core/pin_layout.cpp
     src/core/portable.cpp
+    src/core/region_policy.cpp
     src/core/ui_theme.cpp
     src/core/update_policy.cpp
 )
@@ -215,6 +217,7 @@ target_link_libraries(airshot_core PUBLIC
     ole32
     shell32
     shlwapi
+    uiautomationcore
     user32
     version
     windowsapp
@@ -263,10 +266,14 @@ if(BUILD_TESTING)
 
     airshot_add_test(airshot_tests tests/test_main.cpp)
     airshot_add_test(airshot_clipboard_tests tests/test_clipboard.cpp)
+    target_include_directories(airshot_clipboard_tests PRIVATE src/core)
     set_tests_properties(airshot_clipboard_tests PROPERTIES SKIP_RETURN_CODE 77)
     airshot_add_test(airshot_capture_tests tests/test_capture.cpp)
     target_include_directories(airshot_capture_tests PRIVATE src/core)
     set_tests_properties(airshot_capture_tests PROPERTIES SKIP_RETURN_CODE 77)
+    airshot_add_test(airshot_capture_uia_tests tests/test_capture_uia.cpp)
+    target_include_directories(airshot_capture_uia_tests PRIVATE src/core)
+    set_tests_properties(airshot_capture_uia_tests PROPERTIES SKIP_RETURN_CODE 77)
     airshot_add_test(airshot_command_config_tests tests/test_command_config.cpp)
     airshot_add_test(airshot_image_pipeline_tests tests/test_image_pipeline.cpp)
     target_include_directories(airshot_image_pipeline_tests PRIVATE src/core)
@@ -278,7 +285,20 @@ if(BUILD_TESTING)
     target_include_directories(airshot_portable_tests PRIVATE src/core)
     airshot_add_test(airshot_scroll_tests tests/test_scroll.cpp)
     target_link_libraries(airshot_scroll_tests PRIVATE comctl32)
+
+    airshot_add_test(airshot_pin_workflow_tests tests/test_pin_workflow.cpp)
+    airshot_add_test(airshot_host_policy_tests tests/test_host_policy.cpp)
     airshot_add_test(airshot_update_policy_tests tests/test_update_policy.cpp)
+
+    add_executable(airshot_settings_window_tests
+        tests/test_settings_window.cpp
+        src/host/app_icon.cpp
+        src/host/resources.rc
+    )
+    target_include_directories(airshot_settings_window_tests PRIVATE src/host)
+    airshot_apply_executable_policy(airshot_settings_window_tests)
+    target_link_libraries(airshot_settings_window_tests PRIVATE airshot_core)
+    add_test(NAME airshot_settings_window_tests COMMAND airshot_settings_window_tests)
 
     add_executable(airshot_settings_preview WIN32
         tests/settings_preview.cpp

@@ -184,7 +184,6 @@ int run_cli(std::span<const std::wstring> arguments) {
     const bool app_status = app && app->action == AppAction::status;
     const bool app_start = app && app->action == AppAction::start;
     const bool app_stop = app && app->action == AppAction::stop;
-    const bool app_settings = app && app->action == AppAction::settings;
 
     std::wstring request_json = parsed.request_json;
     bool pipe_available = pipe_is_available(0);
@@ -207,7 +206,10 @@ int run_cli(std::span<const std::wstring> arguments) {
             write_response(response, parsed.json);
             return static_cast<int>(response.code);
         }
-        const bool persistent = app_start || app_settings;
+        // Settings launches are transient until the host sees whether shell
+        // integration is enabled. This prevents cancelling settings with
+        // shell=false from leaving an invisible persistent process.
+        const bool persistent = app_start;
         std::wstring launch_nonce;
         if (!persistent) {
             launch_nonce = create_launch_nonce();

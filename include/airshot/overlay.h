@@ -32,6 +32,7 @@ struct RegionResult {
     Bitmap bitmap;
     RectI bounds;
     AppConfig config;
+    std::wstring topology_signature;
 };
 
 using RegionCaptureCompletion = std::function<void(RegionResult)>;

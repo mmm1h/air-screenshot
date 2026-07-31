@@ -78,6 +78,7 @@ ParsedCli local_result(std::wstring text, bool json_output) {
 std::wstring capture_mode_name(CaptureMode mode) {
     switch (mode) {
         case CaptureMode::region: return L"region";
+        case CaptureMode::repeat: return L"repeat";
         case CaptureMode::window: return L"window";
         case CaptureMode::screen: return L"screen";
     }
@@ -112,6 +113,16 @@ std::wstring module_action_name(ModuleAction action) {
     return L"list";
 }
 
+std::wstring pin_action_name(PinAction action) {
+    switch (action) {
+        case PinAction::clipboard: return L"clipboard";
+        case PinAction::file: return L"file";
+        case PinAction::restore_interaction: return L"restore";
+        case PinAction::toggle_interaction: return L"toggle";
+    }
+    return L"clipboard";
+}
+
 std::wstring module_name(ModuleId module) {
     switch (module) {
         case ModuleId::annotation: return L"annotation";
@@ -127,6 +138,7 @@ std::wstring app_action_name(AppAction action) {
         case AppAction::stop: return L"stop";
         case AppAction::status: return L"status";
         case AppAction::settings: return L"settings";
+        case AppAction::tray_show: return L"tray-show";
     }
     return L"status";
 }
@@ -299,13 +311,16 @@ std::wstring help_text() {
 
 用法:
   AirScreenshot.exe capture region [--output clipboard|file] [--path <路径>] [--json]
+  AirScreenshot.exe capture repeat [--output clipboard|file] [--path <路径>] [--json]
   AirScreenshot.exe capture window [--output clipboard|file] [--path <路径>] [--json]
   AirScreenshot.exe capture screen [--monitor all|primary|cursor|编号] [--output clipboard|file] [--path <路径>] [--json]
   AirScreenshot.exe ocr region [--copy] [--json]
-  AirScreenshot.exe pin clipboard|restore [--json]
+  AirScreenshot.exe pin clipboard|restore|toggle [--json]
+  AirScreenshot.exe pin file <本地图片路径> [--json]
   AirScreenshot.exe module list [--json]
   AirScreenshot.exe module enable|disable <annotation|ocr|shell> [--json]
   AirScreenshot.exe app start|stop|status|settings [--json]
+  AirScreenshot.exe app tray show [--json]
   AirScreenshot.exe --help [--json]
   AirScreenshot.exe --version [--json]
 
@@ -354,12 +369,14 @@ ParsedCli parse_cli(std::span<const std::wstring> arguments) {
 
     if (is_option(command_arguments[0], L"capture")) {
         if (command_arguments.size() < 2) {
-            return error_result(L"capture 需要 region、window 或 screen。", json_output);
+            return error_result(L"capture 需要 region、repeat、window 或 screen。", json_output);
         }
 
         CaptureCommand command;
         if (is_option(command_arguments[1], L"region")) {
             command.mode = CaptureMode::region;
+        } else if (is_option(command_arguments[1], L"repeat")) {
+            command.mode = CaptureMode::repeat;
         } else if (is_option(command_arguments[1], L"window")) {
             command.mode = CaptureMode::window;
         } else if (is_option(command_arguments[1], L"screen")) {
@@ -456,19 +473,43 @@ ParsedCli parse_cli(std::span<const std::wstring> arguments) {
     }
 
     if (is_option(command_arguments[0], L"pin")) {
-        if (command_arguments.size() != 2) {
+        if (command_arguments.size() < 2) {
             return error_result(
-                L"pin 需要且只接受 clipboard 或 restore。",
+                L"pin 需要 clipboard、file、restore 或 toggle 操作。",
                 json_output);
         }
         PinCommand command;
         if (is_option(command_arguments[1], L"clipboard")) {
+            if (command_arguments.size() != 2) {
+                return error_result(L"pin clipboard 不接受额外参数。", json_output);
+            }
             command.action = PinAction::clipboard;
+        } else if (is_option(command_arguments[1], L"file")) {
+            if (command_arguments.size() != 3 || command_arguments[2].empty()) {
+                return error_result(L"pin file 需要且只接受一个本地图片路径。", json_output);
+            }
+            std::error_code path_error;
+            command.path = std::filesystem::absolute(
+                std::filesystem::path(command_arguments[2]),
+                path_error);
+            if (path_error || command.path.empty()) {
+                return error_result(L"无法解析 pin file 的图片路径。", json_output);
+            }
+            command.path = command.path.lexically_normal();
+            command.action = PinAction::file;
         } else if (is_option(command_arguments[1], L"restore")) {
+            if (command_arguments.size() != 2) {
+                return error_result(L"pin restore 不接受额外参数。", json_output);
+            }
             command.action = PinAction::restore_interaction;
+        } else if (is_option(command_arguments[1], L"toggle")) {
+            if (command_arguments.size() != 2) {
+                return error_result(L"pin toggle 不接受额外参数。", json_output);
+            }
+            command.action = PinAction::toggle_interaction;
         } else {
             return error_result(
-                L"未知 pin 操作；只支持 clipboard 或 restore。",
+                L"未知 pin 操作；只支持 clipboard、file、restore 或 toggle。",
                 json_output);
         }
         return request_result(command, json_output);
@@ -509,8 +550,17 @@ ParsedCli parse_cli(std::span<const std::wstring> arguments) {
     }
 
     if (is_option(command_arguments[0], L"app")) {
+        if (command_arguments.size() == 3 &&
+            is_option(command_arguments[1], L"tray") &&
+            is_option(command_arguments[2], L"show")) {
+            AppCommand command;
+            command.action = AppAction::tray_show;
+            return request_result(command, json_output);
+        }
         if (command_arguments.size() != 2) {
-            return error_result(L"app 需要且只接受 start、stop、status 或 settings。", json_output);
+            return error_result(
+                L"app 支持 start、stop、status、settings 或 tray show。",
+                json_output);
         }
         AppCommand command;
         if (is_option(command_arguments[1], L"start")) {
@@ -573,10 +623,12 @@ std::wstring command_to_json(
                     request.SetNamedValue(L"command", JsonValue::CreateStringValue(L"pin"));
                     request.SetNamedValue(
                         L"action",
-                        JsonValue::CreateStringValue(
-                            value.action == PinAction::clipboard
-                                ? L"clipboard"
-                                : L"restore"));
+                        JsonValue::CreateStringValue(pin_action_name(value.action)));
+                    if (value.action == PinAction::file && !value.path.empty()) {
+                        request.SetNamedValue(
+                            L"path",
+                            JsonValue::CreateStringValue(value.path.wstring()));
+                    }
                 } else if constexpr (std::is_same_v<Value, ModuleCommand>) {
                     request.SetNamedValue(L"command", JsonValue::CreateStringValue(L"module"));
                     request.SetNamedValue(L"action", JsonValue::CreateStringValue(module_action_name(value.action)));
@@ -647,6 +699,8 @@ std::optional<Command> command_from_json(std::wstring_view json_text, std::wstri
             CaptureCommand command;
             if (mode == L"region") {
                 command.mode = CaptureMode::region;
+            } else if (mode == L"repeat") {
+                command.mode = CaptureMode::repeat;
             } else if (mode == L"window") {
                 command.mode = CaptureMode::window;
             } else if (mode == L"screen") {
@@ -732,7 +786,7 @@ std::optional<Command> command_from_json(std::wstring_view json_text, std::wstri
         if (command_name == L"pin") {
             if (!has_only_keys(
                     request,
-                    {L"v", L"json", L"command", L"action", L"launchNonce"})) {
+                    {L"v", L"json", L"command", L"action", L"path", L"launchNonce"})) {
                 set_command_error(error, L"pin 请求包含未知字段。");
                 return std::nullopt;
             }
@@ -743,12 +797,36 @@ std::optional<Command> command_from_json(std::wstring_view json_text, std::wstri
             PinCommand command;
             if (action == L"clipboard") {
                 command.action = PinAction::clipboard;
+            } else if (action == L"file") {
+                std::wstring path;
+                if (!read_required_string(request, L"path", path, error) ||
+                    path.empty()) {
+                    if (error && error->empty()) {
+                        *error = L"pin.file.path 不能为空。";
+                    }
+                    return std::nullopt;
+                }
+                const std::filesystem::path parsed_path(path);
+                if (!parsed_path.is_absolute()) {
+                    set_command_error(
+                        error,
+                        L"pin.file.path 必须是绝对路径。");
+                    return std::nullopt;
+                }
+                command.action = PinAction::file;
+                command.path = parsed_path.lexically_normal();
             } else if (action == L"restore") {
                 command.action = PinAction::restore_interaction;
+            } else if (action == L"toggle") {
+                command.action = PinAction::toggle_interaction;
             } else {
                 set_command_error(
                     error,
                     L"pin.action 不是受支持的枚举值。");
+                return std::nullopt;
+            }
+            if (command.action != PinAction::file && request.HasKey(L"path")) {
+                set_command_error(error, L"只有 pin file 可以包含 path。");
                 return std::nullopt;
             }
             return Command{command};
@@ -815,6 +893,8 @@ std::optional<Command> command_from_json(std::wstring_view json_text, std::wstri
                 command.action = AppAction::status;
             } else if (action == L"settings") {
                 command.action = AppAction::settings;
+            } else if (action == L"tray-show") {
+                command.action = AppAction::tray_show;
             } else {
                 set_command_error(error, L"app.action 不是受支持的枚举值。");
                 return std::nullopt;

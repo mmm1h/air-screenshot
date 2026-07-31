@@ -150,9 +150,11 @@ void OverlayWindow::discard_device_resources() noexcept {
     green_brush_.Reset();
     red_brush_.Reset();
     round_stroke_style_.Reset();
+    dashed_stroke_style_.Reset();
     rendered_annotations_.Reset();
     rendered_annotation_revision_ = 0;
     rendered_annotation_selection_ = {};
+    rendered_annotation_has_effect_preview_ = false;
     background_.Reset();
     render_target_.Reset();
 }
@@ -262,6 +264,18 @@ bool OverlayWindow::create_render_target() {
         discard_device_resources();
         return false;
     }
+    D2D1_STROKE_STYLE_PROPERTIES dashed_properties = stroke_properties;
+    dashed_properties.dashStyle = D2D1_DASH_STYLE_CUSTOM;
+    constexpr std::array<float, 2> dash_pattern{3.0F, 2.0F};
+    result = d2d_factory->CreateStrokeStyle(
+        dashed_properties,
+        dash_pattern.data(),
+        static_cast<UINT32>(dash_pattern.size()),
+        dashed_stroke_style_.GetAddressOf());
+    if (FAILED(result) || !dashed_stroke_style_) {
+        discard_device_resources();
+        return false;
+    }
     return true;
 }
 
@@ -290,32 +304,49 @@ RectI padded_buttons_bounds(const std::vector<ToolbarButton>& buttons, int paddi
     return bounds;
 }
 
-void OverlayWindow::draw_arrow(POINT start, POINT end, ID2D1Brush* brush, float width) {
+void OverlayWindow::draw_arrow(POINT start,
+                               POINT end,
+                               ID2D1Brush* brush,
+                               float width,
+                               ArrowHeadStyle head_style,
+                               ID2D1StrokeStyle* stroke_style) {
     const D2D1_POINT_2F first{
         static_cast<float>(start.x - monitor_.bounds.left), static_cast<float>(start.y - monitor_.bounds.top)};
     const D2D1_POINT_2F second{
         static_cast<float>(end.x - monitor_.bounds.left), static_cast<float>(end.y - monitor_.bounds.top)};
-    render_target_->DrawLine(first, second, brush, width);
-    const double angle = std::atan2(static_cast<double>(end.y - start.y), static_cast<double>(end.x - start.x));
-    const double length = 10.0 + width * 2.0;
-    for (double offset : {0.45, -0.45}) {
-        const POINT point{
-            end.x - static_cast<int>(std::cos(angle + offset) * length),
-            end.y - static_cast<int>(std::sin(angle + offset) * length),
+    render_target_->DrawLine(first, second, brush, width, stroke_style);
+    const auto draw_head = [&](POINT tip, POINT tail) {
+        const ArrowHeadWings wings = arrow_head_wings(tip, tail, width);
+        const D2D1_POINT_2F local_tip{
+            static_cast<float>(tip.x - monitor_.bounds.left),
+            static_cast<float>(tip.y - monitor_.bounds.top),
         };
-        render_target_->DrawLine(second,
-                                 D2D1::Point2F(static_cast<float>(point.x - monitor_.bounds.left),
-                                              static_cast<float>(point.y - monitor_.bounds.top)),
-                                 brush,
-                                 width);
+        for (const POINT wing : {wings.first, wings.second}) {
+            render_target_->DrawLine(
+                local_tip,
+                D2D1::Point2F(
+                    static_cast<float>(wing.x - monitor_.bounds.left),
+                    static_cast<float>(wing.y - monitor_.bounds.top)),
+                brush,
+                width,
+                stroke_style);
+        }
+    };
+    if (arrow_has_start_head(head_style)) {
+        draw_head(start, end);
+    }
+    if (arrow_has_end_head(head_style)) {
+        draw_head(end, start);
     }
 }
 
 bool OverlayWindow::draw_rendered_annotations() {
-    if (session_.annotations().empty()) {
+    const bool has_effect_preview = session_.effect_preview_active();
+    if (session_.annotations().empty() && !has_effect_preview) {
         rendered_annotations_.Reset();
-        rendered_annotation_revision_ = session_.annotation_revision();
+        rendered_annotation_revision_ = session_.rendered_source_revision();
         rendered_annotation_selection_ = session_.selection();
+        rendered_annotation_has_effect_preview_ = false;
         return true;
     }
 
@@ -326,9 +357,11 @@ bool OverlayWindow::draw_rendered_annotations() {
         selection.right == rendered_annotation_selection_.right &&
         selection.bottom == rendered_annotation_selection_.bottom;
     if (!rendered_annotations_ ||
-        rendered_annotation_revision_ != session_.annotation_revision() ||
+        rendered_annotation_revision_ != session_.rendered_source_revision() ||
+        rendered_annotation_has_effect_preview_ != has_effect_preview ||
         !same_selection) {
-        const Bitmap& rendered = session_.cached_rendered_selection();
+        const Bitmap& rendered =
+            session_.cached_rendered_selection_for_display();
         if (!rendered.valid()) {
             rendered_annotations_.Reset();
             return false;
@@ -352,8 +385,9 @@ bool OverlayWindow::draw_rendered_annotations() {
             return false;
         }
         rendered_annotations_ = std::move(next);
-        rendered_annotation_revision_ = session_.annotation_revision();
+        rendered_annotation_revision_ = session_.rendered_source_revision();
         rendered_annotation_selection_ = selection;
+        rendered_annotation_has_effect_preview_ = has_effect_preview;
     }
 
     const auto visible = intersect(selection, monitor_.bounds);
@@ -388,11 +422,18 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
 
     COLORREF color = annotation.color;
     float draw_width = annotation.width;
-    float alpha = annotation.tool == Tool::highlight ? std::clamp(annotation.alpha / 255.0F, 0.1F, 1.0F) : 1.0F;
+    float alpha = annotation.tool == Tool::highlight
+                      ? std::clamp(annotation.alpha / 255.0F, 0.0F, 1.0F)
+                      : 1.0F;
     if (preview) {
         color = session_.active_color();
         draw_width = session_.active_width();
-        alpha = annotation.tool == Tool::highlight ? std::clamp(session_.active_highlight_alpha() / 255.0F, 0.1F, 1.0F) : alpha;
+        alpha = annotation.tool == Tool::highlight
+                    ? std::clamp(
+                          session_.active_highlight_alpha() / 255.0F,
+                          0.0F,
+                          1.0F)
+                    : alpha;
     }
 
     ComPtr<ID2D1SolidColorBrush> brush;
@@ -406,38 +447,122 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
         return;
     }
 
+    ID2D1StrokeStyle* shape_stroke_style =
+        annotation.stroke_pattern == StrokePattern::dashed
+            ? dashed_stroke_style_.Get()
+            : round_stroke_style_.Get();
     if (annotation.tool == Tool::rectangle) {
-        render_target_->DrawRectangle(local_rect(RectI{start.x, start.y, end.x, end.y}.normalized()), brush.Get(), draw_width);
+        const RectI absolute_bounds =
+            RectI{start.x, start.y, end.x, end.y}.normalized();
+        const D2D1_RECT_F bounds = local_rect(absolute_bounds);
+        ComPtr<ID2D1SolidColorBrush> fill_brush;
+        if (annotation.fill_style == ShapeFillStyle::translucent &&
+            SUCCEEDED(render_target_->CreateSolidColorBrush(
+                D2D1::ColorF(
+                    GetRValue(color) / 255.0F,
+                    GetGValue(color) / 255.0F,
+                    GetBValue(color) / 255.0F,
+                    64.0F / 255.0F),
+                fill_brush.GetAddressOf())) &&
+            fill_brush) {
+            if (annotation.rounded_rectangle) {
+                const float radius = rounded_rectangle_radius(
+                    absolute_bounds,
+                    draw_width);
+                render_target_->FillRoundedRectangle(
+                    D2D1::RoundedRect(bounds, radius, radius),
+                    fill_brush.Get());
+            } else {
+                render_target_->FillRectangle(bounds, fill_brush.Get());
+            }
+        }
+        if (annotation.rounded_rectangle) {
+            const float radius = rounded_rectangle_radius(
+                absolute_bounds,
+                draw_width);
+            render_target_->DrawRoundedRectangle(
+                D2D1::RoundedRect(bounds, radius, radius),
+                brush.Get(),
+                draw_width,
+                shape_stroke_style);
+        } else {
+            render_target_->DrawRectangle(
+                bounds,
+                brush.Get(),
+                draw_width,
+                shape_stroke_style);
+        }
     } else if (annotation.tool == Tool::ellipse) {
         const D2D1_RECT_F rect = local_rect(RectI{start.x, start.y, end.x, end.y}.normalized());
-        render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F((rect.left + rect.right) / 2.0F, (rect.top + rect.bottom) / 2.0F),
-                                                  std::abs(rect.right - rect.left) / 2.0F,
-                                                  std::abs(rect.bottom - rect.top) / 2.0F),
-                                    brush.Get(),
-                                    draw_width);
+        const D2D1_ELLIPSE ellipse = D2D1::Ellipse(
+            D2D1::Point2F(
+                (rect.left + rect.right) / 2.0F,
+                (rect.top + rect.bottom) / 2.0F),
+            std::abs(rect.right - rect.left) / 2.0F,
+            std::abs(rect.bottom - rect.top) / 2.0F);
+        ComPtr<ID2D1SolidColorBrush> fill_brush;
+        if (annotation.fill_style == ShapeFillStyle::translucent &&
+            SUCCEEDED(render_target_->CreateSolidColorBrush(
+                D2D1::ColorF(
+                    GetRValue(color) / 255.0F,
+                    GetGValue(color) / 255.0F,
+                    GetBValue(color) / 255.0F,
+                    64.0F / 255.0F),
+                fill_brush.GetAddressOf())) &&
+            fill_brush) {
+            render_target_->FillEllipse(ellipse, fill_brush.Get());
+        }
+        render_target_->DrawEllipse(
+            ellipse,
+            brush.Get(),
+            draw_width,
+            shape_stroke_style);
     } else if (annotation.tool == Tool::line) {
         render_target_->DrawLine(D2D1::Point2F(static_cast<float>(start.x - monitor_.bounds.left),
                                                static_cast<float>(start.y - monitor_.bounds.top)),
                                  D2D1::Point2F(static_cast<float>(end.x - monitor_.bounds.left),
                                                static_cast<float>(end.y - monitor_.bounds.top)),
                                  brush.Get(),
-                                 draw_width);
+                                 draw_width,
+                                 shape_stroke_style);
     } else if (annotation.tool == Tool::arrow) {
-        draw_arrow(start, end, brush.Get(), draw_width);
+        draw_arrow(
+            start,
+            end,
+            brush.Get(),
+            draw_width,
+            annotation.arrow_head_style,
+            shape_stroke_style);
     } else if (annotation.tool == Tool::pen || annotation.tool == Tool::highlight) {
         const float line_width =
-            annotation.tool == Tool::highlight ? std::max(6.0F, draw_width * 3.2F) : draw_width;
-        if (annotation.points.empty()) {
+            annotation.tool == Tool::highlight
+                ? tool_visual_radius(Tool::highlight, draw_width) * 2.0F
+                : draw_width;
+        std::vector<POINT> preview_points;
+        const std::vector<POINT>* points = &annotation.points;
+        if (preview && annotation.tool == Tool::pen &&
+            annotation.points.size() > 1) {
+            const double spacing = std::clamp(
+                static_cast<double>(draw_width) * 0.35,
+                1.5,
+                4.0);
+            preview_points = smooth_polyline(
+                resample_polyline(annotation.points, spacing),
+                2);
+            points = &preview_points;
+        }
+        if (points->empty()) {
             render_target_->DrawLine(D2D1::Point2F(static_cast<float>(start.x - monitor_.bounds.left),
                                                    static_cast<float>(start.y - monitor_.bounds.top)),
                                      D2D1::Point2F(static_cast<float>(end.x - monitor_.bounds.left),
                                                    static_cast<float>(end.y - monitor_.bounds.top)),
                                      brush.Get(),
-                                     line_width);
-        } else if (annotation.points.size() == 1) {
+                                     line_width,
+                                     round_stroke_style_.Get());
+        } else if (points->size() == 1) {
             const POINT point{
-                selection.left + annotation.points.front().x,
-                selection.top + annotation.points.front().y,
+                selection.left + points->front().x,
+                selection.top + points->front().y,
             };
             const float radius = std::max(1.0F, line_width * 0.5F);
             render_target_->FillEllipse(
@@ -449,15 +574,20 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
                     radius),
                 brush.Get());
         } else {
-            for (std::size_t index = 1; index < annotation.points.size(); ++index) {
-                const POINT first{selection.left + annotation.points[index - 1].x, selection.top + annotation.points[index - 1].y};
-                const POINT second{selection.left + annotation.points[index].x, selection.top + annotation.points[index].y};
+            for (std::size_t index = 1; index < points->size(); ++index) {
+                const POINT first{
+                    selection.left + (*points)[index - 1].x,
+                    selection.top + (*points)[index - 1].y};
+                const POINT second{
+                    selection.left + (*points)[index].x,
+                    selection.top + (*points)[index].y};
                 render_target_->DrawLine(D2D1::Point2F(static_cast<float>(first.x - monitor_.bounds.left),
                                                        static_cast<float>(first.y - monitor_.bounds.top)),
                                          D2D1::Point2F(static_cast<float>(second.x - monitor_.bounds.left),
                                                        static_cast<float>(second.y - monitor_.bounds.top)),
                                          brush.Get(),
-                                         line_width);
+                                         line_width,
+                                         round_stroke_style_.Get());
             }
         }
     } else if (annotation.tool == Tool::eraser) {
@@ -465,7 +595,8 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
             static_cast<float>(end.x - monitor_.bounds.left),
             static_cast<float>(end.y - monitor_.bounds.top),
         };
-        constexpr float radius = 10.0F;
+        const float radius =
+            tool_visual_radius(Tool::eraser, annotation.width);
         render_target_->DrawEllipse(
             D2D1::Ellipse(center, radius, radius),
             true_white_brush_.Get(),
@@ -495,7 +626,9 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
                 bounds, white_brush_.Get(), 1.0F, round_stroke_style_.Get());
         } else {
             const int radius =
-                std::max(5, static_cast<int>(annotation.width * 3.5F));
+                static_cast<int>(tool_visual_radius(
+                    Tool::mosaic,
+                    annotation.width));
             for (const POINT relative : annotation.points) {
                 POINT point{selection.left + relative.x, selection.top + relative.y};
                 RectI block{
@@ -524,8 +657,8 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
         } else {
             for (const POINT relative : annotation.points) {
                 POINT point{selection.left + relative.x, selection.top + relative.y};
-                float radius = draw_width * 3.5F;
-                if (radius < 5.0F) radius = 5.0F;
+                const float radius =
+                    tool_visual_radius(Tool::blur, draw_width);
                 D2D1_ELLIPSE ellipse = D2D1::Ellipse(
                     D2D1::Point2F(static_cast<float>(point.x - monitor_.bounds.left), static_cast<float>(point.y - monitor_.bounds.top)),
                     radius,
@@ -554,15 +687,16 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
                         static_cast<float>(monitor_.bounds.width()),
                         static_cast<float>(monitor_.bounds.height()));
         if (text_style == TextStyle::dark) {
-            auto layout = create_text_layout(annotation.text, format.Get(), 800.0F, 160.0F);
-            DWRITE_TEXT_METRICS metrics{};
-            if (layout && FAILED(layout->GetMetrics(&metrics))) {
-                metrics = {};
-            }
-            const D2D1_RECT_F background = D2D1::RectF(bounds.left - 4.0F,
-                                                       bounds.top - 2.0F,
-                                                       bounds.left + std::max(40.0F, metrics.widthIncludingTrailingWhitespace) + 8.0F,
-                                                       bounds.top + std::max(font_size + 8.0F, metrics.height + 6.0F));
+            const RectI measured = annotation_bounds(annotation);
+            const D2D1_RECT_F background = D2D1::RectF(
+                static_cast<float>(
+                    selection.left + measured.left - monitor_.bounds.left),
+                static_cast<float>(
+                    selection.top + measured.top - monitor_.bounds.top),
+                static_cast<float>(
+                    selection.left + measured.right - monitor_.bounds.left),
+                static_cast<float>(
+                    selection.top + measured.bottom - monitor_.bounds.top));
             ComPtr<ID2D1SolidColorBrush> dark_background;
             if (SUCCEEDED(render_target_->CreateSolidColorBrush(
                     D2D1::ColorF(0x1F2329, 0.90F),
@@ -674,7 +808,8 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
         render_target_->SetTransform(previous_transform);
         render_target_->PopAxisAlignedClip();
     } else if (annotation.tool == Tool::serial) {
-        float radius = 8.0F + annotation.width * 1.5F;
+        const float radius =
+            serial_visual_radius(annotation.width, annotation.serial);
         const D2D1_ELLIPSE ellipse = D2D1::Ellipse(
             D2D1::Point2F(static_cast<float>(start.x - monitor_.bounds.left), static_cast<float>(start.y - monitor_.bounds.top)),
             radius,
@@ -683,7 +818,10 @@ void OverlayWindow::draw_annotation(const Annotation& annotation, bool preview) 
         render_target_->DrawEllipse(ellipse, white_brush_.Get(), 1.5F);
 
         auto format = create_text_format(
-            L"Consolas", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, radius);
+            L"Consolas",
+            DWRITE_FONT_WEIGHT_BOLD,
+            DWRITE_FONT_STYLE_NORMAL,
+            serial_font_size(annotation.width, annotation.serial));
         if (!format) {
             return;
         }
@@ -715,6 +853,9 @@ void OverlayWindow::paint() {
         EndPaint(hwnd_, &paint);
         return;
     }
+    const OverlayUiMetrics ui{
+        hwnd_ ? GetDpiForWindow(hwnd_) : kOverlayBaseDpi};
+    const float ui_scale = ui.px(1.0F);
     render_target_->BeginDraw();
     render_target_->DrawBitmap(background_.Get());
 
@@ -745,7 +886,8 @@ void OverlayWindow::paint() {
                                                   width,
                                                   static_cast<float>(local.bottom)),
                                       dim_brush_.Get());
-        render_target_->DrawRectangle(local_rect(selected), blue_brush_.Get(), 2.0F);
+        render_target_->DrawRectangle(
+            local_rect(selected), blue_brush_.Get(), ui.px(2.0F));
     } else {
         render_target_->FillRectangle(
             D2D1::RectF(0, 0, static_cast<float>(monitor_.bounds.width()), static_cast<float>(monitor_.bounds.height())),
@@ -753,21 +895,37 @@ void OverlayWindow::paint() {
     }
 
     if (session_.selection_complete()) {
+        bool selected_effect_edit = false;
+        if (session_.annotation_transaction_active()) {
+            const int selected_index = session_.selected_annotation_idx();
+            if (selected_index >= 0 &&
+                static_cast<std::size_t>(selected_index) <
+                    session_.annotations().size()) {
+                const Tool selected_tool = session_.annotations()[
+                    static_cast<std::size_t>(selected_index)].tool;
+                selected_effect_edit =
+                    selected_tool == Tool::mosaic ||
+                    selected_tool == Tool::blur;
+            }
+        }
         if (session_.dragging_selection() ||
-            session_.annotation_transaction_active() ||
+            (session_.annotation_transaction_active() &&
+             !selected_effect_edit) ||
             !draw_rendered_annotations()) {
             for (const auto& annotation : session_.annotations()) {
                 draw_annotation(annotation, false);
             }
         }
         if (const Annotation* preview = session_.preview()) {
-            draw_annotation(*preview, true);
+            if (!session_.effect_preview_active()) {
+                draw_annotation(*preview, true);
+            }
         }
         if (const auto visible = intersect(session_.selection(), monitor_.bounds)) {
             render_target_->DrawRectangle(
                 local_rect(*visible),
                 blue_brush_.Get(),
-                2.0F);
+                ui.px(2.0F));
         }
 
         // Draw object-level editing controls for the selected annotation.
@@ -781,10 +939,11 @@ void OverlayWindow::paint() {
                 if (bounds.empty()) {
                     bounds = annotation_bounds(annotation);
                 }
-                bounds.left -= 3;
-                bounds.top -= 3;
-                bounds.right += 3;
-                bounds.bottom += 3;
+                const int control_padding = ui.px(3);
+                bounds.left -= control_padding;
+                bounds.top -= control_padding;
+                bounds.right += control_padding;
+                bounds.bottom += control_padding;
 
                 RectI screen_bounds{
                     selection.left + bounds.left,
@@ -797,11 +956,11 @@ void OverlayWindow::paint() {
                 render_target_->DrawRectangle(
                     local_rect_f,
                     true_white_brush_.Get(),
-                    3.0F);
+                    ui.px(3.0F));
                 render_target_->DrawRectangle(
                     local_rect_f,
                     blue_brush_.Get(),
-                    1.5F);
+                    ui.px(1.5F));
 
                 for (const auto& handle :
                      annotation_control_handles(annotation)) {
@@ -816,29 +975,29 @@ void OverlayWindow::paint() {
                         const D2D1_ELLIPSE endpoint =
                             D2D1::Ellipse(
                                 D2D1::Point2F(center_x, center_y),
-                                5.0F,
-                                5.0F);
+                                ui.px(5.0F),
+                                ui.px(5.0F));
                         render_target_->FillEllipse(
                             endpoint,
                             true_white_brush_.Get());
                         render_target_->DrawEllipse(
                             endpoint,
                             blue_brush_.Get(),
-                            2.0F);
+                            ui.px(2.0F));
                     } else {
                         const D2D1_RECT_F resize_handle =
                             D2D1::RectF(
-                                center_x - 4.0F,
-                                center_y - 4.0F,
-                                center_x + 4.0F,
-                                center_y + 4.0F);
+                                center_x - ui.px(4.0F),
+                                center_y - ui.px(4.0F),
+                                center_x + ui.px(4.0F),
+                                center_y + ui.px(4.0F));
                         render_target_->FillRectangle(
                             resize_handle,
                             true_white_brush_.Get());
                         render_target_->DrawRectangle(
                             resize_handle,
                             blue_brush_.Get(),
-                            1.5F);
+                            ui.px(1.5F));
                     }
                 }
             }
@@ -865,7 +1024,7 @@ void OverlayWindow::paint() {
         };
 
         auto format = create_text_format(
-            L"Consolas", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, 12.0F);
+            L"Consolas", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, ui.px(12.0F));
         if (format) {
             format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
             format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -878,28 +1037,43 @@ void OverlayWindow::paint() {
 
         // Draw main toolbar background rounded rectangle card
         if (!session_.toolbar().empty()) {
-            D2D1_RECT_F bg_rect = local_rect(padded_buttons_bounds(session_.toolbar(), 8));
+            D2D1_RECT_F bg_rect = local_rect(
+                padded_buttons_bounds(session_.toolbar(), ui.px(8)));
             D2D1_RECT_F shadow_rect = bg_rect;
-            shadow_rect.left -= 1.0F;
-            shadow_rect.right += 1.0F;
-            shadow_rect.top += 2.0F;
-            shadow_rect.bottom += 3.0F;
+            shadow_rect.left -= ui.px(1.0F);
+            shadow_rect.right += ui.px(1.0F);
+            shadow_rect.top += ui.px(2.0F);
+            shadow_rect.bottom += ui.px(3.0F);
             render_target_->FillRoundedRectangle(
-                D2D1::RoundedRect(shadow_rect, 9.0F, 9.0F),
+                D2D1::RoundedRect(shadow_rect, ui.px(9.0F), ui.px(9.0F)),
                 toolbar_shadow_brush_.Get());
             render_target_->FillRoundedRectangle(
-                D2D1::RoundedRect(bg_rect, 8.0F, 8.0F),
+                D2D1::RoundedRect(bg_rect, ui.px(8.0F), ui.px(8.0F)),
                 toolbar_bg_brush_.Get());
             render_target_->DrawRoundedRectangle(
-                D2D1::RoundedRect(bg_rect, 8.0F, 8.0F),
+                D2D1::RoundedRect(bg_rect, ui.px(8.0F), ui.px(8.0F)),
                 toolbar_border_brush_.Get(),
-                1.0F);
+                ui.px(1.0F));
 
             for (const auto& button : session_.toolbar()) {
                 if (!intersect(button.bounds, monitor_.bounds)) {
                     continue;
                 }
-                const D2D1_RECT_F bounds = local_rect(button.bounds);
+                D2D1_RECT_F bounds = local_rect(button.bounds);
+                D2D1_MATRIX_3X2_F previous_transform{};
+                render_target_->GetTransform(&previous_transform);
+                if (ui_scale != 1.0F) {
+                    const float center_x = (bounds.left + bounds.right) * 0.5F;
+                    const float center_y = (bounds.top + bounds.bottom) * 0.5F;
+                    bounds = D2D1::RectF(
+                        center_x + (bounds.left - center_x) / ui_scale,
+                        center_y + (bounds.top - center_y) / ui_scale,
+                        center_x + (bounds.right - center_x) / ui_scale,
+                        center_y + (bounds.bottom - center_y) / ui_scale);
+                    render_target_->SetTransform(D2D1::Matrix3x2F::Scale(
+                        D2D1::SizeF(ui_scale, ui_scale),
+                        D2D1::Point2F(center_x, center_y)));
+                }
 
                 if (button.id == L"|") {
                     float cx = bounds.left + (bounds.right - bounds.left) / 2.0F;
@@ -909,6 +1083,7 @@ void OverlayWindow::paint() {
                         toolbar_border_brush_.Get(),
                         1.2F
                     );
+                    render_target_->SetTransform(previous_transform);
                     continue;
                 }
 
@@ -942,6 +1117,7 @@ void OverlayWindow::paint() {
                                 1.1F),
                             handle_brush);
                     }
+                    render_target_->SetTransform(previous_transform);
                     continue;
                 }
 
@@ -1225,6 +1401,7 @@ void OverlayWindow::paint() {
                     render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy - 6.0F), D2D1::Point2F(cx + 6.0F, cy + 6.0F), white_brush_.Get(), 2.0F, round_stroke_style_.Get());
                     render_target_->DrawLine(D2D1::Point2F(cx - 6.0F, cy + 6.0F), D2D1::Point2F(cx + 6.0F, cy - 6.0F), white_brush_.Get(), 2.0F, round_stroke_style_.Get());
                 }
+                render_target_->SetTransform(previous_transform);
                 white_brush_ = original_white_brush;
             }
         }
@@ -1232,28 +1409,45 @@ void OverlayWindow::paint() {
         // Draw sub-toolbar
         if (!session_.sub_toolbar().empty()) {
             D2D1_RECT_F sub_bg_rect =
-                local_rect(padded_buttons_bounds(session_.sub_toolbar(), 8));
+                local_rect(padded_buttons_bounds(session_.sub_toolbar(), ui.px(8)));
             D2D1_RECT_F sub_shadow_rect = sub_bg_rect;
-            sub_shadow_rect.left -= 1.0F;
-            sub_shadow_rect.right += 1.0F;
-            sub_shadow_rect.top += 2.0F;
-            sub_shadow_rect.bottom += 3.0F;
+            sub_shadow_rect.left -= ui.px(1.0F);
+            sub_shadow_rect.right += ui.px(1.0F);
+            sub_shadow_rect.top += ui.px(2.0F);
+            sub_shadow_rect.bottom += ui.px(3.0F);
             render_target_->FillRoundedRectangle(
-                D2D1::RoundedRect(sub_shadow_rect, 9.0F, 9.0F),
+                D2D1::RoundedRect(
+                    sub_shadow_rect, ui.px(9.0F), ui.px(9.0F)),
                 toolbar_shadow_brush_.Get());
             render_target_->FillRoundedRectangle(
-                D2D1::RoundedRect(sub_bg_rect, 8.0F, 8.0F),
+                D2D1::RoundedRect(
+                    sub_bg_rect, ui.px(8.0F), ui.px(8.0F)),
                 toolbar_bg_brush_.Get());
             render_target_->DrawRoundedRectangle(
-                D2D1::RoundedRect(sub_bg_rect, 8.0F, 8.0F),
+                D2D1::RoundedRect(
+                    sub_bg_rect, ui.px(8.0F), ui.px(8.0F)),
                 toolbar_border_brush_.Get(),
-                1.0F);
+                ui.px(1.0F));
 
             for (const auto& button : session_.sub_toolbar()) {
                 if (!intersect(button.bounds, monitor_.bounds)) {
                     continue;
                 }
-                const D2D1_RECT_F bounds = local_rect(button.bounds);
+                D2D1_RECT_F bounds = local_rect(button.bounds);
+                D2D1_MATRIX_3X2_F previous_transform{};
+                render_target_->GetTransform(&previous_transform);
+                if (ui_scale != 1.0F) {
+                    const float center_x = (bounds.left + bounds.right) * 0.5F;
+                    const float center_y = (bounds.top + bounds.bottom) * 0.5F;
+                    bounds = D2D1::RectF(
+                        center_x + (bounds.left - center_x) / ui_scale,
+                        center_y + (bounds.top - center_y) / ui_scale,
+                        center_x + (bounds.right - center_x) / ui_scale,
+                        center_y + (bounds.bottom - center_y) / ui_scale);
+                    render_target_->SetTransform(D2D1::Matrix3x2F::Scale(
+                        D2D1::SizeF(ui_scale, ui_scale),
+                        D2D1::Point2F(center_x, center_y)));
+                }
                 if (button.id == L"|") {
                     float cx = bounds.left + (bounds.right - bounds.left) / 2.0F;
                     render_target_->DrawLine(
@@ -1263,6 +1457,7 @@ void OverlayWindow::paint() {
                         1.2F,
                         round_stroke_style_.Get()
                     );
+                    render_target_->SetTransform(previous_transform);
                     continue;
                 }
                 bool is_selected = false;
@@ -1286,6 +1481,15 @@ void OverlayWindow::paint() {
                 else if (button.id == L"effect_blur" && session_.mosaic_is_blur()) is_selected = true;
                 else if (button.id == L"mode_smear" && !session_.mosaic_is_rect()) is_selected = true;
                 else if (button.id == L"mode_rect" && session_.mosaic_is_rect()) is_selected = true;
+                else if (button.id == L"fill_outline" && session_.active_fill_style() == ShapeFillStyle::outline) is_selected = true;
+                else if (button.id == L"fill_translucent" && session_.active_fill_style() == ShapeFillStyle::translucent) is_selected = true;
+                else if (button.id == L"stroke_solid" && session_.active_stroke_pattern() == StrokePattern::solid) is_selected = true;
+                else if (button.id == L"stroke_dashed" && session_.active_stroke_pattern() == StrokePattern::dashed) is_selected = true;
+                else if (button.id == L"corner_square" && !session_.active_rectangle_rounded()) is_selected = true;
+                else if (button.id == L"corner_round" && session_.active_rectangle_rounded()) is_selected = true;
+                else if (button.id == L"head_forward" && session_.active_arrow_head_style() == ArrowHeadStyle::forward) is_selected = true;
+                else if (button.id == L"head_reverse" && session_.active_arrow_head_style() == ArrowHeadStyle::reverse) is_selected = true;
+                else if (button.id == L"head_both" && session_.active_arrow_head_style() == ArrowHeadStyle::both) is_selected = true;
                 else if (button.id == L"color_custom" &&
                          session_.active_color() != RGB(245, 34, 45) &&
                          session_.active_color() != RGB(82, 196, 26) &&
@@ -1302,7 +1506,9 @@ void OverlayWindow::paint() {
                     button.enabled;
 
                 if ((button.id.starts_with(L"width_") || button.id.starts_with(L"alpha_") || button.id.starts_with(L"effect_") ||
-                     button.id.starts_with(L"mode_") || button.id.starts_with(L"text_style_")) && is_selected) {
+                     button.id.starts_with(L"mode_") || button.id.starts_with(L"text_style_") ||
+                     button.id.starts_with(L"fill_") || button.id.starts_with(L"stroke_") ||
+                     button.id.starts_with(L"corner_") || button.id.starts_with(L"head_")) && is_selected) {
                     render_target_->FillRoundedRectangle(
                         D2D1::RoundedRect(bounds, 6.0F, 6.0F),
                         active_bg_brush_.Get());
@@ -1429,7 +1635,11 @@ void OverlayWindow::paint() {
                 } else if (button.id == L"mosaic_strength_slider" || button.id == L"watermark_opacity_slider") {
                     const bool watermark_slider = button.id == L"watermark_opacity_slider";
                     const int value = watermark_slider ? session_.watermark_opacity() : session_.mosaic_strength();
-                    const wchar_t* label = watermark_slider ? L"水印浓度" : L"模糊强度";
+                    const wchar_t* label = watermark_slider
+                                               ? L"水印浓度"
+                                               : (session_.mosaic_is_blur()
+                                                      ? L"模糊强度"
+                                                      : L"马赛克强度");
 
                     auto slider_format = create_text_format(
                         L"Microsoft YaHei",
@@ -1498,7 +1708,9 @@ void OverlayWindow::paint() {
                                                   bounds,
                                                   white_brush_.Get());
                     }
-                } else if (button.id.starts_with(L"effect_") || button.id.starts_with(L"mode_")) {
+                } else if (button.id.starts_with(L"effect_") || button.id.starts_with(L"mode_") ||
+                           button.id.starts_with(L"fill_") || button.id.starts_with(L"stroke_") ||
+                           button.id.starts_with(L"corner_") || button.id.starts_with(L"head_")) {
                     auto segment_format = create_text_format(
                         L"Segoe UI",
                         DWRITE_FONT_WEIGHT_SEMI_BOLD,
@@ -1531,31 +1743,49 @@ void OverlayWindow::paint() {
                     }
                     render_target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 6.0F, 6.0F), white_brush_.Get(), 1.2F, round_stroke_style_.Get());
                 }
+                render_target_->SetTransform(previous_transform);
                 white_brush_ = original_sub_toolbar_brush;
             }
         }
 
-        // Draw 8-point handles
-        for (const auto& pt : handles) {
-            D2D1_ELLIPSE circle = D2D1::Ellipse(pt, 4.0F, 4.0F);
-            render_target_->FillEllipse(circle, blue_brush_.Get());
-            render_target_->DrawEllipse(circle, true_white_brush_.Get(), 1.2F);
+        // The capture rectangle is frozen once annotations exist. Keep object
+        // handles visible, but do not advertise the disabled rectangle resize.
+        if (session_.annotations().empty()) {
+            for (const auto& pt : handles) {
+                D2D1_ELLIPSE circle =
+                    D2D1::Ellipse(pt, ui.px(4.0F), ui.px(4.0F));
+                render_target_->FillEllipse(circle, blue_brush_.Get());
+                render_target_->DrawEllipse(
+                    circle,
+                    true_white_brush_.Get(),
+                    ui.px(1.2F));
+            }
         }
 
-        const std::wstring dimensions =
-            std::format(L" {} × {} ", session_.selection().width(), session_.selection().height());
-        RectI text_bounds{session_.selection().left,
-                          session_.selection().top - 28,
-                          session_.selection().left + 130,
-                          session_.selection().top - 4};
-        if (text_bounds.top < monitor_.bounds.top) {
-            text_bounds.top = session_.selection().top + 4;
-            text_bounds.bottom = text_bounds.top + 24;
-        }
+        const bool size_hovered =
+            session_.can_edit_selection_size() &&
+            session_.dimension_badge_hovered();
+        const std::wstring dimensions = size_hovered
+                                            ? std::format(
+                                                  L" {} × {}  ·  F2 ",
+                                                  session_.selection().width(),
+                                                  session_.selection().height())
+                                            : std::format(
+                                                  L" {} × {} ",
+                                                  session_.selection().width(),
+                                                  session_.selection().height());
+        const RectI text_bounds = session_.dimension_badge_bounds();
         if (format && intersect(text_bounds, monitor_.bounds)) {
             const auto bounds = local_rect(text_bounds);
-            render_target_->FillRoundedRectangle(D2D1::RoundedRect(bounds, 12.f, 12.f), toolbar_bg_brush_.Get());
-            render_target_->DrawRoundedRectangle(D2D1::RoundedRect(bounds, 12.f, 12.f), toolbar_border_brush_.Get(), 1.0f);
+            render_target_->FillRoundedRectangle(
+                D2D1::RoundedRect(bounds, ui.px(12.0F), ui.px(12.0F)),
+                toolbar_bg_brush_.Get());
+            render_target_->DrawRoundedRectangle(
+                D2D1::RoundedRect(bounds, ui.px(12.0F), ui.px(12.0F)),
+                size_hovered
+                    ? static_cast<ID2D1Brush*>(blue_brush_.Get())
+                    : static_cast<ID2D1Brush*>(toolbar_border_brush_.Get()),
+                size_hovered ? ui.px(1.5F) : ui.px(1.0F));
             render_target_->DrawTextW(dimensions.c_str(),
                                       static_cast<UINT32>(dimensions.size()),
                                       format.Get(),
@@ -1573,19 +1803,20 @@ void OverlayWindow::paint() {
             int cy = cursor_pos.y - monitor_.bounds.top;
 
             constexpr int grid_cells = 15;
-            constexpr int cell_size = 10;
-            constexpr int grid_size = grid_cells * cell_size;
-            constexpr int text_height = 72;
-            constexpr int mag_width = grid_size;
-            constexpr int mag_height = grid_size + text_height;
+            const int cell_size = ui.px(10);
+            const int grid_size = grid_cells * cell_size;
+            const int text_height = ui.px(72);
+            const int mag_width = grid_size;
+            const int mag_height = grid_size + text_height;
+            const int cursor_gap = ui.px(20);
 
-            int mx = cx + 20;
-            int my = cy + 20;
+            int mx = cx + cursor_gap;
+            int my = cy + cursor_gap;
             if (mx + mag_width > monitor_.bounds.width()) {
-                mx = cx - mag_width - 20;
+                mx = cx - mag_width - cursor_gap;
             }
             if (my + mag_height > monitor_.bounds.height()) {
-                my = cy - mag_height - 20;
+                my = cy - mag_height - cursor_gap;
             }
 
             D2D1_RECT_F mag_rect = D2D1::RectF(
@@ -1636,12 +1867,12 @@ void OverlayWindow::paint() {
                 render_target_->DrawLine(
                     D2D1::Point2F(static_cast<float>(mx), static_cast<float>(my + line_coord)),
                     D2D1::Point2F(static_cast<float>(mx + grid_size), static_cast<float>(my + line_coord)),
-                    grid_line_brush.Get(), 0.5f);
+                    grid_line_brush.Get(), ui.px(0.5F));
                 // Vertical line
                 render_target_->DrawLine(
                     D2D1::Point2F(static_cast<float>(mx + line_coord), static_cast<float>(my)),
                     D2D1::Point2F(static_cast<float>(mx + line_coord), static_cast<float>(my + grid_size)),
-                    grid_line_brush.Get(), 0.5f);
+                    grid_line_brush.Get(), ui.px(0.5F));
             }
 
             int center_cell_x = mx + (grid_cells/2) * cell_size;
@@ -1657,25 +1888,26 @@ void OverlayWindow::paint() {
             render_target_->DrawLine(
                 D2D1::Point2F(static_cast<float>(mx), static_cast<float>(center_cell_y + cell_size/2)),
                 D2D1::Point2F(static_cast<float>(center_cell_x), static_cast<float>(center_cell_y + cell_size/2)),
-                blue_brush_.Get(), 1.0f
+                blue_brush_.Get(), ui.px(1.0F)
             );
             render_target_->DrawLine(
                 D2D1::Point2F(static_cast<float>(center_cell_x + cell_size), static_cast<float>(center_cell_y + cell_size/2)),
                 D2D1::Point2F(static_cast<float>(mx + grid_size), static_cast<float>(center_cell_y + cell_size/2)),
-                blue_brush_.Get(), 1.0f
+                blue_brush_.Get(), ui.px(1.0F)
             );
             render_target_->DrawLine(
                 D2D1::Point2F(static_cast<float>(center_cell_x + cell_size/2), static_cast<float>(my)),
                 D2D1::Point2F(static_cast<float>(center_cell_x + cell_size/2), static_cast<float>(center_cell_y)),
-                blue_brush_.Get(), 1.0f
+                blue_brush_.Get(), ui.px(1.0F)
             );
             render_target_->DrawLine(
                 D2D1::Point2F(static_cast<float>(center_cell_x + cell_size/2), static_cast<float>(center_cell_y + cell_size)),
                 D2D1::Point2F(static_cast<float>(center_cell_x + cell_size/2), static_cast<float>(my + grid_size)),
-                blue_brush_.Get(), 1.0f
+                blue_brush_.Get(), ui.px(1.0F)
             );
 
-            render_target_->DrawRectangle(center_rect, blue_brush_.Get(), 1.0f);
+            render_target_->DrawRectangle(
+                center_rect, blue_brush_.Get(), ui.px(1.0F));
 
             COLORREF center_color = session_.get_pixel_color(cursor_pos.x, cursor_pos.y);
             std::wstring coord_text;
@@ -1695,7 +1927,7 @@ void OverlayWindow::paint() {
             std::wstring hint_text = L"C 复制 | Shift 切换";
 
             auto mag_format = create_text_format(
-                L"Consolas", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, 12.0F);
+                L"Consolas", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, ui.px(12.0F));
             if (mag_format) {
                 mag_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                 mag_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -1704,9 +1936,9 @@ void OverlayWindow::paint() {
             // Line 1: coordinates
             D2D1_RECT_F coord_rect = D2D1::RectF(
                 static_cast<float>(mx),
-                static_cast<float>(my + grid_size + 4),
+                static_cast<float>(my + grid_size + ui.px(4)),
                 static_cast<float>(mx + mag_width),
-                static_cast<float>(my + grid_size + 24)
+                static_cast<float>(my + grid_size + ui.px(24))
             );
             if (mag_format) {
                 render_target_->DrawTextW(coord_text.c_str(), static_cast<UINT32>(coord_text.size()), mag_format.Get(), coord_rect, white_brush_.Get());
@@ -1715,9 +1947,9 @@ void OverlayWindow::paint() {
             // Line 2: color value (Hex or RGB)
             D2D1_RECT_F color_rect = D2D1::RectF(
                 static_cast<float>(mx),
-                static_cast<float>(my + grid_size + 24),
+                static_cast<float>(my + grid_size + ui.px(24)),
                 static_cast<float>(mx + mag_width),
-                static_cast<float>(my + grid_size + 44)
+                static_cast<float>(my + grid_size + ui.px(44))
             );
             if (mag_format) {
                 render_target_->DrawTextW(primary_color.c_str(), static_cast<UINT32>(primary_color.size()), mag_format.Get(), color_rect, white_brush_.Get());
@@ -1728,7 +1960,7 @@ void OverlayWindow::paint() {
                 L"Microsoft YaHei",
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
-                10.5F);
+                ui.px(10.5F));
             if (hint_format) {
                 hint_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                 hint_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -1744,15 +1976,16 @@ void OverlayWindow::paint() {
 
             D2D1_RECT_F hint_rect = D2D1::RectF(
                 static_cast<float>(mx),
-                static_cast<float>(my + grid_size + 44),
+                static_cast<float>(my + grid_size + ui.px(44)),
                 static_cast<float>(mx + mag_width),
-                static_cast<float>(my + mag_height - 4)
+                static_cast<float>(my + mag_height - ui.px(4))
             );
             if (hint_format) {
                 render_target_->DrawTextW(hint_text.c_str(), static_cast<UINT32>(hint_text.size()), hint_format.Get(), hint_rect, hint_brush.Get());
             }
 
-            render_target_->DrawRectangle(mag_rect, toolbar_border_brush_.Get(), 1.0f);
+            render_target_->DrawRectangle(
+                mag_rect, toolbar_border_brush_.Get(), ui.px(1.0F));
         }
     }
 
@@ -1782,11 +2015,16 @@ void OverlayWindow::paint() {
         RectI card_bounds = session_.get_text_size_dropdown_bounds();
         D2D1_RECT_F local_card = local_rect(card_bounds);
 
-        render_target_->FillRoundedRectangle(D2D1::RoundedRect(local_card, 6.f, 6.f), toolbar_bg_brush_.Get());
-        render_target_->DrawRoundedRectangle(D2D1::RoundedRect(local_card, 6.f, 6.f), toolbar_border_brush_.Get(), 1.f);
+        render_target_->FillRoundedRectangle(
+            D2D1::RoundedRect(local_card, ui.px(6.0F), ui.px(6.0F)),
+            toolbar_bg_brush_.Get());
+        render_target_->DrawRoundedRectangle(
+            D2D1::RoundedRect(local_card, ui.px(6.0F), ui.px(6.0F)),
+            toolbar_border_brush_.Get(),
+            ui.px(1.0F));
 
         auto dropdown_text_format = create_text_format(
-            L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, 12.5F);
+            L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, ui.px(12.5F));
         if (dropdown_text_format) {
             dropdown_text_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
             dropdown_text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -1809,24 +2047,32 @@ void OverlayWindow::paint() {
         }};
 
         for (std::size_t i = 0; i < options.size(); ++i) {
+            const float row_height = ui.px(32.0F);
+            const float row_inset = ui.px(2.0F);
             D2D1_RECT_F item_rect_full = D2D1::RectF(
-                local_card.left + 2.0F,
-                local_card.top + static_cast<float>(i) * 32.0F + 2.0F,
-                local_card.right - 2.0F,
-                local_card.top + static_cast<float>(i + 1) * 32.0F - 2.0F
+                local_card.left + row_inset,
+                local_card.top + static_cast<float>(i) * row_height + row_inset,
+                local_card.right - row_inset,
+                local_card.top + static_cast<float>(i + 1) * row_height - row_inset
             );
 
             bool is_active = (std::abs(session_.active_text_size() - options[i].second) < 0.5F);
             bool is_hovered = (session_.text_size_hovered_idx() == static_cast<int>(i));
 
             if (is_hovered) {
-                render_target_->FillRoundedRectangle(D2D1::RoundedRect(item_rect_full, 4.f, 4.f), hover_bg_brush_.Get());
+                render_target_->FillRoundedRectangle(
+                    D2D1::RoundedRect(
+                        item_rect_full, ui.px(4.0F), ui.px(4.0F)),
+                    hover_bg_brush_.Get());
             }
 
             ComPtr<ID2D1SolidColorBrush> text_brush = white_brush_;
             if (is_active) {
                 text_brush = blue_brush_;
-                render_target_->FillRoundedRectangle(D2D1::RoundedRect(item_rect_full, 4.f, 4.f), active_bg_brush_.Get());
+                render_target_->FillRoundedRectangle(
+                    D2D1::RoundedRect(
+                        item_rect_full, ui.px(4.0F), ui.px(4.0F)),
+                    active_bg_brush_.Get());
             }
 
             if (dropdown_text_format) {
@@ -1910,7 +2156,7 @@ void OverlayWindow::paint() {
                 }
                 if (id == L"highlight") {
                     return std::format(
-                        L"荧光笔 ({}) · 滚轮调整粗细",
+                        L"荧光笔 ({}) · Shift 锁定水平/垂直 · 滚轮调粗细",
                         config.tool_shortcut_highlight);
                 }
                 if (id == L"watermark") return L"水印";
@@ -1952,6 +2198,16 @@ void OverlayWindow::paint() {
                 if (id == L"effect_blur") return L"模糊效果";
                 if (id == L"mode_smear") return L"涂抹模式";
                 if (id == L"mode_rect") return L"框选模式";
+                if (id == L"mosaic_strength_slider") return L"效果强度 · 0% 不产生效果，也不会提交";
+                if (id == L"fill_outline") return L"空心：只绘制轮廓";
+                if (id == L"fill_translucent") return L"填充：使用 25% 透明色填充";
+                if (id == L"stroke_solid") return L"实线轮廓";
+                if (id == L"stroke_dashed") return L"虚线轮廓";
+                if (id == L"corner_square") return L"直角矩形";
+                if (id == L"corner_round") return L"圆角矩形";
+                if (id == L"head_forward") return L"箭头位于终点";
+                if (id == L"head_reverse") return L"箭头位于起点";
+                if (id == L"head_both") return L"起点和终点均显示箭头";
                 if (id == L"text_style_normal") return L"普通文字";
                 if (id == L"text_style_dark") return L"黑底文字";
                 if (id == L"text_style_outline") return L"轮廓高亮";
@@ -1971,14 +2227,18 @@ void OverlayWindow::paint() {
                     L"Microsoft YaHei",
                     DWRITE_FONT_WEIGHT_NORMAL,
                     DWRITE_FONT_STYLE_NORMAL,
-                    13.0F);
+                    ui.px(13.0F));
                 if (tooltip_format) {
                     tooltip_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                     tooltip_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
                 }
 
                 auto layout =
-                    create_text_layout(tooltip_str, tooltip_format.Get(), 400.0F, 100.0F);
+                    create_text_layout(
+                        tooltip_str,
+                        tooltip_format.Get(),
+                        ui.px(400.0F),
+                        ui.px(100.0F));
                 DWRITE_TEXT_METRICS metrics{};
                 if (layout && FAILED(layout->GetMetrics(&metrics))) {
                     metrics = {};
@@ -1986,31 +2246,34 @@ void OverlayWindow::paint() {
                 const float text_width =
                     metrics.width > 0.0F
                         ? metrics.width
-                        : static_cast<float>(tooltip_str.size()) * 13.0F;
-                const float text_height = metrics.height > 0.0F ? metrics.height : 18.0F;
+                        : static_cast<float>(tooltip_str.size()) * ui.px(13.0F);
+                const float text_height =
+                    metrics.height > 0.0F ? metrics.height : ui.px(18.0F);
 
-                float bubble_width = text_width + 20.0F;
-                float bubble_height = text_height + 12.0F;
+                float bubble_width = text_width + ui.px(20.0F);
+                float bubble_height = text_height + ui.px(12.0F);
 
                 float btn_cx = static_cast<float>(button_bounds.left - monitor_.bounds.left) + static_cast<float>(button_bounds.width()) / 2.0F;
                 float btn_top = static_cast<float>(button_bounds.top - monitor_.bounds.top);
                 float btn_bottom = static_cast<float>(button_bounds.bottom - monitor_.bounds.top);
 
                 float bubble_left = btn_cx - bubble_width / 2.0F;
-                float bubble_bottom = btn_top - 8.0F;
+                float bubble_bottom = btn_top - ui.px(8.0F);
                 float bubble_top = bubble_bottom - bubble_height;
 
                 if (bubble_top < 0.0F) {
-                    bubble_top = btn_bottom + 8.0F;
+                    bubble_top = btn_bottom + ui.px(8.0F);
                     bubble_bottom = bubble_top + bubble_height;
                 }
                 const D2D1_SIZE_F target_size = render_target_->GetSize();
                 bubble_left = std::clamp(
                     bubble_left,
-                    8.0F,
-                    std::max(8.0F, target_size.width - bubble_width - 8.0F));
-                if (bubble_bottom > target_size.height - 8.0F) {
-                    bubble_bottom = btn_top - 8.0F;
+                    ui.px(8.0F),
+                    std::max(
+                        ui.px(8.0F),
+                        target_size.width - bubble_width - ui.px(8.0F)));
+                if (bubble_bottom > target_size.height - ui.px(8.0F)) {
+                    bubble_bottom = btn_top - ui.px(8.0F);
                     bubble_top = bubble_bottom - bubble_height;
                 }
 
@@ -2029,20 +2292,29 @@ void OverlayWindow::paint() {
                     tooltip_fg_brush = true_white_brush_;
                 }
 
-                render_target_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bubble_left, bubble_top, bubble_left + bubble_width, bubble_bottom), 4.0F, 4.0F), tooltip_bg_brush.Get());
+                render_target_->FillRoundedRectangle(
+                    D2D1::RoundedRect(
+                        D2D1::RectF(
+                            bubble_left,
+                            bubble_top,
+                            bubble_left + bubble_width,
+                            bubble_bottom),
+                        ui.px(4.0F),
+                        ui.px(4.0F)),
+                    tooltip_bg_brush.Get());
 
                 ComPtr<ID2D1PathGeometry> tri_geom;
                 if (SUCCEEDED(d2d_factory->CreatePathGeometry(tri_geom.GetAddressOf()))) {
                     ComPtr<ID2D1GeometrySink> sink;
                     if (SUCCEEDED(tri_geom->Open(sink.GetAddressOf()))) {
                         if (bubble_top > btn_bottom) {
-                            sink->BeginFigure(D2D1::Point2F(btn_cx, btn_bottom + 3.0F), D2D1_FIGURE_BEGIN_FILLED);
-                            sink->AddLine(D2D1::Point2F(btn_cx - 4.0F, btn_bottom + 8.0F));
-                            sink->AddLine(D2D1::Point2F(btn_cx + 4.0F, btn_bottom + 8.0F));
+                            sink->BeginFigure(D2D1::Point2F(btn_cx, btn_bottom + ui.px(3.0F)), D2D1_FIGURE_BEGIN_FILLED);
+                            sink->AddLine(D2D1::Point2F(btn_cx - ui.px(4.0F), btn_bottom + ui.px(8.0F)));
+                            sink->AddLine(D2D1::Point2F(btn_cx + ui.px(4.0F), btn_bottom + ui.px(8.0F)));
                         } else {
-                            sink->BeginFigure(D2D1::Point2F(btn_cx, btn_top - 3.0F), D2D1_FIGURE_BEGIN_FILLED);
-                            sink->AddLine(D2D1::Point2F(btn_cx - 4.0F, btn_top - 8.0F));
-                            sink->AddLine(D2D1::Point2F(btn_cx + 4.0F, btn_top - 8.0F));
+                            sink->BeginFigure(D2D1::Point2F(btn_cx, btn_top - ui.px(3.0F)), D2D1_FIGURE_BEGIN_FILLED);
+                            sink->AddLine(D2D1::Point2F(btn_cx - ui.px(4.0F), btn_top - ui.px(8.0F)));
+                            sink->AddLine(D2D1::Point2F(btn_cx + ui.px(4.0F), btn_top - ui.px(8.0F)));
                         }
                         sink->EndFigure(D2D1_FIGURE_END_CLOSED);
                         sink->Close();
@@ -2178,6 +2450,11 @@ LRESULT CALLBACK OverlayWindow::window_proc(HWND window, UINT message, WPARAM w_
     if (message == WM_SETCURSOR) {
         POINT point{};
         GetCursorPos(&point);
+        if (self->session_.can_edit_selection_size() &&
+            self->session_.dimension_badge_bounds().contains(point)) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
         if (self->session_.is_over_toolbar(point)) {
             SetCursor(LoadCursorW(
                 nullptr,

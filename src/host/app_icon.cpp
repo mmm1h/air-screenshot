@@ -36,11 +36,13 @@ HICON load_app_icon(
         LR_SHARED | ((width <= 0 || height <= 0) ? LR_DEFAULTSIZE : 0)));
 }
 
-void apply_app_icon_to_window(HWND window, std::wstring_view icon_style) noexcept {
+void apply_app_icon_to_window(
+    HWND window,
+    std::wstring_view icon_style,
+    UINT dpi) noexcept {
     if (!window || !IsWindow(window)) {
         return;
     }
-    UINT dpi = GetDpiForWindow(window);
     if (dpi == 0) {
         dpi = 96;
     }
@@ -56,6 +58,11 @@ void apply_app_icon_to_window(HWND window, std::wstring_view icon_style) noexcep
         WM_SETICON,
         ICON_SMALL,
         reinterpret_cast<LPARAM>(load_app_icon(nullptr, icon_style, small, small)));
+}
+
+void apply_app_icon_to_window(HWND window, std::wstring_view icon_style) noexcept {
+    const UINT dpi = window && IsWindow(window) ? GetDpiForWindow(window) : 0;
+    apply_app_icon_to_window(window, icon_style, dpi);
 }
 
 }  // namespace airshot

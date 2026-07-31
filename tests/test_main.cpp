@@ -1,9 +1,11 @@
 #include "airshot/bitmap.h"
+#include "airshot/capture.h"
 #include "airshot/pin_layout.h"
 #include "airshot/command.h"
 #include "airshot/config.h"
 #include "airshot/ocr.h"
 #include "airshot/portable.h"
+#include "airshot/region_policy.h"
 #include "airshot/output.h"
 
 #include "../src/core/overlay_types.h"
@@ -91,6 +93,57 @@ void test_rect_and_bitmap() {
     expect(std::filesystem::exists(temp_png), L"saved png file exists");
     std::error_code ignored;
     std::filesystem::remove(temp_png, ignored);
+}
+
+bool same_rect(const airshot::RectI& first, const airshot::RectI& second) {
+    return first.left == second.left && first.top == second.top &&
+           first.right == second.right && first.bottom == second.bottom;
+}
+
+void test_window_candidate_hierarchy() {
+    const HWND first_root = reinterpret_cast<HWND>(1);
+    const HWND second_root = reinterpret_cast<HWND>(2);
+    const std::vector<airshot::WindowCandidate> candidates{
+        {first_root, {0, 0, 100, 100}, first_root, nullptr, 0},
+        {reinterpret_cast<HWND>(3), {10, 10, 90, 90}, first_root, first_root, 1},
+        {reinterpret_cast<HWND>(4), {20, 20, 40, 40}, first_root, reinterpret_cast<HWND>(3), 2},
+        // A smaller overlapping sibling must not become the parent when the
+        // user scrolls up the hierarchy from candidate 4.
+        {reinterpret_cast<HWND>(5), {22, 22, 35, 35}, first_root, first_root, 1},
+        {second_root, {15, 15, 120, 120}, second_root, nullptr, 0},
+        {reinterpret_cast<HWND>(6), {20, 20, 110, 110}, second_root, second_root, 1},
+    };
+
+    const auto deepest = airshot::window_candidate_at_point(
+        candidates,
+        {25, 25});
+    expect(
+        deepest && deepest->handle == reinterpret_cast<HWND>(4),
+        L"window candidate prefers the smallest deepest control in the topmost root");
+    const auto parent = airshot::window_candidate_at_point(
+        candidates,
+        {25, 25},
+        1);
+    expect(
+        parent && parent->handle == reinterpret_cast<HWND>(3),
+        L"window candidate wheel cycle follows the selected control's real parent");
+    const auto root = airshot::window_candidate_at_point(
+        candidates,
+        {25, 25},
+        99);
+    expect(
+        root && root->handle == first_root,
+        L"window candidate ancestor cycle clamps to top-level root");
+    const auto lower_root = airshot::window_candidate_at_point(
+        candidates,
+        {105, 105});
+    expect(
+        lower_root &&
+            lower_root->handle == reinterpret_cast<HWND>(6),
+        L"window candidate advances to the next visible root");
+    expect(
+        !airshot::window_candidate_at_point(candidates, {-1, -1}),
+        L"window candidate rejects points outside all candidates");
 }
 
 void test_pin_recovery_layout() {
@@ -193,6 +246,63 @@ void test_annotation_geometry_and_history() {
                 3.0F) == 8.0F,
         L"brush cursor matches each tool's real editing footprint");
 
+    Annotation mosaic_footprint;
+    mosaic_footprint.tool = Tool::mosaic;
+    mosaic_footprint.width = 12.0F;
+    mosaic_footprint.points = {{50, 50}};
+    const auto mosaic_bounds =
+        airshot::overlay_detail::annotation_bounds(mosaic_footprint);
+    expect(
+        airshot::overlay_detail::annotation_visual_radius(
+            mosaic_footprint) == 42.0F &&
+            mosaic_bounds.left == 8 && mosaic_bounds.top == 8 &&
+            mosaic_bounds.right == 93 && mosaic_bounds.bottom == 93,
+        L"annotation bounds and cursor share the mosaic footprint");
+
+    Annotation degenerate_rectangle;
+    degenerate_rectangle.tool = Tool::rectangle;
+    degenerate_rectangle.start = {10, 10};
+    degenerate_rectangle.end = {11, 30};
+    Annotation valid_rectangle = degenerate_rectangle;
+    valid_rectangle.end = {12, 12};
+    Annotation short_arrow;
+    short_arrow.tool = Tool::arrow;
+    short_arrow.start = {0, 0};
+    short_arrow.end = {2, 0};
+    Annotation valid_arrow = short_arrow;
+    valid_arrow.end = {3, 0};
+    expect(
+        !airshot::overlay_detail::annotation_is_committable(
+            degenerate_rectangle) &&
+            airshot::overlay_detail::annotation_is_committable(
+                valid_rectangle) &&
+            !airshot::overlay_detail::annotation_is_committable(
+                short_arrow) &&
+            airshot::overlay_detail::annotation_is_committable(
+                valid_arrow),
+        L"degenerate boxes and short arrows are filtered before history commit");
+
+    expect(
+        airshot::overlay_detail::interaction_settle_mode(
+            airshot::overlay_detail::InteractionCommand::copy) ==
+                airshot::overlay_detail::InteractionSettleMode::commit &&
+            airshot::overlay_detail::interaction_settle_mode(
+                airshot::overlay_detail::InteractionCommand::save) ==
+                airshot::overlay_detail::InteractionSettleMode::commit &&
+            airshot::overlay_detail::interaction_settle_mode(
+                airshot::overlay_detail::InteractionCommand::ocr) ==
+                airshot::overlay_detail::InteractionSettleMode::commit &&
+            airshot::overlay_detail::interaction_settle_mode(
+                airshot::overlay_detail::InteractionCommand::undo) ==
+                airshot::overlay_detail::InteractionSettleMode::cancel &&
+            airshot::overlay_detail::interaction_settle_mode(
+                airshot::overlay_detail::InteractionCommand::redo) ==
+                airshot::overlay_detail::InteractionSettleMode::cancel &&
+            airshot::overlay_detail::interaction_settle_mode(
+                airshot::overlay_detail::InteractionCommand::close) ==
+                airshot::overlay_detail::InteractionSettleMode::cancel,
+        L"output commands commit active gestures while history and close cancel them");
+
     const auto square =
         airshot::overlay_detail::constrained_annotation_geometry(
             Tool::rectangle,
@@ -247,6 +357,56 @@ void test_annotation_geometry_and_history() {
             centered_near_edge.start.y == 20 &&
             centered_near_edge.end.y == 80,
         L"Alt-centered shapes clamp each axis without distorting the other");
+
+    const auto square_selection =
+        airshot::overlay_detail::constrained_selection_rect(
+            POINT{10, 10},
+            POINT{40, 25},
+            airshot::RectI{0, 0, 100, 100},
+            true,
+            false);
+    expect(
+        square_selection.left == 10 && square_selection.top == 10 &&
+            square_selection.right == 40 && square_selection.bottom == 40,
+        L"Shift constrains a new capture selection to a stable square");
+
+    const auto centered_selection =
+        airshot::overlay_detail::constrained_selection_rect(
+            POINT{50, 50},
+            POINT{70, 60},
+            airshot::RectI{0, 0, 100, 100},
+            false,
+            true);
+    expect(
+        centered_selection.left == 30 && centered_selection.top == 40 &&
+            centered_selection.right == 70 && centered_selection.bottom == 60,
+        L"Alt expands a new capture selection from its center");
+
+    const auto aspect_selection =
+        airshot::overlay_detail::resize_selection_from_corner(
+            airshot::RectI{10, 10, 50, 30},
+            airshot::overlay_detail::DragMode::bottom_right,
+            POINT{70, 35},
+            airshot::RectI{0, 0, 100, 100},
+            true,
+            false);
+    expect(
+        aspect_selection.left == 10 && aspect_selection.top == 10 &&
+            aspect_selection.right == 70 && aspect_selection.bottom == 40,
+        L"Shift preserves the original ratio while resizing a capture corner");
+
+    const auto centered_resize =
+        airshot::overlay_detail::resize_selection_from_corner(
+            airshot::RectI{20, 20, 60, 40},
+            airshot::overlay_detail::DragMode::bottom_right,
+            POINT{70, 45},
+            airshot::RectI{0, 0, 100, 100},
+            false,
+            true);
+    expect(
+        centered_resize.left == 10 && centered_resize.top == 15 &&
+            centered_resize.right == 70 && centered_resize.bottom == 45,
+        L"Alt resizes an existing capture corner around the selection center");
 
     const std::vector<POINT> long_stroke{{0, 0}, {100, 0}};
     const auto capped_stroke =
@@ -338,6 +498,45 @@ void test_annotation_geometry_and_history() {
             aspect_resized.end.y == 50,
         L"Shift preserves aspect ratio while resizing annotations");
 
+    Annotation centered_rectangle;
+    centered_rectangle.tool = Tool::rectangle;
+    centered_rectangle.start = {40, 40};
+    centered_rectangle.end = {60, 60};
+    const Annotation centered_resized =
+        airshot::overlay_detail::resize_annotation_from_handle(
+            centered_rectangle,
+            airshot::overlay_detail::AnnotationHandle::bottom_right,
+            POINT{75, 70},
+            120,
+            120,
+            false,
+            true);
+    expect(
+        centered_resized.start.x == 25 &&
+            centered_resized.start.y == 30 &&
+            centered_resized.end.x == 75 &&
+            centered_resized.end.y == 70,
+        L"Alt resizes an annotation handle around its stable center");
+
+    Annotation wide_rectangle = centered_rectangle;
+    wide_rectangle.start = {40, 45};
+    wide_rectangle.end = {60, 55};
+    const Annotation centered_aspect_resized =
+        airshot::overlay_detail::resize_annotation_from_handle(
+            wide_rectangle,
+            airshot::overlay_detail::AnnotationHandle::bottom_right,
+            POINT{80, 60},
+            120,
+            120,
+            true,
+            true);
+    expect(
+        centered_aspect_resized.start.x == 20 &&
+            centered_aspect_resized.start.y == 35 &&
+            centered_aspect_resized.end.x == 80 &&
+            centered_aspect_resized.end.y == 65,
+        L"Shift and Alt preserve aspect ratio while scaling from center");
+
     Annotation arrow = rectangle;
     arrow.tool = Tool::arrow;
     arrow.start = {30, 30};
@@ -357,6 +556,72 @@ void test_annotation_geometry_and_history() {
             endpoint_resized.end.y == 62,
         L"line and arrow endpoints can be re-edited");
 
+    const Annotation centered_endpoint =
+        airshot::overlay_detail::resize_annotation_from_handle(
+            arrow,
+            airshot::overlay_detail::AnnotationHandle::end_point,
+            POINT{65, 60},
+            100,
+            100,
+            false,
+            true);
+    expect(
+        centered_endpoint.start.x + centered_endpoint.end.x ==
+                arrow.start.x + arrow.end.x &&
+            centered_endpoint.start.y + centered_endpoint.end.y ==
+                arrow.start.y + arrow.end.y &&
+            centered_endpoint.end.x == 65 &&
+            centered_endpoint.end.y == 60,
+        L"Alt moves the opposite line endpoint symmetrically");
+
+    Annotation edge_line = arrow;
+    edge_line.tool = Tool::line;
+    edge_line.start = {0, 10};
+    edge_line.end = {20, 10};
+    const Annotation bounded_centered_endpoint =
+        airshot::overlay_detail::resize_annotation_from_handle(
+            edge_line,
+            airshot::overlay_detail::AnnotationHandle::end_point,
+            POINT{100, 10},
+            100,
+            100,
+            false,
+            true);
+    expect(
+        bounded_centered_endpoint.start.x >= 0 &&
+            bounded_centered_endpoint.end.x <= 100 &&
+            airshot::overlay_detail::annotation_bounds(
+                bounded_centered_endpoint).left >= 0 &&
+            airshot::overlay_detail::annotation_bounds(
+                bounded_centered_endpoint).right <= 100,
+        L"center scaling clamps both line endpoints at the canvas edge");
+
+    expect(
+        airshot::overlay_detail::keyboard_selection_step(false) == 1 &&
+            airshot::overlay_detail::keyboard_selection_step(true) == 10,
+        L"selection arrow keys use one pixel or ten pixels with Shift");
+    const auto nudged_selection =
+        airshot::overlay_detail::translate_selection_within_bounds(
+            {20, 20, 50, 40},
+            10,
+            -10,
+            {0, 0, 100, 100});
+    const auto clamped_selection =
+        airshot::overlay_detail::translate_selection_within_bounds(
+            nudged_selection,
+            100,
+            -100,
+            {0, 0, 100, 100});
+    expect(
+        nudged_selection.left == 30 && nudged_selection.top == 10 &&
+            nudged_selection.width() == 30 &&
+            nudged_selection.height() == 20 &&
+            clamped_selection.left == 70 &&
+            clamped_selection.top == 0 &&
+            clamped_selection.width() == 30 &&
+            clamped_selection.height() == 20,
+        L"keyboard selection movement preserves size and clamps to the desktop");
+
     const POINT clone_offset =
         airshot::overlay_detail::preferred_clone_translation(
             rectangle,
@@ -368,10 +633,487 @@ void test_annotation_geometry_and_history() {
         L"annotation duplication uses a visible in-bounds offset");
 }
 
+void test_repeat_region_and_selection_size_policy() {
+    using airshot::DisplayMonitorGeometry;
+    using airshot::LastRegionCapture;
+    using airshot::RepeatRegionStatus;
+    using airshot::SelectionSizeAnchor;
+    using airshot::SelectionSizeParseError;
+
+    const std::vector<DisplayMonitorGeometry> monitors{
+        {{-1920, 0, 0, 1080}, false, L"LEFT"},
+        {{0, 0, 1920, 1080}, true, L"PRIMARY"},
+    };
+    const std::vector<DisplayMonitorGeometry> reordered{
+        monitors[1], monitors[0]};
+    const std::wstring signature =
+        airshot::display_topology_signature(monitors);
+    expect(
+        airshot::valid_display_topology_signature(signature) &&
+            signature == airshot::display_topology_signature(reordered),
+        L"display topology signature is valid and monitor-order independent");
+    const auto desktop = airshot::display_topology_bounds(monitors);
+    expect(
+        desktop && same_rect(*desktop, {-1920, 0, 1920, 1080}),
+        L"display topology bounds preserve negative monitor coordinates");
+
+    const auto no_history = airshot::resolve_repeat_region(
+        std::nullopt,
+        monitors);
+    expect(
+        no_history.status == RepeatRegionStatus::no_history,
+        L"repeat capture reports an explicit no-history state");
+
+    const LastRegionCapture exact_history{
+        {-1800, 100, -1400, 500},
+        signature};
+    const auto exact = airshot::resolve_repeat_region(exact_history, monitors);
+    expect(
+        exact && !exact.topology_changed && !exact.cropped &&
+            same_rect(exact.bounds, exact_history.bounds),
+        L"repeat capture keeps an exact negative-coordinate region on unchanged topology");
+
+    const std::vector<DisplayMonitorGeometry> smaller_monitor{
+        {{0, 0, 1000, 700}, true, L"PRIMARY"},
+    };
+    const LastRegionCapture translated_history{
+        {-50, 40, 150, 240},
+        L"v1-0000000000000000"};
+    const auto translated = airshot::resolve_repeat_region(
+        translated_history,
+        smaller_monitor);
+    expect(
+        translated && translated.topology_changed && !translated.cropped &&
+            same_rect(translated.bounds, {0, 40, 200, 240}),
+        L"topology changes translate a partially visible repeat region without resizing it");
+
+    const LastRegionCapture oversized_history{
+        {-100, -50, 1100, 800},
+        L"v1-0000000000000000"};
+    const auto cropped = airshot::resolve_repeat_region(
+        oversized_history,
+        smaller_monitor);
+    expect(
+        cropped && cropped.cropped &&
+            same_rect(cropped.bounds, {0, 0, 1000, 700}),
+        L"repeat capture crops only dimensions larger than the current virtual desktop");
+
+    const LastRegionCapture unplugged_history{
+        {-1800, 100, -1400, 500},
+        signature};
+    const auto unplugged = airshot::resolve_repeat_region(
+        unplugged_history,
+        smaller_monitor);
+    expect(
+        unplugged.status == RepeatRegionStatus::no_intersection,
+        L"repeat capture rejects a region left entirely on an unplugged monitor");
+
+    const std::vector<DisplayMonitorGeometry> monitors_with_gap{
+        {{0, 0, 100, 100}, true, L"A"},
+        {{200, 0, 300, 100}, false, L"B"},
+    };
+    const LastRegionCapture gap_history{
+        {120, 20, 180, 80},
+        L"v1-0000000000000000"};
+    const auto gap = airshot::resolve_repeat_region(
+        gap_history,
+        monitors_with_gap);
+    expect(
+        gap.status == RepeatRegionStatus::no_intersection,
+        L"repeat capture rejects regions wholly inside a virtual-desktop monitor gap");
+
+    const LastRegionCapture invalid_history{
+        {0, 0, 1, 100},
+        L"not-a-signature"};
+    expect(
+        airshot::resolve_repeat_region(invalid_history, monitors).status ==
+            RepeatRegionStatus::invalid_history,
+        L"repeat capture rejects malformed persisted history");
+
+    const auto parsed = airshot::parse_selection_size(
+        L"640",
+        L"480",
+        3840,
+        1080);
+    expect(
+        parsed && parsed.width == 640 && parsed.height == 480,
+        L"selection size parser accepts dimensions within virtual-desktop limits");
+    expect(
+        airshot::parse_selection_size(L"1", L"20", 100, 100).error ==
+            SelectionSizeParseError::width_out_of_range &&
+            airshot::parse_selection_size(L"20", L"101", 100, 100).error ==
+                SelectionSizeParseError::height_out_of_range &&
+            airshot::parse_selection_size(L"2x", L"20", 100, 100).error ==
+                SelectionSizeParseError::invalid_width &&
+            airshot::parse_selection_size(
+                L"999999999999999999999",
+                L"20",
+                100,
+                100)
+                    .error == SelectionSizeParseError::invalid_width,
+        L"selection size parser rejects range, syntax, and overflow errors");
+
+    const airshot::RectI negative_desktop{-1920, -200, 1920, 1080};
+    const auto centered = airshot::resize_selection_to_size(
+        {-100, 100, 100, 300},
+        400,
+        300,
+        negative_desktop,
+        SelectionSizeAnchor::center);
+    expect(
+        centered && same_rect(*centered, {-200, 50, 200, 350}),
+        L"center-anchored size entry preserves the selection center");
+    const auto top_left = airshot::resize_selection_to_size(
+        {1800, 1000, 1900, 1070},
+        400,
+        300,
+        negative_desktop,
+        SelectionSizeAnchor::top_left);
+    expect(
+        top_left && same_rect(*top_left, {1520, 780, 1920, 1080}),
+        L"top-left size entry clamps by translation while preserving size");
+    expect(
+        !airshot::resize_selection_to_size(
+            {0, 0, 20, 20},
+            4000,
+            20,
+            negative_desktop,
+            SelectionSizeAnchor::center),
+        L"selection sizing rejects dimensions larger than the virtual desktop");
+
+    const auto badge = airshot::selection_size_badge_bounds(
+        {-1910, -195, -1800, -100},
+        negative_desktop);
+    expect(
+        badge.left >= negative_desktop.left &&
+            badge.top >= negative_desktop.top &&
+            badge.right <= negative_desktop.right &&
+            badge.bottom <= negative_desktop.bottom,
+        L"selection size badge remains visible on negative-coordinate desktops");
+    const auto tiny_badge = airshot::selection_size_badge_bounds(
+        {0, 0, 2, 2},
+        {0, 0, 10, 10});
+    expect(
+        same_rect(tiny_badge, {0, 0, 10, 10}),
+        L"selection size badge safely adapts to very small synthetic desktops");
+}
+
+void test_annotation_product_styles_and_toolbar_layout() {
+    using airshot::overlay_detail::Annotation;
+    using airshot::overlay_detail::ArrowHeadStyle;
+    using airshot::overlay_detail::ShapeFillStyle;
+    using airshot::overlay_detail::StrokePattern;
+    using airshot::overlay_detail::TextStyle;
+    using airshot::overlay_detail::Tool;
+    using airshot::overlay_detail::ToolbarButton;
+    using airshot::overlay_detail::ToolbarMetrics;
+    using airshot::overlay_detail::ToolStylePalette;
+
+    ToolStylePalette styles(128);
+    auto& rectangle_style = styles.for_tool(Tool::rectangle);
+    rectangle_style.color = RGB(1, 2, 3);
+    rectangle_style.width = 8.0F;
+    rectangle_style.fill_style = ShapeFillStyle::translucent;
+    rectangle_style.stroke_pattern = StrokePattern::dashed;
+    rectangle_style.rounded_rectangle = true;
+    const auto& pen_style = styles.for_tool(Tool::pen);
+    const auto& highlight_style = styles.for_tool(Tool::highlight);
+    expect(
+        rectangle_style.color == RGB(1, 2, 3) &&
+            rectangle_style.width == 8.0F &&
+            rectangle_style.fill_style == ShapeFillStyle::translucent &&
+            rectangle_style.stroke_pattern == StrokePattern::dashed &&
+            rectangle_style.rounded_rectangle &&
+            pen_style.color == RGB(245, 34, 45) &&
+            pen_style.width == 4.0F &&
+            highlight_style.color == RGB(250, 219, 20) &&
+            highlight_style.highlight_alpha == 128,
+        L"each annotation tool keeps an independent style within one capture");
+
+    const auto horizontal = airshot::overlay_detail::orthogonal_endpoint(
+        POINT{10, 10},
+        POINT{40, 19});
+    const auto vertical = airshot::overlay_detail::orthogonal_endpoint(
+        POINT{10, 10},
+        POINT{14, 50});
+    expect(
+        horizontal.x == 40 && horizontal.y == 10 &&
+            vertical.x == 10 && vertical.y == 50,
+        L"Shift highlight constraint selects the dominant axis");
+
+    expect(
+        airshot::overlay_detail::arrow_head_length(0.0F) == 10.0F &&
+            airshot::overlay_detail::arrow_head_length(100.0F) == 34.0F &&
+            airshot::overlay_detail::arrow_has_start_head(
+                ArrowHeadStyle::reverse) &&
+            airshot::overlay_detail::arrow_has_start_head(
+                ArrowHeadStyle::both) &&
+            airshot::overlay_detail::arrow_has_end_head(
+                ArrowHeadStyle::forward) &&
+            airshot::overlay_detail::arrow_has_end_head(
+                ArrowHeadStyle::both),
+        L"arrow heads expose bounded width-aware forward/reverse/both modes");
+    const auto short_wings = airshot::overlay_detail::arrow_head_wings(
+        POINT{5, 0},
+        POINT{0, 0},
+        50.0F);
+    expect(
+        short_wings.first.x >= 0 && short_wings.second.x >= 0 &&
+            short_wings.first.x <= 5 && short_wings.second.x <= 5,
+        L"arrow heads remain bounded by short shaft geometry");
+
+    std::vector<POINT> bounded_stroke;
+    const bool first_added =
+        airshot::overlay_detail::append_stroke_point_bounded(
+            bounded_stroke, POINT{0, 0}, 2.0, 2);
+    const bool jitter_added =
+        airshot::overlay_detail::append_stroke_point_bounded(
+            bounded_stroke, POINT{1, 0}, 2.0, 2);
+    const bool second_added =
+        airshot::overlay_detail::append_stroke_point_bounded(
+            bounded_stroke, POINT{2, 0}, 2.0, 2);
+    const bool over_limit_added =
+        airshot::overlay_detail::append_stroke_point_bounded(
+            bounded_stroke, POINT{4, 0}, 2.0, 2);
+    expect(
+        first_added && !jitter_added && second_added &&
+            !over_limit_added && bounded_stroke.size() == 2,
+        L"pen input removes pointer jitter and enforces a hard point bound");
+    const std::vector<POINT> noisy_stroke{
+        {0, 0}, {2, 6}, {4, 0}, {6, 6}, {8, 0}};
+    const auto smoothed =
+        airshot::overlay_detail::smooth_polyline(noisy_stroke, 2, 32);
+    expect(
+        !smoothed.empty() && smoothed.front().x == 0 &&
+            smoothed.front().y == 0 && smoothed.back().x == 8 &&
+            smoothed.back().y == 0 && smoothed.size() <= noisy_stroke.size(),
+        L"pen smoothing is bounded and preserves both endpoints");
+    const std::vector<POINT> click_dot{{7, 9}};
+    const auto smoothed_click =
+        airshot::overlay_detail::smooth_polyline(click_dot);
+    expect(
+        smoothed_click.size() == 1 && smoothed_click.front().x == 7 &&
+            smoothed_click.front().y == 9,
+        L"pen smoothing preserves a single-click dot");
+
+    Annotation serial;
+    serial.tool = Tool::serial;
+    serial.start = {50, 50};
+    serial.end = serial.start;
+    serial.width = 4.0F;
+    serial.serial = 100;
+    const float two_digit_radius =
+        airshot::overlay_detail::serial_visual_radius(4.0F, 99);
+    const float three_digit_radius =
+        airshot::overlay_detail::serial_visual_radius(4.0F, 100);
+    const auto serial_bounds =
+        airshot::overlay_detail::annotation_bounds(serial);
+    expect(
+        airshot::overlay_detail::serial_digit_count(100) == 3 &&
+            three_digit_radius > two_digit_radius &&
+            airshot::overlay_detail::serial_font_size(4.0F, 100) <
+                three_digit_radius &&
+            serial_bounds.width() >=
+                static_cast<int>(std::ceil(three_digit_radius * 2.0F)),
+        L"three-digit serial markers adapt circle, font, and hit bounds");
+
+    Annotation zero_effect;
+    zero_effect.tool = Tool::blur;
+    zero_effect.points = {{10, 10}};
+    zero_effect.alpha = 0;
+    expect(
+        !airshot::overlay_detail::annotation_is_committable(zero_effect),
+        L"zero-strength mosaic and blur gestures are not committed");
+
+    Annotation hollow_rectangle;
+    hollow_rectangle.tool = Tool::rectangle;
+    hollow_rectangle.start = {10, 10};
+    hollow_rectangle.end = {110, 90};
+    hollow_rectangle.width = 4.0F;
+    expect(
+        airshot::overlay_detail::shape_annotation_hit_test(
+            hollow_rectangle, POINT{10, 50}) &&
+            !airshot::overlay_detail::shape_annotation_hit_test(
+                hollow_rectangle, POINT{60, 50}) &&
+            airshot::overlay_detail::shape_annotation_hit_test(
+                hollow_rectangle, POINT{3, 50}) &&
+            !airshot::overlay_detail::shape_annotation_hit_test(
+                hollow_rectangle, POINT{0, 50}),
+        L"hollow rectangle hit testing follows its width-aware stroke instead of its interior bounds");
+    Annotation filled_rectangle = hollow_rectangle;
+    filled_rectangle.fill_style = ShapeFillStyle::translucent;
+    expect(
+        airshot::overlay_detail::shape_annotation_hit_test(
+            filled_rectangle, POINT{60, 50}),
+        L"filled rectangle hit testing includes the interior");
+
+    Annotation hollow_ellipse = hollow_rectangle;
+    hollow_ellipse.tool = Tool::ellipse;
+    hollow_ellipse.start = {150, 10};
+    hollow_ellipse.end = {250, 90};
+    expect(
+        airshot::overlay_detail::shape_annotation_hit_test(
+            hollow_ellipse, POINT{200, 10}) &&
+            !airshot::overlay_detail::shape_annotation_hit_test(
+                hollow_ellipse, POINT{200, 50}),
+        L"hollow ellipse hit testing follows the curved stroke and excludes its center");
+    hollow_ellipse.fill_style = ShapeFillStyle::translucent;
+    expect(
+        airshot::overlay_detail::shape_annotation_hit_test(
+            hollow_ellipse, POINT{200, 50}),
+        L"filled ellipse hit testing includes the interior");
+
+    Annotation rounded_rectangle = hollow_rectangle;
+    rounded_rectangle.width = 2.0F;
+    rounded_rectangle.rounded_rectangle = true;
+    expect(
+        !airshot::overlay_detail::shape_annotation_hit_test(
+            rounded_rectangle, POINT{10, 10}, 0.0) &&
+            airshot::overlay_detail::shape_annotation_hit_test(
+                rounded_rectangle, POINT{12, 12}, 0.0),
+        L"rounded rectangle hit testing excludes the clipped corner and includes its arc");
+
+    expect(
+        airshot::overlay_detail::tool_uses_bitmap_effect_preview(
+            Tool::highlight) &&
+            airshot::overlay_detail::tool_uses_bitmap_effect_preview(
+                Tool::mosaic) &&
+            !airshot::overlay_detail::tool_uses_bitmap_effect_preview(
+                Tool::pen),
+        L"highlight preview uses the same bitmap effect pipeline as its committed render");
+    expect(
+        airshot::overlay_detail::should_persist_tool_style(
+            Tool::rectangle, true) &&
+            airshot::overlay_detail::should_persist_tool_style(
+                Tool::select, false) &&
+            !airshot::overlay_detail::should_persist_tool_style(
+                Tool::select, true),
+        L"selecting and editing a history object cannot overwrite new-tool defaults");
+    expect(
+        airshot::overlay_detail::effect_geometry_mode_available(
+            Tool::mosaic, Tool::mosaic, false) &&
+            !airshot::overlay_detail::effect_geometry_mode_available(
+                Tool::select, Tool::mosaic, true) &&
+            !airshot::overlay_detail::effect_geometry_mode_available(
+                Tool::select, Tool::blur, true),
+        L"existing mosaic and blur objects do not expose a silent no-op geometry mode switch");
+
+    Annotation styled_history;
+    styled_history.tool = Tool::rectangle;
+    styled_history.start = {10, 10};
+    styled_history.end = {30, 30};
+    styled_history.fill_style = ShapeFillStyle::translucent;
+    styled_history.stroke_pattern = StrokePattern::dashed;
+    styled_history.rounded_rectangle = true;
+    std::vector<Annotation> document{styled_history};
+    airshot::overlay_detail::AnnotationHistory history;
+    history.record(document);
+    document.front().fill_style = ShapeFillStyle::outline;
+    document.front().stroke_pattern = StrokePattern::solid;
+    document.front().rounded_rectangle = false;
+    expect(
+        history.undo(document) &&
+            document.front().fill_style == ShapeFillStyle::translucent &&
+            document.front().stroke_pattern == StrokePattern::dashed &&
+            document.front().rounded_rectangle,
+        L"undo restores all product shape styles atomically");
+
+    Annotation normal_text;
+    normal_text.tool = Tool::text;
+    normal_text.start = {20, 20};
+    normal_text.end = normal_text.start;
+    normal_text.text = L"Air";
+    normal_text.width = 18.0F;
+    Annotation dark_text = normal_text;
+    dark_text.text_style = TextStyle::dark;
+    Annotation outline_text = normal_text;
+    outline_text.text_style = TextStyle::outline;
+    const auto normal_bounds =
+        airshot::overlay_detail::annotation_bounds(normal_text);
+    const auto dark_bounds =
+        airshot::overlay_detail::annotation_bounds(dark_text);
+    const auto outline_bounds =
+        airshot::overlay_detail::annotation_bounds(outline_text);
+    expect(
+        dark_bounds.left == normal_bounds.left &&
+            dark_bounds.top == normal_bounds.top &&
+            dark_bounds.right == normal_bounds.right + 8 &&
+            dark_bounds.bottom == normal_bounds.bottom + 6 &&
+            outline_bounds.left == normal_bounds.left - 2 &&
+            outline_bounds.top == normal_bounds.top - 2,
+        L"normal, dark, and outline text bounds match their rendered footprint");
+
+    const std::vector<std::pair<std::wstring, std::wstring>> rectangle_items{
+        {L"width_small", L""}, {L"width_medium", L""},
+        {L"width_large", L""}, {L"|", L""},
+        {L"color_red", L""}, {L"color_green", L""},
+        {L"color_blue", L""}, {L"color_yellow", L""},
+        {L"color_black", L""}, {L"color_gray", L""},
+        {L"color_white", L""}, {L"color_custom", L""},
+        {L"|", L""}, {L"fill_outline", L"空心"},
+        {L"fill_translucent", L"填充"}, {L"|", L""},
+        {L"corner_square", L"直角"}, {L"corner_round", L"圆角"},
+        {L"|", L""}, {L"stroke_solid", L"实线"},
+        {L"stroke_dashed", L"虚线"},
+    };
+    const auto verify_toolbar = [&](airshot::RectI monitor,
+                                    ToolbarMetrics metrics,
+                                    std::wstring_view message) {
+        const auto rows = airshot::overlay_detail::wrap_toolbar_items(
+            rectangle_items,
+            metrics,
+            monitor);
+        const int width =
+            airshot::overlay_detail::toolbar_width(rows, metrics);
+        const int height =
+            airshot::overlay_detail::toolbar_height(rows, metrics);
+        const int left = airshot::overlay_detail::clamp_toolbar_axis(
+            monitor.right - width,
+            width,
+            monitor.left,
+            monitor.right);
+        const int top = airshot::overlay_detail::clamp_toolbar_axis(
+            monitor.bottom - height,
+            height,
+            monitor.top,
+            monitor.bottom);
+        std::vector<ToolbarButton> buttons;
+        airshot::overlay_detail::place_toolbar_rows(
+            buttons, rows, metrics, left, top);
+        const bool all_inside = std::ranges::all_of(
+            buttons,
+            [&](const ToolbarButton& button) {
+                return button.bounds.left >= monitor.left &&
+                       button.bounds.top >= monitor.top &&
+                       button.bounds.right <= monitor.right &&
+                       button.bounds.bottom <= monitor.bottom;
+            });
+        expect(
+            !rows.empty() && !buttons.empty() && width <= monitor.width() &&
+                height <= monitor.height() && all_inside,
+            message);
+    };
+    verify_toolbar(
+        {0, 0, 1280, 720},
+        {36, 34, 4, 8},
+        L"expanded sub-toolbar fits a 1280 by 720 monitor");
+    verify_toolbar(
+        {-1280, -120, 0, 600},
+        {36, 34, 4, 8},
+        L"expanded sub-toolbar fits a negative-coordinate monitor");
+    verify_toolbar(
+        {0, 0, 1280, 720},
+        {54, 51, 6, 12},
+        L"expanded sub-toolbar remains bounded with 150 percent metrics");
+}
+
 void test_config() {
     expect(airshot::AppConfig{}.ocr_engine == airshot::kDefaultOcrEngine &&
                airshot::kDefaultOcrEngine == airshot::kOcrEngineRapidV5Fast,
            L"default OCR engine is local high accuracy");
+    expect(
+        airshot::AppConfig{}.toolbar_order.starts_with(L"lock,"),
+        L"new installations expose continuous annotation in the toolbar");
 
     airshot::AppConfig config;
     config.annotation_enabled = false;
@@ -381,6 +1123,7 @@ void test_config() {
     config.global_ocr_enabled = true;
     config.capture_hotkey = L"Ctrl+Shift+F9";
     config.global_ocr_hotkey = L"Ctrl+Alt+O";
+    config.capture_cursor = true;
     config.custom_color = L"#123456";
     config.tool_shortcut_select = L"Shift+S";
     config.tool_shortcut_rectangle = L"Shift+R";
@@ -397,10 +1140,11 @@ void test_config() {
                !parsed->annotation_locked_tool && parsed->annotation_hidden_tools == L"rect,pen,close" &&
                parsed->annotation_highlight_alpha == 192 &&
                parsed->capture_hotkey == L"Ctrl+Shift+F9" && parsed->global_ocr_hotkey == L"Ctrl+Alt+O" &&
+               parsed->capture_cursor &&
                parsed->custom_color == L"#123456" &&
                parsed->tool_shortcut_select == L"Shift+S" &&
                parsed->tool_shortcut_rectangle == L"Shift+R" &&
-               parsed->toolbar_order == L"rect,pen,close" &&
+               parsed->toolbar_order == airshot::kDefaultToolbarOrder &&
                parsed->text_font_family == L"Consolas" &&
                parsed->text_font_bold == true &&
                parsed->text_font_italic == true &&
@@ -413,11 +1157,42 @@ void test_config() {
         LR"({"schemaVersion":2,"annotation":{"enabled":false},"future":[null,true,{"name":"\u4E2D"}]})");
     expect(future && future->schema_version == 2 && !future->annotation_enabled &&
                future->annotation_locked_tool && future->annotation_hidden_tools.empty() &&
+               future->toolbar_order.starts_with(L"lock,") &&
+               !future->capture_cursor &&
                future->annotation_highlight_alpha == 96 &&
                future->text_font_family == L"Microsoft YaHei" && !future->text_font_bold && !future->text_font_italic &&
                future->app_icon == airshot::kDefaultAppIcon &&
                future->ocr_engine == airshot::kDefaultOcrEngine,
            L"config accepts unknown future fields and keeps annotation defaults");
+    constexpr std::wstring_view normalized_legacy_toolbar_order =
+        L"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,highlight,watermark,text,serial,eraser,undo,redo,ocr,scroll,pin,save,close,copy";
+    const auto explicit_legacy_toolbar = airshot::config_from_json(
+        LR"({"schemaVersion":2,"annotation":{"toolbarOrder":"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,highlight,text,serial,eraser,undo,redo,ocr,scroll,pin,save,copy"}})");
+    expect(
+        explicit_legacy_toolbar &&
+            explicit_legacy_toolbar->toolbar_order ==
+                normalized_legacy_toolbar_order,
+        L"legacy toolbar order keeps known relative order and gains missing tools");
+    const std::wstring only_blur =
+        airshot::normalize_toolbar_order(L"blur");
+    const std::wstring only_mosaic =
+        airshot::normalize_toolbar_order(L"mosaic");
+    expect(
+        only_blur == airshot::kDefaultToolbarOrder &&
+            only_mosaic == airshot::kDefaultToolbarOrder &&
+            only_blur.find(L"mosaic,blur") != std::wstring::npos,
+        L"single legacy blur or mosaic layouts regain the unified effect anchors");
+    const std::wstring customized_toolbar =
+        airshot::normalize_toolbar_order(
+            L"copy,unknown,RECT,copy,lock");
+    expect(
+        customized_toolbar.find(L"unknown") == std::wstring::npos &&
+            customized_toolbar.find(L"copy") <
+                customized_toolbar.find(L"rect") &&
+            customized_toolbar.find(L"rect") <
+                customized_toolbar.find(L"lock") &&
+            customized_toolbar.find(L"copy", 1) == std::wstring::npos,
+        L"toolbar normalization filters unknowns, deduplicates, and preserves custom order");
     const auto legacy_serial = airshot::config_from_json(
         LR"({"annotation":{"nextSerial":37}})");
     expect(
@@ -577,12 +1352,67 @@ void test_portable_runtime() {
 
 }  // namespace
 
+void test_overlay_ui_dpi_metrics() {
+    using airshot::overlay_detail::OverlayUiMetrics;
+    using airshot::overlay_detail::ToolbarMetrics;
+    using airshot::overlay_detail::scale_overlay_ui_px;
+    using airshot::overlay_detail::toolbar_item_width;
+
+    expect(scale_overlay_ui_px(9, 96) == 9 &&
+               scale_overlay_ui_px(9, 144) == 14 &&
+               scale_overlay_ui_px(9, 192) == 18,
+           L"overlay UI integer scaling rounds consistently at 96/144/192 DPI");
+    expect(scale_overlay_ui_px(40, 96) == 40 &&
+               scale_overlay_ui_px(40, 144) == 60 &&
+               scale_overlay_ui_px(40, 192) == 80,
+           L"overlay UI button scaling at 96/144/192 DPI");
+
+    const auto verify_toolbar = [&](unsigned int dpi,
+                                    int button,
+                                    int drag,
+                                    int separator,
+                                    int slider) {
+        const OverlayUiMetrics ui{dpi};
+        const ToolbarMetrics metrics{
+            ui.px(40), ui.px(40), ui.px(4), ui.px(8), dpi};
+        expect(metrics.button_width == button &&
+                   toolbar_item_width(L"drag", metrics) == drag &&
+                   toolbar_item_width(L"|", metrics) == separator &&
+                   toolbar_item_width(L"mosaic_strength_slider", metrics) == slider,
+               L"toolbar layout and special items share one DPI scale");
+    };
+    verify_toolbar(96, 40, 20, 9, 188);
+    verify_toolbar(144, 60, 30, 14, 282);
+    verify_toolbar(192, 80, 40, 18, 376);
+
+    const airshot::RectI selection{100, 200, 500, 600};
+    const airshot::RectI desktop{0, 0, 2000, 1200};
+    expect(same_rect(
+               airshot::selection_size_badge_bounds(selection, desktop, 96),
+               {100, 172, 260, 196}),
+           L"selection badge metrics at 96 DPI");
+    expect(same_rect(
+               airshot::selection_size_badge_bounds(selection, desktop, 144),
+               {100, 158, 340, 194}),
+           L"selection badge metrics at 144 DPI");
+    expect(same_rect(
+               airshot::selection_size_badge_bounds(selection, desktop, 192),
+               {100, 144, 420, 192}),
+           L"selection badge metrics at 192 DPI");
+    expect(selection.width() == 400 && selection.height() == 400,
+           L"DPI scaling leaves screenshot canvas coordinates unchanged");
+}
+
 int wmain() {
+    test_overlay_ui_dpi_metrics();
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     test_rect_and_bitmap();
+    test_window_candidate_hierarchy();
     test_pin_recovery_layout();
+    test_repeat_region_and_selection_size_policy();
     test_serial_counter_is_scoped_to_capture_session();
     test_annotation_geometry_and_history();
+    test_annotation_product_styles_and_toolbar_layout();
     test_config();
     test_cli();
     test_ocr_join();

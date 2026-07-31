@@ -21,6 +21,19 @@ enum class UpdateStageResult {
     failed,
 };
 
+enum class UpdateRequestSource {
+    automatic,
+    manual,
+};
+
+enum class PendingUpdateManualResult {
+    ready,
+    missing,
+    busy,
+    invalid,
+    failed,
+};
+
 [[nodiscard]] std::filesystem::path portable_executable_path();
 [[nodiscard]] std::wstring portable_startup_command(const std::filesystem::path& executable);
 bool sync_portable_startup(bool enabled, std::wstring* error = nullptr);
@@ -38,8 +51,17 @@ UpdateStageResult stage_latest_update(std::wstring* message = nullptr);
 UpdateStageResult stage_latest_update(
     std::wstring* message,
     std::stop_token stop_token);
-[[nodiscard]] bool pending_update_available();
+UpdateStageResult stage_latest_update(
+    std::wstring* message,
+    std::stop_token stop_token,
+    UpdateRequestSource source);
+[[nodiscard]] PendingUpdateManualResult mark_pending_update_manual(
+    std::wstring* error = nullptr);
 bool launch_pending_update(bool restart_after_update, std::wstring* error = nullptr);
+bool launch_pending_update(
+    bool restart_after_update,
+    bool allow_automatic_pending,
+    std::wstring* error);
 int run_update_helper(std::span<const std::wstring> arguments);
 void cleanup_stale_updates();
 

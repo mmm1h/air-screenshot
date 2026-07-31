@@ -7,10 +7,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <fcntl.h>
 #include <filesystem>
+#include <format>
 #include <io.h>
 #include <limits>
 #include <optional>
@@ -22,7 +24,8 @@
 namespace {
 
 constexpr DWORD kRunnerTimeoutMs = 120'000;
-constexpr std::size_t kMaxRunnerOutputBytes = 8U * 1024U * 1024U;
+constexpr std::size_t kMaxRunnerProtocolBytes = 8U * 1024U * 1024U;
+constexpr std::size_t kMaxRunnerDiagnosticBytes = 1U * 1024U * 1024U;
 
 class UniqueHandle {
 public:
@@ -279,6 +282,7 @@ std::optional<std::vector<wchar_t>> runner_environment_block() {
 bool append_available_output(
     HANDLE pipe,
     std::vector<char>& output,
+    std::size_t maximum_bytes,
     bool& output_limit_exceeded) {
     std::array<char, 4096> temporary{};
     for (;;) {
@@ -300,7 +304,7 @@ bool append_available_output(
         if (bytes_read == 0) {
             return true;
         }
-        if (bytes_read > kMaxRunnerOutputBytes - std::min(output.size(), kMaxRunnerOutputBytes)) {
+        if (bytes_read > maximum_bytes - std::min(output.size(), maximum_bytes)) {
             output_limit_exceeded = true;
             return false;
         }
@@ -324,19 +328,39 @@ bool run_external_runner(
     const std::filesystem::path& image_path,
     const std::filesystem::path& model_dir,
     std::wstring_view profile,
+    const airshot::OcrProtocolExpectations& expected,
     int ort_threads,
-    std::wstring& out_text,
+    std::string& out_protocol,
+    std::wstring& out_diagnostic,
     std::wstring& out_error) {
-    HANDLE raw_read = nullptr;
-    HANDLE raw_write = nullptr;
+    HANDLE raw_stdout_read = nullptr;
+    HANDLE raw_stdout_write = nullptr;
+    HANDLE raw_stderr_read = nullptr;
+    HANDLE raw_stderr_write = nullptr;
     SECURITY_ATTRIBUTES pipe_security{sizeof(pipe_security), nullptr, TRUE};
-    if (!CreatePipe(&raw_read, &raw_write, &pipe_security, 0)) {
+    if (!CreatePipe(&raw_stdout_read, &raw_stdout_write, &pipe_security, 0) ||
+        !CreatePipe(&raw_stderr_read, &raw_stderr_write, &pipe_security, 0)) {
+        if (raw_stdout_read) {
+            CloseHandle(raw_stdout_read);
+        }
+        if (raw_stdout_write) {
+            CloseHandle(raw_stdout_write);
+        }
+        if (raw_stderr_read) {
+            CloseHandle(raw_stderr_read);
+        }
+        if (raw_stderr_write) {
+            CloseHandle(raw_stderr_write);
+        }
         out_error = L"创建 OCR runner 输出管道失败。";
         return false;
     }
-    UniqueHandle stdout_read(raw_read);
-    UniqueHandle stdout_write(raw_write);
-    if (!SetHandleInformation(stdout_read.get(), HANDLE_FLAG_INHERIT, 0)) {
+    UniqueHandle stdout_read(raw_stdout_read);
+    UniqueHandle stdout_write(raw_stdout_write);
+    UniqueHandle stderr_read(raw_stderr_read);
+    UniqueHandle stderr_write(raw_stderr_write);
+    if (!SetHandleInformation(stdout_read.get(), HANDLE_FLAG_INHERIT, 0) ||
+        !SetHandleInformation(stderr_read.get(), HANDLE_FLAG_INHERIT, 0)) {
         out_error = L"限制 OCR runner 管道继承失败。";
         return false;
     }
@@ -373,7 +397,8 @@ bool run_external_runner(
         return false;
     }
 
-    HANDLE inherited_handles[] = {stdin_null.get(), stdout_write.get()};
+    HANDLE inherited_handles[] = {
+        stdin_null.get(), stdout_write.get(), stderr_write.get()};
     if (!UpdateProcThreadAttribute(
             attributes,
             0,
@@ -408,14 +433,21 @@ bool run_external_runner(
     command_line += L" --image " + quote_argument(image_path.wstring());
     command_line += L" --model-dir " + quote_argument(model_dir.wstring());
     command_line += L" --ocr-profile " + quote_argument(profile);
-    command_line += L" --ort-threads " + std::to_wstring(std::clamp(ort_threads, 1, 16));
+    command_line += L" --ort-threads " + std::to_wstring(std::clamp(ort_threads, 1, 4));
+    command_line += L" --source-width " + std::to_wstring(expected.source_width);
+    command_line += L" --source-height " + std::to_wstring(expected.source_height);
+    command_line += L" --input-width " + std::to_wstring(expected.input_width);
+    command_line += L" --input-height " + std::to_wstring(expected.input_height);
+    command_line += L" --scale-x " + std::format(L"{:.17g}", expected.scale_x);
+    command_line += L" --scale-y " + std::format(L"{:.17g}", expected.scale_y);
+    command_line += L" --preprocess-mode " + quote_argument(expected.resample);
 
     STARTUPINFOEXW startup{};
     startup.StartupInfo.cb = sizeof(startup);
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdInput = stdin_null.get();
     startup.StartupInfo.hStdOutput = stdout_write.get();
-    startup.StartupInfo.hStdError = stdout_write.get();
+    startup.StartupInfo.hStdError = stderr_write.get();
     startup.lpAttributeList = attributes;
 
     auto environment = runner_environment_block();
@@ -467,6 +499,7 @@ bool run_external_runner(
     const DWORD restore_error = restored ? ERROR_SUCCESS : GetLastError();
     DeleteProcThreadAttributeList(attributes);
     stdout_write.reset();
+    stderr_write.reset();
 
     UniqueHandle process_handle(process.hProcess);
     UniqueHandle thread_handle(process.hThread);
@@ -498,16 +531,29 @@ bool run_external_runner(
         return false;
     }
 
-    std::vector<char> output;
-    output.reserve(4096);
+    std::vector<char> protocol_output;
+    protocol_output.reserve(4096);
+    std::vector<char> diagnostic_output;
+    diagnostic_output.reserve(1024);
     const ULONGLONG deadline = GetTickCount64() + kRunnerTimeoutMs;
     bool timed_out = false;
-    bool output_limit_exceeded = false;
+    bool protocol_limit_exceeded = false;
+    bool diagnostic_limit_exceeded = false;
     bool wait_failed = false;
 
     for (;;) {
-        if (!append_available_output(stdout_read.get(), output, output_limit_exceeded)) {
-            if (output_limit_exceeded) {
+        const bool stdout_ok = append_available_output(
+            stdout_read.get(),
+            protocol_output,
+            kMaxRunnerProtocolBytes,
+            protocol_limit_exceeded);
+        const bool stderr_ok = append_available_output(
+            stderr_read.get(),
+            diagnostic_output,
+            kMaxRunnerDiagnosticBytes,
+            diagnostic_limit_exceeded);
+        if (!stdout_ok || !stderr_ok) {
+            if (protocol_limit_exceeded || diagnostic_limit_exceeded) {
                 TerminateJobObject(job.get(), 125);
                 WaitForSingleObject(process_handle.get(), 5'000);
             }
@@ -516,7 +562,16 @@ bool run_external_runner(
 
         const DWORD wait_result = WaitForSingleObject(process_handle.get(), 25);
         if (wait_result == WAIT_OBJECT_0) {
-            append_available_output(stdout_read.get(), output, output_limit_exceeded);
+            append_available_output(
+                stdout_read.get(),
+                protocol_output,
+                kMaxRunnerProtocolBytes,
+                protocol_limit_exceeded);
+            append_available_output(
+                stderr_read.get(),
+                diagnostic_output,
+                kMaxRunnerDiagnosticBytes,
+                diagnostic_limit_exceeded);
             break;
         }
         if (wait_result == WAIT_FAILED) {
@@ -541,8 +596,12 @@ bool run_external_runner(
         out_error = L"RapidOCR runner 超过 120 秒，已停止本次识别。";
         return false;
     }
-    if (output_limit_exceeded) {
-        out_error = L"RapidOCR runner 输出超过 8 MiB，已停止本次识别。";
+    if (protocol_limit_exceeded) {
+        out_error = L"RapidOCR runner 协议输出超过 8 MiB，已停止本次识别。";
+        return false;
+    }
+    if (diagnostic_limit_exceeded) {
+        out_error = L"RapidOCR runner 诊断输出超过 1 MiB，已停止本次识别。";
         return false;
     }
     if (wait_failed) {
@@ -550,22 +609,34 @@ bool run_external_runner(
         return false;
     }
 
-    const std::string_view output_bytes(output.data(), output.size());
-    const std::wstring decoded = airshot::from_utf8(output_bytes);
-    if (!output.empty() && decoded.empty()) {
-        out_error = L"RapidOCR runner 返回了无效的 UTF-8 输出。";
+    const std::string protocol_bytes(protocol_output.begin(), protocol_output.end());
+    const std::string diagnostic_bytes(diagnostic_output.begin(), diagnostic_output.end());
+    const std::wstring decoded_diagnostic = airshot::from_utf8(diagnostic_bytes);
+    if (!diagnostic_output.empty() && decoded_diagnostic.empty()) {
+        out_error = L"RapidOCR runner 返回了无效的 UTF-8 诊断信息。";
         return false;
     }
     if (exit_code != 0) {
-        out_error = decoded.empty() ? L"RapidOCR runner 执行失败。" : decoded;
+        out_error = decoded_diagnostic.empty()
+                        ? L"RapidOCR runner 执行失败。"
+                        : decoded_diagnostic;
         return false;
     }
-    if (decoded.empty()) {
-        out_error = L"RapidOCR runner 未识别到任何文本。";
+    if (protocol_bytes.empty()) {
+        out_error = L"RapidOCR runner 未返回协议数据。";
+        return false;
+    }
+    std::wstring protocol_error;
+    if (!airshot::parse_ocr_runner_protocol(
+            protocol_bytes,
+            expected,
+            &protocol_error)) {
+        out_error = L"RapidOCR runner 协议无效：" + protocol_error;
         return false;
     }
 
-    out_text = decoded;
+    out_protocol = protocol_bytes;
+    out_diagnostic = decoded_diagnostic;
     return true;
 }
 
@@ -582,6 +653,11 @@ bool write_utf8(FILE* stream, std::wstring_view value) {
                stream) == bytes.size();
 }
 
+bool write_bytes(FILE* stream, std::string_view value) {
+    return value.empty() ||
+           std::fwrite(value.data(), 1, value.size(), stream) == value.size();
+}
+
 }  // namespace
 
 namespace airshot {
@@ -596,6 +672,13 @@ int run_ocr_cli(std::span<const std::wstring> arguments) {
     std::wstring dependency_dir;
     std::wstring profile{kDefaultOcrEngine};
     int ort_threads = 2;
+    int source_width = 0;
+    int source_height = 0;
+    int input_width = 0;
+    int input_height = 0;
+    double scale_x = 0.0;
+    double scale_y = 0.0;
+    std::wstring preprocess_mode;
 
     for (std::size_t i = 1; i < arguments.size(); ++i) {
         const std::wstring_view argument = arguments[i];
@@ -621,22 +704,75 @@ int run_ocr_cli(std::span<const std::wstring> arguments) {
             try {
                 std::size_t parsed = 0;
                 const int requested = std::stoi(*value, &parsed);
-                if (parsed != value->size() || requested < 1 || requested > 16) {
+                if (parsed != value->size() || requested < 1 || requested > 4) {
                     throw std::invalid_argument("thread count");
                 }
                 ort_threads = requested;
             } catch (...) {
-                write_utf8(stderr, L"错误: --ort-threads 必须是 1 到 16 的整数。\n");
+                write_utf8(stderr, L"错误: --ort-threads 必须是 1 到 4 的整数。\n");
                 return 1;
             }
+        } else if ((argument == L"--source-width" ||
+                    argument == L"--source-height" ||
+                    argument == L"--input-width" ||
+                    argument == L"--input-height") &&
+                   (value = take_value())) {
+            try {
+                std::size_t parsed = 0;
+                const int requested = std::stoi(*value, &parsed);
+                if (parsed != value->size() || requested < 1 || requested > 100'000) {
+                    throw std::invalid_argument("dimension");
+                }
+                if (argument == L"--source-width") {
+                    source_width = requested;
+                } else if (argument == L"--source-height") {
+                    source_height = requested;
+                } else if (argument == L"--input-width") {
+                    input_width = requested;
+                } else {
+                    input_height = requested;
+                }
+            } catch (...) {
+                write_utf8(stderr, L"错误: OCR 图像尺寸参数无效。\n");
+                return 1;
+            }
+        } else if ((argument == L"--scale-x" || argument == L"--scale-y") &&
+                   (value = take_value())) {
+            try {
+                std::size_t parsed = 0;
+                const double requested = std::stod(*value, &parsed);
+                if (parsed != value->size() || !std::isfinite(requested) ||
+                    requested < 0.01 || requested > 2.0) {
+                    throw std::invalid_argument("scale");
+                }
+                if (argument == L"--scale-x") {
+                    scale_x = requested;
+                } else {
+                    scale_y = requested;
+                }
+            } catch (...) {
+                write_utf8(stderr, L"错误: OCR 缩放比例参数无效。\n");
+                return 1;
+            }
+        } else if (argument == L"--preprocess-mode" && (value = take_value())) {
+            preprocess_mode = *value;
         } else {
             write_utf8(stderr, L"错误: OCR 内部命令参数无效或缺少值。\n");
             return 1;
         }
     }
 
+    const bool valid_preprocess_mode =
+        preprocess_mode == L"none" ||
+        preprocess_mode == L"bilinear-upscale" ||
+        preprocess_mode == L"progressive-bilinear-downscale";
     if (engine != L"onnx" || image_path.empty() ||
-        dependency_dir.empty() || !valid_profile(profile)) {
+        dependency_dir.empty() || !valid_profile(profile) ||
+        source_width <= 0 || source_height <= 0 ||
+        input_width <= 0 || input_height <= 0 ||
+        scale_x <= 0.0 || scale_y <= 0.0 || !valid_preprocess_mode ||
+        std::abs(scale_x - static_cast<double>(input_width) / source_width) > 1.0e-9 ||
+        std::abs(scale_y - static_cast<double>(input_height) / source_height) > 1.0e-9) {
         write_utf8(stderr, L"错误: OCR 内部命令参数无效。\n");
         return 1;
     }
@@ -694,21 +830,37 @@ int run_ocr_cli(std::span<const std::wstring> arguments) {
         }
     }
 
-    std::wstring text;
+    const OcrProtocolExpectations expected{
+        profile,
+        source_width,
+        source_height,
+        input_width,
+        input_height,
+        scale_x,
+        scale_y,
+        preprocess_mode,
+    };
+    std::string protocol;
+    std::wstring diagnostic;
     std::wstring error;
     if (!run_external_runner(
             runner_path,
             image,
             models,
             profile,
+            expected,
             ort_threads,
-            text,
+            protocol,
+            diagnostic,
             error)) {
         write_utf8(stderr, error);
         return 2;
     }
 
-    if (!write_utf8(stdout, text)) {
+    if (!diagnostic.empty()) {
+        write_utf8(stderr, diagnostic);
+    }
+    if (!write_bytes(stdout, protocol)) {
         return 2;
     }
     return 0;

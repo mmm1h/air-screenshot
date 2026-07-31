@@ -1,8 +1,19 @@
 #pragma once
 
-#include "airshot/common.h"
+#include "airshot/portable.h"
 
 namespace airshot::portable_internal {
+
+[[nodiscard]] std::optional<UpdateRequestSource>
+pending_update_source_from_json(std::wstring_view json);
+
+[[nodiscard]] std::wstring pending_update_to_json_for_testing(
+    const UpdateManifest& manifest,
+    UpdateRequestSource source);
+
+[[nodiscard]] bool pending_update_source_allowed(
+    UpdateRequestSource source,
+    bool allow_automatic_pending) noexcept;
 
 bool named_object_security_uses_current_user_owner(
     std::wstring* error = nullptr);

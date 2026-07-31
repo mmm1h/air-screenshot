@@ -1007,6 +1007,54 @@ struct ClipboardByteSnapshot {
 
 }  // namespace
 
+std::optional<Bitmap> decode_local_image_file(
+    const std::filesystem::path& path,
+    std::wstring* error) {
+    clear_error(error);
+    if (path.empty()) {
+        set_error(error, L"未指定要贴出的图片文件。");
+        return std::nullopt;
+    }
+    if (!path.is_absolute()) {
+        set_error(error, L"图片文件路径必须是绝对路径。");
+        return std::nullopt;
+    }
+    if (PathIsNetworkPathW(path.c_str())) {
+        set_error(
+            error,
+            L"为避免阻塞截图主程序，请先把网络图片复制到本地再贴图。");
+        return std::nullopt;
+    }
+
+    std::error_code file_error;
+    const std::uintmax_t file_size =
+        std::filesystem::file_size(path, file_error);
+    if (file_error || file_size == 0) {
+        set_error(error, L"图片文件不存在、为空或无法读取。");
+        return std::nullopt;
+    }
+    if (file_size > kClipboardPayloadBudget) {
+        set_error(error, L"图片文件超过 128 MiB 安全上限。");
+        return std::nullopt;
+    }
+
+    const ScopedWinrtApartment apartment(true);
+    ComPtr<IWICImagingFactory> factory;
+    if (!apartment.available() ||
+        FAILED(create_wic_factory(factory)) || !factory) {
+        set_error(error, L"Windows 图片解码器不可用。");
+        return std::nullopt;
+    }
+    auto bitmap = decode_image_file(factory.Get(), path);
+    if (!bitmap || !bitmap->valid()) {
+        set_error(
+            error,
+            L"文件不是受支持的静态图片，或解码后超过 64 MiB 安全上限。");
+        return std::nullopt;
+    }
+    return bitmap;
+}
+
 std::optional<ClipboardVisual> read_clipboard_visual(
     HWND owner,
     std::wstring* error) {

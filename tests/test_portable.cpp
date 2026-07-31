@@ -122,6 +122,152 @@ void test_manifests() {
            L"documented size and version limits are accepted");
 }
 
+void test_pending_update_sources() {
+    const auto manifest = airshot::parse_update_manifest(manifest_json());
+    expect(manifest.has_value(),
+           L"pending update source tests have a valid manifest");
+    if (!manifest) {
+        return;
+    }
+
+    const auto legacy_source =
+        airshot::portable_internal::pending_update_source_from_json(
+            manifest_json());
+    expect(legacy_source == airshot::UpdateRequestSource::automatic,
+           L"legacy pending metadata is conservatively treated as automatic");
+
+    const std::wstring automatic_json =
+        airshot::portable_internal::pending_update_to_json_for_testing(
+            *manifest, airshot::UpdateRequestSource::automatic);
+    const std::wstring manual_json =
+        airshot::portable_internal::pending_update_to_json_for_testing(
+            *manifest, airshot::UpdateRequestSource::manual);
+    expect(
+        airshot::portable_internal::pending_update_source_from_json(
+            automatic_json) == airshot::UpdateRequestSource::automatic,
+        L"automatic pending update source round trips");
+    expect(
+        airshot::portable_internal::pending_update_source_from_json(
+            manual_json) == airshot::UpdateRequestSource::manual,
+        L"manual pending update source round trips");
+
+    std::wstring unknown_json = automatic_json;
+    const std::wstring automatic_marker = L"\"automatic\"";
+    const std::size_t marker = unknown_json.find(automatic_marker);
+    if (marker != std::wstring::npos) {
+        unknown_json.replace(marker, automatic_marker.size(), L"\"unknown\"");
+    }
+    expect(
+        marker != std::wstring::npos &&
+            !airshot::portable_internal::pending_update_source_from_json(
+                unknown_json),
+        L"unknown pending update sources are rejected");
+
+    expect(
+        !airshot::portable_internal::pending_update_source_allowed(
+            airshot::UpdateRequestSource::automatic, false) &&
+            airshot::portable_internal::pending_update_source_allowed(
+                airshot::UpdateRequestSource::manual, false) &&
+            airshot::portable_internal::pending_update_source_allowed(
+                airshot::UpdateRequestSource::automatic, true),
+        L"disabled automatic updates pause only automatically staged payloads");
+}
+
+void test_mark_pending_update_manual_on_disk() {
+    const auto manifest = airshot::parse_update_manifest(
+        manifest_json(L"65535.65535.65535"));
+    expect(manifest.has_value(),
+           L"manual pending promotion has a newer valid manifest");
+    if (!manifest) {
+        return;
+    }
+
+    const auto root = std::filesystem::temp_directory_path() /
+                      std::format(
+                          L"airshot-portable-manual-intent-test-{}-{}",
+                          GetCurrentProcessId(),
+                          GetTickCount64());
+    const DWORD old_size =
+        GetEnvironmentVariableW(L"AIRSHOT_DATA_DIR", nullptr, 0);
+    std::wstring old_value(old_size, L'\0');
+    if (old_size > 0) {
+        const DWORD copied = GetEnvironmentVariableW(
+            L"AIRSHOT_DATA_DIR", old_value.data(), old_size);
+        old_value.resize(copied);
+    }
+    SetEnvironmentVariableW(L"AIRSHOT_DATA_DIR", root.c_str());
+
+    const auto updates = root / L"updates";
+    const auto pending_path = updates / L"pending.json";
+    std::filesystem::create_directories(updates);
+    {
+        std::ofstream stream(
+            pending_path, std::ios::binary | std::ios::trunc);
+        const std::string json = airshot::to_utf8(
+            airshot::portable_internal::pending_update_to_json_for_testing(
+                *manifest, airshot::UpdateRequestSource::automatic));
+        stream.write(
+            json.data(), static_cast<std::streamsize>(json.size()));
+    }
+
+    std::wstring error = L"stale";
+    expect(airshot::mark_pending_update_manual(&error) ==
+                   airshot::PendingUpdateManualResult::ready &&
+               error.empty(),
+           L"an automatically staged update is promoted to manual intent on disk");
+
+    std::string promoted_bytes;
+    {
+        std::ifstream stream(pending_path, std::ios::binary);
+        stream.seekg(0, std::ios::end);
+        const auto size = stream.tellg();
+        if (size > 0) {
+            promoted_bytes.resize(static_cast<std::size_t>(size));
+            stream.seekg(0, std::ios::beg);
+            stream.read(
+                promoted_bytes.data(),
+                static_cast<std::streamsize>(promoted_bytes.size()));
+        }
+    }
+    expect(
+        airshot::portable_internal::pending_update_source_from_json(
+            airshot::from_utf8(promoted_bytes)) ==
+            airshot::UpdateRequestSource::manual,
+        L"manual update intent survives a fresh pending.json read");
+
+    error = L"stale";
+    expect(airshot::mark_pending_update_manual(&error) ==
+                   airshot::PendingUpdateManualResult::ready &&
+               error.empty(),
+           L"manual pending promotion is idempotent");
+
+    std::error_code ignored;
+    std::filesystem::remove(pending_path, ignored);
+    error = L"stale";
+    expect(airshot::mark_pending_update_manual(&error) ==
+                   airshot::PendingUpdateManualResult::missing &&
+               error.empty(),
+           L"a missing pending update is reported without a false error");
+
+    {
+        std::ofstream stream(
+            pending_path, std::ios::binary | std::ios::trunc);
+        stream << "{}";
+    }
+    error = L"stale";
+    expect(airshot::mark_pending_update_manual(&error) ==
+                   airshot::PendingUpdateManualResult::invalid &&
+               !error.empty(),
+           L"invalid pending metadata is distinguished from a retryable promotion failure");
+
+    if (old_size > 0) {
+        SetEnvironmentVariableW(L"AIRSHOT_DATA_DIR", old_value.c_str());
+    } else {
+        SetEnvironmentVariableW(L"AIRSHOT_DATA_DIR", nullptr);
+    }
+    std::filesystem::remove_all(root, ignored);
+}
+
 void test_hashing() {
     const auto root = std::filesystem::temp_directory_path() /
                       std::format(
@@ -849,6 +995,8 @@ int wmain(int argument_count, wchar_t** arguments) {
     expect(apartment.available(), L"Windows Runtime is available");
     test_versions();
     test_manifests();
+    test_pending_update_sources();
+    test_mark_pending_update_manual_on_disk();
     test_hashing();
     test_helper_boundary();
     test_atomic_replacement_preserves_security();

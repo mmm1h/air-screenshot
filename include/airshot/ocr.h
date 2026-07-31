@@ -18,10 +18,60 @@ namespace airshot {
 
 struct AppConfig;
 
+inline constexpr std::uint64_t kOcrProtocolSchemaVersion = 1;
+
+struct OcrPoint {
+    double x{};
+    double y{};
+};
+
+struct OcrBlock {
+    std::array<OcrPoint, 4> quad{};
+    std::wstring text;
+    double score{};
+};
+
+struct OcrTimings {
+    double decode_ms{};
+    double model_init_ms{};
+    double inference_ms{};
+    double merge_ms{};
+    double total_ms{};
+};
+
+struct OcrPreprocessInfo {
+    int source_width{};
+    int source_height{};
+    int input_width{};
+    int input_height{};
+    double scale_x{1.0};
+    double scale_y{1.0};
+    std::wstring resample;
+    bool tiled{};
+    int tile_count{1};
+    int tile_size{};
+    int tile_overlap{};
+};
+
 struct OcrOutput {
     bool ok{};
     std::wstring text;
     std::wstring error;
+    std::vector<OcrBlock> blocks;
+    std::wstring profile;
+    OcrPreprocessInfo preprocess;
+    OcrTimings timings;
+};
+
+struct OcrProtocolExpectations {
+    std::wstring_view profile;
+    int source_width{};
+    int source_height{};
+    int input_width{};
+    int input_height{};
+    double scale_x{};
+    double scale_y{};
+    std::wstring_view resample;
 };
 
 struct OcrDependencyFile {
@@ -69,7 +119,8 @@ private:
         const std::filesystem::path& root,
         bool verify_hashes,
         bool update_high_watermark,
-        std::wstring* error);
+        std::wstring* error,
+        std::stop_token stop_token);
 
     OcrDependencyLease(
         std::vector<HANDLE> handles,
@@ -86,6 +137,10 @@ private:
     const Bitmap& bitmap,
     const AppConfig& config,
     std::stop_token stop_token = {});
+[[nodiscard]] std::optional<OcrOutput> parse_ocr_runner_protocol(
+    std::string_view json_utf8,
+    const OcrProtocolExpectations& expected,
+    std::wstring* error = nullptr);
 [[nodiscard]] std::wstring join_ocr_lines(std::span<const std::wstring> lines);
 [[nodiscard]] std::filesystem::path rapid_ocr_dependency_directory();
 [[nodiscard]] std::uint64_t ocr_minimum_sequence() noexcept;
@@ -93,7 +148,8 @@ private:
     const std::filesystem::path& root,
     bool verify_hashes,
     bool update_high_watermark,
-    std::wstring* error = nullptr);
+    std::wstring* error = nullptr,
+    std::stop_token stop_token = {});
 [[nodiscard]] std::optional<OcrDependencyManifest> parse_ocr_dependency_manifest(std::wstring_view json);
 [[nodiscard]] std::optional<OcrManifestSignature> parse_ocr_manifest_signature(std::wstring_view json);
 [[nodiscard]] bool verify_ocr_manifest_signature(

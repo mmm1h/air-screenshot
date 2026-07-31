@@ -1,4 +1,5 @@
 #include "capture_modern.h"
+#include "airshot/capture.h"
 
 #include <dwmapi.h>
 
@@ -9,9 +10,9 @@
 namespace {
 
 constexpr wchar_t kTargetClass[] =
-    L"AirScreenshot.CaptureTest.Target";
+    L"AirshotCaptureTest.Target";
 constexpr wchar_t kOccluderClass[] =
-    L"AirScreenshot.CaptureTest.Occluder";
+    L"AirshotCaptureTest.Occluder";
 constexpr COLORREF kTargetColor = RGB(23, 117, 201);
 
 LRESULT CALLBACK color_window_proc(
@@ -96,6 +97,42 @@ int wmain() {
     }
     ShowWindow(target, SW_SHOWNOACTIVATE);
     UpdateWindow(target);
+
+    HWND child = CreateWindowExW(
+        0,
+        L"STATIC",
+        L"",
+        WS_CHILD | WS_VISIBLE,
+        12,
+        14,
+        72,
+        44,
+        target,
+        nullptr,
+        instance,
+        nullptr);
+    if (!child) {
+        DestroyWindow(target);
+        return 1;
+    }
+    UpdateWindow(child);
+
+    const auto candidates =
+        airshot::enumerate_window_candidates();
+    const auto child_candidate = std::ranges::find_if(
+        candidates,
+        [child](const airshot::WindowCandidate& candidate) {
+            return candidate.handle == child;
+        });
+    if (child_candidate == candidates.end() ||
+        child_candidate->root != target ||
+        child_candidate->parent != target ||
+        child_candidate->depth < 1) {
+        DestroyWindow(target);
+        std::wcerr
+            << L"Child HWND was not exposed for smart selection.\n";
+        return 1;
+    }
 
     HWND occluder = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST,

@@ -1,5 +1,6 @@
 #include "host_app.h"
 #include "cli_app.h"
+#include "airshot/host_policy.h"
 #include "airshot/ocr.h"
 
 #include "airshot/portable.h"
@@ -71,9 +72,24 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         }
         return static_cast<int>(airshot::ExitCode::unknown_error);
     }
-    if (!transient) {
+    airshot::HostApp app(
+        instance, transient, std::move(transient_launch_nonce));
+    if (!app.owns_host_instance()) {
+        return static_cast<int>(airshot::ExitCode::ipc_failed);
+    }
+    if (airshot::check_pending_update_on_host_startup(
+            app.owns_host_instance(), transient)) {
+        std::wstring config_error;
+        const auto startup_config =
+            airshot::ConfigStore().load(&config_error);
+        const bool allow_automatic_pending =
+            startup_config && !startup_config->write_protected &&
+            startup_config->automatic_updates_enabled;
         std::wstring update_error;
-        if (airshot::launch_pending_update(true, &update_error)) {
+        if (airshot::launch_pending_update(
+                true,
+                allow_automatic_pending,
+                &update_error)) {
             return 0;
         }
         if (!update_error.empty()) {
@@ -81,11 +97,17 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         }
         airshot::cleanup_stale_updates();
     }
-    airshot::HostApp app(instance, transient, std::move(transient_launch_nonce));
     const int result = app.run();
-    if (!app.is_transient() && !app.update_helper_launched()) {
+    if (airshot::launch_pending_update_on_host_exit(
+            app.initialized(),
+            app.is_transient(),
+            app.update_helper_launched())) {
         std::wstring update_error;
-        if (!airshot::launch_pending_update(false, &update_error) && !update_error.empty()) {
+        if (!airshot::launch_pending_update(
+                false,
+                app.automatic_updates_enabled(),
+                &update_error) &&
+            !update_error.empty()) {
             MessageBoxW(nullptr, update_error.c_str(), airshot::kAppName, MB_OK | MB_ICONERROR);
         }
     }

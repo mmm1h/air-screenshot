@@ -3,6 +3,7 @@
 #include "airshot/config.h"
 #include "airshot/output.h"
 #include "airshot/portable.h"
+#include "ocr_test_support.h"
 
 #include <windows.h>
 #include <aclapi.h>
@@ -15,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -27,6 +29,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -51,6 +54,11 @@ namespace {
 
 constexpr DWORD kOcrProcessTimeoutMs = 120'000;
 constexpr std::size_t kMaxOcrProcessOutputBytes = 8U * 1024U * 1024U;
+constexpr std::size_t kMaxOcrProcessDiagnosticBytes = 1U * 1024U * 1024U;
+constexpr std::size_t kMaxWarmWorkerRequestBytes = 64U * 1024U;
+constexpr std::size_t kMaxWarmWorkerResponseBytes = 8U * 1024U * 1024U;
+constexpr std::uint64_t kWarmWorkerSchemaVersion = 1;
+constexpr DWORD kWarmWorkerCancelWaitMs = 200;
 constexpr std::uint64_t kMaxManifestBytes = 4U * 1024U * 1024U;
 constexpr std::uint64_t kMaxDependencyFileBytes = 1024ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaxDependencyPackageBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -72,8 +80,13 @@ constexpr DWORD kDownloadPollTimeoutMs = 1'000;
 constexpr int kMaxDownloadAttempts = 8;
 constexpr ULONGLONG kDownloadFileDeadlineMs = 10ULL * 60ULL * 1'000ULL;
 constexpr ULONGLONG kDownloadOperationDeadlineMs = 30ULL * 60ULL * 1'000ULL;
-constexpr int kMaxOcrImageEdge = 4096;
-constexpr std::uint64_t kMaxOcrPixels = 8ULL * 1024ULL * 1024ULL;
+constexpr int kMaxOcrImageEdge = 32'768;
+constexpr std::uint64_t kMaxOcrPixels = 32ULL * 1024ULL * 1024ULL;
+constexpr int kMaxOcrProtocolDimension = 100'000;
+constexpr std::size_t kMaxOcrProtocolBlocks = 16'384;
+constexpr std::size_t kMaxOcrBlockTextCharacters = 4'096;
+constexpr std::size_t kMaxOcrTotalTextCharacters = 2U * 1024U * 1024U;
+constexpr double kMaxOcrProtocolTimingMs = 120'000.0;
 constexpr std::wstring_view kInstalledManifestName = L".airshot-manifest.json";
 constexpr std::wstring_view kInstalledSignatureName = L".airshot-manifest.sig";
 constexpr std::wstring_view kSequenceHighWatermarkName =
@@ -217,9 +230,22 @@ private:
     bool owns_{};
 };
 
+bool ocr_stop_requested(
+    std::stop_token stop_token,
+    std::wstring* error) {
+    if (!stop_token.stop_requested()) {
+        return false;
+    }
+    if (error) {
+        *error = L"OCR 已取消。";
+    }
+    return true;
+}
+
 std::optional<MutexLease> acquire_named_mutex(
     const wchar_t* name,
-    std::wstring* error) {
+    std::wstring* error,
+    std::stop_token stop_token = {}) {
     UniqueHandle mutex(CreateMutexW(nullptr, FALSE, name));
     if (!mutex.get()) {
         if (error) {
@@ -230,20 +256,34 @@ std::optional<MutexLease> acquire_named_mutex(
         return std::nullopt;
     }
 
-    const DWORD wait_result =
-        WaitForSingleObject(mutex.get(), kOcrMutexWaitMs);
-    if (wait_result != WAIT_OBJECT_0 &&
-        wait_result != WAIT_ABANDONED) {
-        if (error) {
-            *error =
-                wait_result == WAIT_TIMEOUT
-                    ? L"等待 OCR 状态互斥锁超时。"
-                    : L"等待 OCR 状态互斥锁失败：" +
-                          windows_error_message(GetLastError());
+    const ULONGLONG deadline =
+        GetTickCount64() + kOcrMutexWaitMs;
+    for (;;) {
+        if (ocr_stop_requested(stop_token, error)) {
+            return std::nullopt;
         }
-        return std::nullopt;
+        const ULONGLONG now = GetTickCount64();
+        const DWORD wait_ms = static_cast<DWORD>(std::min<ULONGLONG>(
+            25,
+            deadline > now ? deadline - now : 0));
+        const DWORD wait_result =
+            WaitForSingleObject(mutex.get(), wait_ms);
+        if (wait_result == WAIT_OBJECT_0 ||
+            wait_result == WAIT_ABANDONED) {
+            return MutexLease(mutex.release());
+        }
+        if (wait_result != WAIT_TIMEOUT ||
+            GetTickCount64() >= deadline) {
+            if (error) {
+                *error =
+                    wait_result == WAIT_TIMEOUT
+                        ? L"等待 OCR 状态互斥锁超时。"
+                        : L"等待 OCR 状态互斥锁失败：" +
+                              windows_error_message(GetLastError());
+            }
+            return std::nullopt;
+        }
     }
-    return MutexLease(mutex.release());
 }
 
 class UniqueWinHttpHandle {
@@ -636,7 +676,11 @@ std::optional<std::vector<std::byte>> read_binary_handle(
 
 std::optional<std::array<std::uint8_t, 32>> sha256_handle(
     HANDLE handle,
-    std::wstring* error) {
+    std::wstring* error,
+    std::stop_token stop_token = {}) {
+    if (ocr_stop_requested(stop_token, error)) {
+        return std::nullopt;
+    }
     BCRYPT_ALG_HANDLE algorithm = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
     std::vector<std::uint8_t> hash_object;
@@ -674,8 +718,13 @@ std::optional<std::array<std::uint8_t, 32>> sha256_handle(
         status = static_cast<NTSTATUS>(0xC0000001L);
     }
 
+    bool cancelled = false;
     std::array<std::uint8_t, 64U * 1024U> buffer{};
     while (BCRYPT_SUCCESS(status)) {
+        if (stop_token.stop_requested()) {
+            cancelled = true;
+            break;
+        }
         DWORD bytes_read = 0;
         if (!ReadFile(
                 handle,
@@ -689,13 +738,17 @@ std::optional<std::array<std::uint8_t, 32>> sha256_handle(
         if (bytes_read == 0) {
             break;
         }
+        if (stop_token.stop_requested()) {
+            cancelled = true;
+            break;
+        }
         status = BCryptHashData(
             hash,
             buffer.data(),
             bytes_read,
             0);
     }
-    if (BCRYPT_SUCCESS(status)) {
+    if (BCRYPT_SUCCESS(status) && !cancelled) {
         status = BCryptFinishHash(
             hash,
             digest.data(),
@@ -708,6 +761,12 @@ std::optional<std::array<std::uint8_t, 32>> sha256_handle(
     }
     if (algorithm) {
         BCryptCloseAlgorithmProvider(algorithm, 0);
+    }
+    if (cancelled) {
+        if (error) {
+            *error = L"OCR 已取消。";
+        }
+        return std::nullopt;
     }
     if (!BCRYPT_SUCCESS(status)) {
         if (error && error->empty()) {
@@ -1098,11 +1157,16 @@ std::filesystem::path sequence_high_watermark_path() {
 }
 
 std::optional<std::uint64_t> read_sequence_high_watermark(
-    std::wstring* error) {
+    std::wstring* error,
+    std::stop_token stop_token = {}) {
     auto mutex = acquire_named_mutex(
         kSequenceMutexName,
-        error);
+        error,
+        stop_token);
     if (!mutex) {
+        return std::nullopt;
+    }
+    if (ocr_stop_requested(stop_token, error)) {
         return std::nullopt;
     }
     return read_sequence_file_locked(
@@ -1235,7 +1299,11 @@ bool write_sequence_file_locked(
 
 bool persist_sequence_high_watermark(
     std::uint64_t sequence,
-    std::wstring* error) {
+    std::wstring* error,
+    std::stop_token stop_token = {}) {
+    if (ocr_stop_requested(stop_token, error)) {
+        return false;
+    }
     if (sequence < 1 ||
         sequence > kMaxSafeJsonInteger) {
         if (error) {
@@ -1246,8 +1314,12 @@ bool persist_sequence_high_watermark(
 
     auto mutex = acquire_named_mutex(
         kSequenceMutexName,
-        error);
+        error,
+        stop_token);
     if (!mutex) {
+        return false;
+    }
+    if (ocr_stop_requested(stop_token, error)) {
         return false;
     }
     const auto existing = read_sequence_file_locked(
@@ -2040,11 +2112,144 @@ bool validate_signed_manifest(
     return true;
 }
 
+bool dependency_hash_cache_key_matches_impl(
+    bool same_file_object_value,
+    const std::filesystem::path& cached_root,
+    std::uint64_t cached_sequence,
+    std::wstring_view cached_relative_path,
+    std::wstring_view cached_sha256,
+    std::uint64_t cached_size,
+    const std::filesystem::path& requested_root,
+    std::uint64_t requested_sequence,
+    std::wstring_view requested_relative_path,
+    std::wstring_view requested_sha256,
+    std::uint64_t requested_size) {
+    return same_file_object_value &&
+           cached_sequence == requested_sequence &&
+           cached_size == requested_size &&
+           path_comparison_key(
+               cached_root.lexically_normal().generic_wstring()) ==
+               path_comparison_key(
+                   requested_root.lexically_normal().generic_wstring()) &&
+           path_comparison_key(cached_relative_path) ==
+               path_comparison_key(requested_relative_path) &&
+           normalized_hex(cached_sha256) ==
+               normalized_hex(requested_sha256);
+}
+
+struct CachedDependencyHashEntry {
+    std::wstring relative_path;
+    std::wstring sha256;
+    std::uint64_t size{};
+    UniqueHandle guard;
+};
+
+struct DependencyHashCacheState {
+    std::mutex mutex;
+    std::uint64_t generation{};
+    std::filesystem::path root;
+    std::uint64_t sequence{};
+    std::map<std::wstring, CachedDependencyHashEntry> files;
+};
+
+DependencyHashCacheState& dependency_hash_cache() {
+    static DependencyHashCacheState cache;
+    return cache;
+}
+
+std::uint64_t dependency_hash_cache_generation() {
+    auto& cache = dependency_hash_cache();
+    std::scoped_lock lock(cache.mutex);
+    return cache.generation;
+}
+
+bool dependency_hash_cache_matches(
+    const std::filesystem::path& root,
+    std::uint64_t sequence,
+    const OcrDependencyFile& file,
+    HANDLE current_handle) {
+    auto& cache = dependency_hash_cache();
+    std::scoped_lock lock(cache.mutex);
+    const auto found = cache.files.find(
+        path_comparison_key(file.path));
+    if (found == cache.files.end()) {
+        return false;
+    }
+    const CachedDependencyHashEntry& cached =
+        found->second;
+    return dependency_hash_cache_key_matches_impl(
+        same_file_object(
+            cached.guard.get(),
+            current_handle),
+        cache.root,
+        cache.sequence,
+        cached.relative_path,
+        cached.sha256,
+        cached.size,
+        root,
+        sequence,
+        file.path,
+        file.sha256,
+        file.size);
+}
+
+std::optional<CachedDependencyHashEntry>
+make_cached_dependency_hash_entry(
+    const OcrDependencyFile& file,
+    HANDLE current_handle) {
+    HANDLE duplicate = nullptr;
+    if (!DuplicateHandle(
+            GetCurrentProcess(),
+            current_handle,
+            GetCurrentProcess(),
+            &duplicate,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS)) {
+        return std::nullopt;
+    }
+    return CachedDependencyHashEntry{
+        file.path,
+        normalized_hex(file.sha256),
+        file.size,
+        UniqueHandle(duplicate),
+    };
+}
+
+void publish_dependency_hash_cache(
+    std::uint64_t expected_generation,
+    const std::filesystem::path& root,
+    std::uint64_t sequence,
+    std::map<std::wstring, CachedDependencyHashEntry> files) {
+    auto& cache = dependency_hash_cache();
+    std::scoped_lock lock(cache.mutex);
+    if (cache.generation != expected_generation) {
+        return;
+    }
+    cache.root = root;
+    cache.sequence = sequence;
+    cache.files = std::move(files);
+    ++cache.generation;
+}
+
+void clear_dependency_hash_cache() {
+    auto& cache = dependency_hash_cache();
+    std::scoped_lock lock(cache.mutex);
+    cache.root.clear();
+    cache.sequence = 0;
+    cache.files.clear();
+    ++cache.generation;
+}
+
 bool verify_dependency_handle(
     const OcrDependencyFile& file,
     HANDLE handle,
     bool verify_hash,
+    std::stop_token stop_token,
     std::wstring* error) {
+    if (ocr_stop_requested(stop_token, error)) {
+        return false;
+    }
     const auto size =
         file_size_from_handle(handle, error);
     if (!size || file.size == 0 ||
@@ -2060,7 +2265,7 @@ bool verify_dependency_handle(
     }
 
     const auto digest =
-        sha256_handle(handle, error);
+        sha256_handle(handle, error, stop_token);
     if (!digest ||
         hex_digest(*digest) !=
             normalized_hex(file.sha256)) {
@@ -2084,16 +2289,30 @@ verify_and_lock_installed_dependency(
     const std::filesystem::path& root,
     bool verify_hashes,
     std::uint64_t minimum_sequence,
+    std::stop_token stop_token,
     std::wstring* error) {
+    if (ocr_stop_requested(stop_token, error)) {
+        return std::nullopt;
+    }
     VerifiedDependency result;
     result.handles.reserve(
         kMaxManifestFiles +
         kMaxDependencyDirectories + 8);
+    const std::uint64_t cache_generation =
+        verify_hashes
+            ? dependency_hash_cache_generation()
+            : 0;
+    std::map<std::wstring, CachedDependencyHashEntry>
+        next_cached_files;
+    bool cache_complete = verify_hashes;
 
     std::vector<std::filesystem::path>
         protected_directories;
     std::filesystem::path current = root;
     for (int depth = 0; depth < 3; ++depth) {
+        if (ocr_stop_requested(stop_token, error)) {
+            return std::nullopt;
+        }
         if (current.empty() ||
             current == current.root_path()) {
             break;
@@ -2106,6 +2325,9 @@ verify_and_lock_installed_dependency(
     HANDLE locked_root = nullptr;
     for (const auto& directory :
          protected_directories) {
+        if (ocr_stop_requested(stop_token, error)) {
+            return std::nullopt;
+        }
         auto directory_handle =
             open_locked_path(
                 directory,
@@ -2172,6 +2394,9 @@ verify_and_lock_installed_dependency(
             error)) {
         return std::nullopt;
     }
+    if (ocr_stop_requested(stop_token, error)) {
+        return std::nullopt;
+    }
     if (!sequence_is_allowed_by_policy(
             result.manifest.sequence,
             minimum_sequence)) {
@@ -2199,6 +2424,9 @@ verify_and_lock_installed_dependency(
     };
     for (const auto& entry :
          result.manifest.files) {
+        if (ocr_stop_requested(stop_token, error)) {
+            return std::nullopt;
+        }
         const std::filesystem::path relative(
             entry.path);
         std::filesystem::path parent;
@@ -2252,6 +2480,9 @@ verify_and_lock_installed_dependency(
 
     for (const auto& relative :
          ordered_directories) {
+        if (ocr_stop_requested(stop_token, error)) {
+            return std::nullopt;
+        }
         auto directory_handle = open_locked_path(
             result.root / relative,
             true,
@@ -2265,18 +2496,49 @@ verify_and_lock_installed_dependency(
 
     for (const auto& entry :
          result.manifest.files) {
+        if (ocr_stop_requested(stop_token, error)) {
+            return std::nullopt;
+        }
         auto file_handle = open_locked_path(
             result.root /
                 std::filesystem::path(entry.path),
             false,
             error);
+        const bool cached_hash =
+            file_handle && verify_hashes &&
+            dependency_hash_cache_matches(
+                result.root,
+                result.manifest.sequence,
+                entry,
+                file_handle->get());
         if (!file_handle ||
             !verify_dependency_handle(
                 entry,
                 file_handle->get(),
-                verify_hashes,
+                verify_hashes && !cached_hash,
+                stop_token,
                 error)) {
             return std::nullopt;
+        }
+        if (cache_complete) {
+            auto cached_entry =
+                make_cached_dependency_hash_entry(
+                    entry,
+                    file_handle->get());
+            if (!cached_entry) {
+                cache_complete = false;
+                next_cached_files.clear();
+            } else {
+                const auto [position, inserted] =
+                    next_cached_files.emplace(
+                        path_comparison_key(entry.path),
+                        std::move(*cached_entry));
+                static_cast<void>(position);
+                if (!inserted) {
+                    cache_complete = false;
+                    next_cached_files.clear();
+                }
+            }
         }
         result.handles.push_back(
             std::move(*file_handle));
@@ -2293,6 +2555,9 @@ verify_and_lock_installed_dependency(
     for (;
          !iterator_error && iterator != end;
          iterator.increment(iterator_error)) {
+        if (ocr_stop_requested(stop_token, error)) {
+            return std::nullopt;
+        }
         const std::filesystem::path relative_path =
             iterator->path().lexically_relative(
                 result.root);
@@ -2342,6 +2607,10 @@ verify_and_lock_installed_dependency(
         return std::nullopt;
     }
 
+    if (ocr_stop_requested(stop_token, error)) {
+        return std::nullopt;
+    }
+
     auto final_root_handle =
         open_locked_path(
             result.root,
@@ -2359,6 +2628,13 @@ verify_and_lock_installed_dependency(
     }
     result.handles.push_back(
         std::move(*final_root_handle));
+    if (cache_complete) {
+        publish_dependency_hash_cache(
+            cache_generation,
+            result.root,
+            result.manifest.sequence,
+            std::move(next_cached_files));
+    }
     return result;
 }
 
@@ -2498,45 +2774,155 @@ std::optional<std::filesystem::path> create_private_directory(
     return result;
 }
 
-Bitmap resize_bitmap_for_ocr(const Bitmap& source) {
-    const std::uint64_t pixels =
-        static_cast<std::uint64_t>(std::max(0, source.width)) *
-        static_cast<std::uint64_t>(std::max(0, source.height));
-    if (source.empty() ||
-        (source.width <= kMaxOcrImageEdge && source.height <= kMaxOcrImageEdge &&
-         pixels <= kMaxOcrPixels)) {
+Bitmap resize_bitmap_bilinear_once(
+    const Bitmap& source,
+    int target_width,
+    int target_height) {
+    if (source.empty() || target_width <= 0 || target_height <= 0) {
+        return {};
+    }
+    if (source.width == target_width && source.height == target_height) {
         return source;
     }
 
-    const double edge_scale = std::min(
-        static_cast<double>(kMaxOcrImageEdge) / source.width,
-        static_cast<double>(kMaxOcrImageEdge) / source.height);
-    const double pixel_scale =
-        std::sqrt(static_cast<double>(kMaxOcrPixels) / static_cast<double>(pixels));
-    const double scale = std::min(edge_scale, pixel_scale);
-    const int target_width =
-        std::max(1, static_cast<int>(std::floor(source.width * scale)));
-    const int target_height =
-        std::max(1, static_cast<int>(std::floor(source.height * scale)));
+    struct AxisSample {
+        int first{};
+        int second{};
+        double weight{};
+    };
+    const auto make_samples = [](int source_size, int target_size) {
+        std::vector<AxisSample> samples(static_cast<std::size_t>(target_size));
+        const double ratio =
+            static_cast<double>(source_size) / static_cast<double>(target_size);
+        for (int destination = 0; destination < target_size; ++destination) {
+            const double source_position =
+                (static_cast<double>(destination) + 0.5) * ratio - 0.5;
+            const int lower = static_cast<int>(std::floor(source_position));
+            samples[static_cast<std::size_t>(destination)] = {
+                std::clamp(lower, 0, source_size - 1),
+                std::clamp(lower + 1, 0, source_size - 1),
+                std::clamp(source_position - lower, 0.0, 1.0),
+            };
+        }
+        return samples;
+    };
 
+    const auto horizontal = make_samples(source.width, target_width);
+    const auto vertical = make_samples(source.height, target_height);
     Bitmap target(target_width, target_height);
     if (target.empty()) {
         return {};
     }
+
     for (int y = 0; y < target_height; ++y) {
-        const int source_y = std::min(
-            source.height - 1,
-            static_cast<int>(static_cast<double>(y) / scale));
-        const auto* source_row = source.row(source_y).data();
-        auto* target_row = target.row(y).data();
+        const AxisSample& y_sample = vertical[static_cast<std::size_t>(y)];
+        const auto first_row = source.row(y_sample.first);
+        const auto second_row = source.row(y_sample.second);
+        auto destination_row = target.row(y);
         for (int x = 0; x < target_width; ++x) {
-            const int source_x = std::min(
-                source.width - 1,
-                static_cast<int>(static_cast<double>(x) / scale));
-            std::memcpy(target_row + x * 4, source_row + source_x * 4, 4);
+            const AxisSample& x_sample = horizontal[static_cast<std::size_t>(x)];
+            for (std::size_t channel = 0; channel < Bitmap::bytes_per_pixel; ++channel) {
+                const auto pixel = [channel, &x_sample](std::span<const std::uint8_t> row) {
+                    const double first = row[
+                        static_cast<std::size_t>(x_sample.first) * Bitmap::bytes_per_pixel +
+                        channel];
+                    const double second = row[
+                        static_cast<std::size_t>(x_sample.second) * Bitmap::bytes_per_pixel +
+                        channel];
+                    return first + (second - first) * x_sample.weight;
+                };
+                const double top = pixel(first_row);
+                const double bottom = pixel(second_row);
+                const double value = top + (bottom - top) * y_sample.weight;
+                destination_row[
+                    static_cast<std::size_t>(x) * Bitmap::bytes_per_pixel + channel] =
+                    static_cast<std::uint8_t>(std::clamp(std::lround(value), 0L, 255L));
+            }
         }
     }
+    target.make_opaque();
     return target;
+}
+
+Bitmap resize_bitmap_high_quality_impl(
+    const Bitmap& source,
+    int target_width,
+    int target_height) {
+    if (source.empty() || target_width <= 0 || target_height <= 0) {
+        return {};
+    }
+    if (source.width == target_width && source.height == target_height) {
+        return source;
+    }
+
+    const Bitmap* current = &source;
+    Bitmap intermediate;
+    while (current->width > target_width * 2LL ||
+           current->height > target_height * 2LL) {
+        const int next_width = std::max(target_width, (current->width + 1) / 2);
+        const int next_height = std::max(target_height, (current->height + 1) / 2);
+        Bitmap next = resize_bitmap_bilinear_once(*current, next_width, next_height);
+        if (next.empty()) {
+            return {};
+        }
+        intermediate = std::move(next);
+        current = &intermediate;
+    }
+    return resize_bitmap_bilinear_once(*current, target_width, target_height);
+}
+
+double select_preprocess_scale_impl(int width, int height) noexcept {
+    if (width <= 0 || height <= 0) {
+        return 0.0;
+    }
+    const std::uint64_t pixels =
+        static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height);
+    const int longest_edge = std::max(width, height);
+    double scale = 1.0;
+    if (pixels <= 600'000ULL && longest_edge <= 1'200) {
+        scale = 2.0;
+    } else if (pixels <= 1'500'000ULL && longest_edge <= 1'800) {
+        scale = 1.5;
+    }
+
+    if (scale > 1.0) {
+        const double edge_limit =
+            4'096.0 / static_cast<double>(longest_edge);
+        const double pixel_limit = std::sqrt(
+            (8.0 * 1024.0 * 1024.0) / static_cast<double>(pixels));
+        scale = std::max(1.0, std::min({scale, edge_limit, pixel_limit}));
+    }
+
+    if (pixels > kMaxOcrPixels || longest_edge > kMaxOcrImageEdge) {
+        const double edge_scale =
+            static_cast<double>(kMaxOcrImageEdge) / longest_edge;
+        const double pixel_scale = std::sqrt(
+            static_cast<double>(kMaxOcrPixels) / static_cast<double>(pixels));
+        scale = std::min({scale, edge_scale, pixel_scale});
+    }
+    return std::clamp(scale, 0.01, 2.0);
+}
+
+int select_thread_count_impl(
+    std::uint64_t pixels,
+    unsigned int logical_processors,
+    bool accurate_profile) noexcept {
+    const int maximum = static_cast<int>(
+        std::clamp(logical_processors, 1U, 4U));
+    if (maximum == 1) {
+        return 1;
+    }
+    if (pixels < 400'000ULL) {
+        return std::min(2, maximum);
+    }
+    if (pixels >= 8ULL * 1024ULL * 1024ULL ||
+        (accurate_profile && pixels >= 4ULL * 1024ULL * 1024ULL)) {
+        return maximum;
+    }
+    if (pixels >= 2ULL * 1024ULL * 1024ULL) {
+        return std::min(3, maximum);
+    }
+    return std::min(2, maximum);
 }
 
 bool configure_kill_on_close_job(HANDLE job) {
@@ -2554,6 +2940,7 @@ bool configure_kill_on_close_job(HANDLE job) {
 bool append_available_output(
     HANDLE pipe,
     std::vector<char>& output,
+    std::size_t maximum_bytes,
     bool& limit_exceeded) {
     std::array<char, 4096> temporary{};
     for (;;) {
@@ -2583,7 +2970,7 @@ bool append_available_output(
         if (bytes_read == 0) {
             return true;
         }
-        if (output.size() > kMaxOcrProcessOutputBytes - bytes_read) {
+        if (bytes_read > maximum_bytes - std::min(output.size(), maximum_bytes)) {
             limit_exceeded = true;
             return false;
         }
@@ -2598,6 +2985,7 @@ OcrOutput run_ocr_process(
     const std::filesystem::path& executable,
     std::wstring command_line,
     const OcrDependencyLease& dependency_lease,
+    const OcrProtocolExpectations& expected,
     std::stop_token stop_token) {
     if (stop_token.stop_requested()) {
         return {false, {}, L"OCR 已取消。"};
@@ -2637,15 +3025,33 @@ OcrOutput run_ocr_process(
         };
     }
 
-    HANDLE raw_read = nullptr;
-    HANDLE raw_write = nullptr;
+    HANDLE raw_stdout_read = nullptr;
+    HANDLE raw_stdout_write = nullptr;
+    HANDLE raw_stderr_read = nullptr;
+    HANDLE raw_stderr_write = nullptr;
     SECURITY_ATTRIBUTES pipe_security{sizeof(pipe_security), nullptr, TRUE};
-    if (!CreatePipe(&raw_read, &raw_write, &pipe_security, 0)) {
+    if (!CreatePipe(&raw_stdout_read, &raw_stdout_write, &pipe_security, 0) ||
+        !CreatePipe(&raw_stderr_read, &raw_stderr_write, &pipe_security, 0)) {
+        if (raw_stdout_read) {
+            CloseHandle(raw_stdout_read);
+        }
+        if (raw_stdout_write) {
+            CloseHandle(raw_stdout_write);
+        }
+        if (raw_stderr_read) {
+            CloseHandle(raw_stderr_read);
+        }
+        if (raw_stderr_write) {
+            CloseHandle(raw_stderr_write);
+        }
         return {false, {}, L"创建 OCR 输出管道失败。"};
     }
-    UniqueHandle stdout_read(raw_read);
-    UniqueHandle stdout_write(raw_write);
-    if (!SetHandleInformation(stdout_read.get(), HANDLE_FLAG_INHERIT, 0)) {
+    UniqueHandle stdout_read(raw_stdout_read);
+    UniqueHandle stdout_write(raw_stdout_write);
+    UniqueHandle stderr_read(raw_stderr_read);
+    UniqueHandle stderr_write(raw_stderr_write);
+    if (!SetHandleInformation(stdout_read.get(), HANDLE_FLAG_INHERIT, 0) ||
+        !SetHandleInformation(stderr_read.get(), HANDLE_FLAG_INHERIT, 0)) {
         return {false, {}, L"限制 OCR 管道句柄继承失败。"};
     }
     UniqueHandle stdin_null(CreateFileW(
@@ -2705,6 +3111,7 @@ OcrOutput run_ocr_process(
     std::vector<HANDLE> inherited_handles{
         stdin_null.get(),
         stdout_write.get(),
+        stderr_write.get(),
     };
     inherited_handles.reserve(
         inherited_handles.size() +
@@ -2750,7 +3157,7 @@ OcrOutput run_ocr_process(
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdInput = stdin_null.get();
     startup.StartupInfo.hStdOutput = stdout_write.get();
-    startup.StartupInfo.hStdError = stdout_write.get();
+    startup.StartupInfo.hStdError = stderr_write.get();
     startup.lpAttributeList = attributes;
 
     PROCESS_INFORMATION process{};
@@ -2767,6 +3174,7 @@ OcrOutput run_ocr_process(
         &process);
     DeleteProcThreadAttributeList(attributes);
     stdout_write.reset();
+    stderr_write.reset();
     inherited_guards.clear();
     if (!created) {
         return {
@@ -2789,12 +3197,15 @@ OcrOutput run_ocr_process(
         return {false, {}, L"无法启动 OCR 辅助进程线程。"};
     }
 
-    std::vector<char> output;
-    output.reserve(4096);
+    std::vector<char> protocol_output;
+    protocol_output.reserve(4096);
+    std::vector<char> diagnostic_output;
+    diagnostic_output.reserve(1024);
     const ULONGLONG deadline = GetTickCount64() + kOcrProcessTimeoutMs;
     bool timed_out = false;
     bool cancelled = false;
-    bool output_limit_exceeded = false;
+    bool protocol_limit_exceeded = false;
+    bool diagnostic_limit_exceeded = false;
     bool wait_failed = false;
     for (;;) {
         if (stop_token.stop_requested()) {
@@ -2803,11 +3214,18 @@ OcrOutput run_ocr_process(
             WaitForSingleObject(process_handle.get(), 5'000);
             break;
         }
-        if (!append_available_output(
-                stdout_read.get(),
-                output,
-                output_limit_exceeded)) {
-            if (output_limit_exceeded) {
+        const bool stdout_ok = append_available_output(
+            stdout_read.get(),
+            protocol_output,
+            kMaxOcrProcessOutputBytes,
+            protocol_limit_exceeded);
+        const bool stderr_ok = append_available_output(
+            stderr_read.get(),
+            diagnostic_output,
+            kMaxOcrProcessDiagnosticBytes,
+            diagnostic_limit_exceeded);
+        if (!stdout_ok || !stderr_ok) {
+            if (protocol_limit_exceeded || diagnostic_limit_exceeded) {
                 TerminateJobObject(job.get(), 125);
                 WaitForSingleObject(process_handle.get(), 5'000);
             }
@@ -2818,8 +3236,14 @@ OcrOutput run_ocr_process(
         if (wait_result == WAIT_OBJECT_0) {
             append_available_output(
                 stdout_read.get(),
-                output,
-                output_limit_exceeded);
+                protocol_output,
+                kMaxOcrProcessOutputBytes,
+                protocol_limit_exceeded);
+            append_available_output(
+                stderr_read.get(),
+                diagnostic_output,
+                kMaxOcrProcessDiagnosticBytes,
+                diagnostic_limit_exceeded);
             break;
         }
         if (wait_result == WAIT_FAILED) {
@@ -2850,33 +3274,53 @@ OcrOutput run_ocr_process(
             L"OCR 子进程超过 120 秒，已停止本次识别。",
         };
     }
-    if (output_limit_exceeded) {
+    if (protocol_limit_exceeded) {
         return {
             false,
             {},
-            L"OCR 子进程输出超过 8 MiB，已停止本次识别。",
+            L"OCR 子进程协议输出超过 8 MiB，已停止本次识别。",
+        };
+    }
+    if (diagnostic_limit_exceeded) {
+        return {
+            false,
+            {},
+            L"OCR 子进程诊断输出超过 1 MiB，已停止本次识别。",
         };
     }
     if (wait_failed) {
         return {false, {}, L"等待 OCR 子进程时发生错误。"};
     }
 
-    const std::string output_bytes(output.begin(), output.end());
-    const std::wstring decoded = from_utf8(output_bytes);
-    if (!output.empty() && decoded.empty()) {
-        return {false, {}, L"OCR 子进程返回了无效的 UTF-8 输出。"};
+    const std::string protocol_bytes(protocol_output.begin(), protocol_output.end());
+    const std::string diagnostic_bytes(diagnostic_output.begin(), diagnostic_output.end());
+    const std::wstring decoded_diagnostic = from_utf8(diagnostic_bytes);
+    if (!diagnostic_output.empty() && decoded_diagnostic.empty()) {
+        return {false, {}, L"OCR 子进程返回了无效的 UTF-8 诊断信息。"};
     }
     if (exit_code != 0) {
         return {
             false,
             {},
-            decoded.empty() ? L"OCR 子进程执行失败。" : decoded,
+            decoded_diagnostic.empty() ? L"OCR 子进程执行失败。" : decoded_diagnostic,
         };
     }
-    if (decoded.empty()) {
-        return {false, {}, L"OCR 未识别到任何文本。"};
+    if (protocol_bytes.empty()) {
+        return {false, {}, L"OCR 子进程未返回协议数据。"};
     }
-    return {true, decoded, {}};
+    std::wstring protocol_error;
+    auto parsed = parse_ocr_runner_protocol(
+        protocol_bytes,
+        expected,
+        &protocol_error);
+    if (!parsed) {
+        return {
+            false,
+            {},
+            L"OCR 子进程协议无效：" + protocol_error,
+        };
+    }
+    return std::move(*parsed);
 }
 
 std::optional<std::array<std::uint8_t, 32>> sha256_bytes(
@@ -3033,6 +3477,1560 @@ std::uint64_t ocr_minimum_sequence() noexcept {
     return kCompiledMinimumSequence;
 }
 
+namespace {
+
+class StrictJsonScanner {
+public:
+    explicit StrictJsonScanner(std::wstring_view text) noexcept
+        : text_(text) {}
+
+    [[nodiscard]] bool valid() {
+        skip_whitespace();
+        if (!parse_value(0)) {
+            return false;
+        }
+        skip_whitespace();
+        return position_ == text_.size();
+    }
+
+private:
+    [[nodiscard]] static int hex_value(wchar_t character) noexcept {
+        if (character >= L'0' && character <= L'9') {
+            return character - L'0';
+        }
+        if (character >= L'a' && character <= L'f') {
+            return character - L'a' + 10;
+        }
+        if (character >= L'A' && character <= L'F') {
+            return character - L'A' + 10;
+        }
+        return -1;
+    }
+
+    void skip_whitespace() noexcept {
+        while (position_ < text_.size() &&
+               (text_[position_] == L' ' || text_[position_] == L'\t' ||
+                text_[position_] == L'\r' || text_[position_] == L'\n')) {
+            ++position_;
+        }
+    }
+
+    [[nodiscard]] bool consume(std::wstring_view token) noexcept {
+        if (text_.substr(position_, token.size()) != token) {
+            return false;
+        }
+        position_ += token.size();
+        return true;
+    }
+
+    [[nodiscard]] bool parse_string(std::wstring* decoded) {
+        if (position_ >= text_.size() || text_[position_] != L'"') {
+            return false;
+        }
+        ++position_;
+        while (position_ < text_.size()) {
+            const wchar_t character = text_[position_++];
+            if (character == L'"') {
+                return true;
+            }
+            if (character < L' ') {
+                return false;
+            }
+            if (character != L'\\') {
+                if (decoded) {
+                    decoded->push_back(character);
+                }
+                continue;
+            }
+            if (position_ >= text_.size()) {
+                return false;
+            }
+            const wchar_t escaped = text_[position_++];
+            wchar_t value = 0;
+            switch (escaped) {
+                case L'"': value = L'"'; break;
+                case L'\\': value = L'\\'; break;
+                case L'/': value = L'/'; break;
+                case L'b': value = L'\b'; break;
+                case L'f': value = L'\f'; break;
+                case L'n': value = L'\n'; break;
+                case L'r': value = L'\r'; break;
+                case L't': value = L'\t'; break;
+                case L'u': {
+                    if (text_.size() - position_ < 4) {
+                        return false;
+                    }
+                    unsigned int code_unit = 0;
+                    for (int index = 0; index < 4; ++index) {
+                        const int digit = hex_value(text_[position_++]);
+                        if (digit < 0) {
+                            return false;
+                        }
+                        code_unit = (code_unit << 4U) | static_cast<unsigned int>(digit);
+                    }
+                    value = static_cast<wchar_t>(code_unit);
+                    break;
+                }
+                default: return false;
+            }
+            if (decoded) {
+                decoded->push_back(value);
+            }
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool parse_object(std::size_t depth) {
+        ++position_;
+        skip_whitespace();
+        if (position_ < text_.size() && text_[position_] == L'}') {
+            ++position_;
+            return true;
+        }
+
+        std::set<std::wstring> keys;
+        for (;;) {
+            std::wstring key;
+            if (!parse_string(&key) || !keys.insert(std::move(key)).second) {
+                return false;
+            }
+            skip_whitespace();
+            if (position_ >= text_.size() || text_[position_++] != L':') {
+                return false;
+            }
+            skip_whitespace();
+            if (!parse_value(depth + 1)) {
+                return false;
+            }
+            skip_whitespace();
+            if (position_ >= text_.size()) {
+                return false;
+            }
+            if (text_[position_] == L'}') {
+                ++position_;
+                return true;
+            }
+            if (text_[position_++] != L',') {
+                return false;
+            }
+            skip_whitespace();
+        }
+    }
+
+    [[nodiscard]] bool parse_array(std::size_t depth) {
+        ++position_;
+        skip_whitespace();
+        if (position_ < text_.size() && text_[position_] == L']') {
+            ++position_;
+            return true;
+        }
+        for (;;) {
+            if (!parse_value(depth + 1)) {
+                return false;
+            }
+            skip_whitespace();
+            if (position_ >= text_.size()) {
+                return false;
+            }
+            if (text_[position_] == L']') {
+                ++position_;
+                return true;
+            }
+            if (text_[position_++] != L',') {
+                return false;
+            }
+            skip_whitespace();
+        }
+    }
+
+    [[nodiscard]] bool parse_number() noexcept {
+        const std::size_t start = position_;
+        while (position_ < text_.size()) {
+            const wchar_t character = text_[position_];
+            if ((character >= L'0' && character <= L'9') ||
+                character == L'-' || character == L'+' || character == L'.' ||
+                character == L'e' || character == L'E') {
+                ++position_;
+            } else {
+                break;
+            }
+        }
+        return position_ > start;
+    }
+
+    [[nodiscard]] bool parse_value(std::size_t depth) {
+        if (depth > 64 || position_ >= text_.size()) {
+            return false;
+        }
+        switch (text_[position_]) {
+            case L'{': return parse_object(depth);
+            case L'[': return parse_array(depth);
+            case L'"': return parse_string(nullptr);
+            case L't': return consume(L"true");
+            case L'f': return consume(L"false");
+            case L'n': return consume(L"null");
+            default:
+                return (text_[position_] == L'-' ||
+                        (text_[position_] >= L'0' && text_[position_] <= L'9')) &&
+                       parse_number();
+        }
+    }
+
+    std::wstring_view text_;
+    std::size_t position_{};
+};
+
+}  // namespace
+
+std::optional<OcrOutput> parse_ocr_runner_protocol(
+    std::string_view json_utf8,
+    const OcrProtocolExpectations& expected,
+    std::wstring* error) {
+    if (error) {
+        error->clear();
+    }
+    const auto fail = [error](std::wstring_view reason) -> std::optional<OcrOutput> {
+        if (error) {
+            *error = reason;
+        }
+        return std::nullopt;
+    };
+    if (json_utf8.empty() || json_utf8.size() > kMaxOcrProcessOutputBytes) {
+        return fail(L"协议为空或超过大小上限。");
+    }
+    const std::wstring json = from_utf8(json_utf8);
+    if (json.empty()) {
+        return fail(L"协议不是合法 UTF-8。");
+    }
+    StrictJsonScanner scanner(json);
+    if (!scanner.valid()) {
+        return fail(L"协议 JSON 结构无效或包含重复字段。");
+    }
+
+    try {
+        const ScopedWinrtApartment apartment;
+        const auto root = winrt::Windows::Data::Json::JsonObject::Parse(json);
+        if (root.Size() != 5 || !root.HasKey(L"schemaVersion") ||
+            !root.HasKey(L"profile") || !root.HasKey(L"preprocess") ||
+            !root.HasKey(L"timings") || !root.HasKey(L"blocks")) {
+            return fail(L"协议顶层字段不符合 schemaVersion 1。");
+        }
+
+        const auto exact_integer = [](
+                                       const auto& object,
+                                       std::wstring_view name,
+                                       int minimum,
+                                       int maximum) -> std::optional<int> {
+            const double value = object.GetNamedNumber(winrt::hstring(name));
+            if (!std::isfinite(value) || std::trunc(value) != value ||
+                value < static_cast<double>(minimum) ||
+                value > static_cast<double>(maximum)) {
+                return std::nullopt;
+            }
+            return static_cast<int>(value);
+        };
+        const auto finite_number = [](
+                                       const auto& object,
+                                       std::wstring_view name,
+                                       double minimum,
+                                       double maximum) -> std::optional<double> {
+            const double value = object.GetNamedNumber(winrt::hstring(name));
+            if (!std::isfinite(value) || value < minimum || value > maximum) {
+                return std::nullopt;
+            }
+            return value;
+        };
+
+        const auto schema_version = exact_integer(
+            root,
+            L"schemaVersion",
+            1,
+            static_cast<int>(kOcrProtocolSchemaVersion));
+        if (!schema_version ||
+            *schema_version != static_cast<int>(kOcrProtocolSchemaVersion)) {
+            return fail(L"不支持的 OCR 协议版本。");
+        }
+
+        OcrOutput output;
+        output.profile = root.GetNamedString(L"profile").c_str();
+        const bool supported_profile =
+            output.profile == kOcrEngineRapidV5Fast ||
+            output.profile == kOcrEngineRapidV5Accurate ||
+            output.profile == kOcrEngineRapidV4Compat;
+        if (!supported_profile ||
+            (!expected.profile.empty() && output.profile != expected.profile)) {
+            return fail(L"OCR 协议 profile 与请求不匹配。");
+        }
+
+        const auto preprocess = root.GetNamedObject(L"preprocess");
+        if (preprocess.Size() != 12 ||
+            !preprocess.HasKey(L"sourceWidth") ||
+            !preprocess.HasKey(L"sourceHeight") ||
+            !preprocess.HasKey(L"inputWidth") ||
+            !preprocess.HasKey(L"inputHeight") ||
+            !preprocess.HasKey(L"scaleX") ||
+            !preprocess.HasKey(L"scaleY") ||
+            !preprocess.HasKey(L"resample") ||
+            !preprocess.HasKey(L"tiled") ||
+            !preprocess.HasKey(L"tileCount") ||
+            !preprocess.HasKey(L"tileSize") ||
+            !preprocess.HasKey(L"tileOverlap") ||
+            !preprocess.HasKey(L"coordinateSpace")) {
+            return fail(L"OCR 预处理字段不完整或包含未知字段。");
+        }
+        const auto source_width = exact_integer(
+            preprocess, L"sourceWidth", 1, kMaxOcrProtocolDimension);
+        const auto source_height = exact_integer(
+            preprocess, L"sourceHeight", 1, kMaxOcrProtocolDimension);
+        const auto input_width = exact_integer(
+            preprocess, L"inputWidth", 1, kMaxOcrProtocolDimension);
+        const auto input_height = exact_integer(
+            preprocess, L"inputHeight", 1, kMaxOcrProtocolDimension);
+        const auto scale_x = finite_number(preprocess, L"scaleX", 0.01, 2.0);
+        const auto scale_y = finite_number(preprocess, L"scaleY", 0.01, 2.0);
+        const auto tile_count = exact_integer(preprocess, L"tileCount", 1, 512);
+        const auto tile_size = exact_integer(preprocess, L"tileSize", 0, 4'096);
+        const auto tile_overlap = exact_integer(preprocess, L"tileOverlap", 0, 1'024);
+        if (!source_width || !source_height || !input_width || !input_height ||
+            !scale_x || !scale_y || !tile_count || !tile_size || !tile_overlap) {
+            return fail(L"OCR 预处理数值越界。");
+        }
+        const std::wstring resample = preprocess.GetNamedString(L"resample").c_str();
+        const std::wstring coordinate_space =
+            preprocess.GetNamedString(L"coordinateSpace").c_str();
+        const bool tiled = preprocess.GetNamedBoolean(L"tiled");
+        if ((resample != L"none" && resample != L"bilinear-upscale" &&
+             resample != L"progressive-bilinear-downscale") ||
+            coordinate_space != L"input-pixels") {
+            return fail(L"OCR 预处理模式或坐标空间无效。");
+        }
+        const double calculated_scale_x =
+            static_cast<double>(*input_width) / static_cast<double>(*source_width);
+        const double calculated_scale_y =
+            static_cast<double>(*input_height) / static_cast<double>(*source_height);
+        if (std::abs(*scale_x - calculated_scale_x) > 1.0e-9 ||
+            std::abs(*scale_y - calculated_scale_y) > 1.0e-9) {
+            return fail(L"OCR 预处理缩放比例不自洽。");
+        }
+        if ((!tiled && (*tile_count != 1 || *tile_size != 0 || *tile_overlap != 0)) ||
+            (tiled && (*tile_count < 2 || *tile_size < 512 || *tile_overlap < 32 ||
+                       *tile_overlap >= *tile_size / 2))) {
+            return fail(L"OCR 分块元数据不自洽。");
+        }
+        if ((expected.source_width > 0 && *source_width != expected.source_width) ||
+            (expected.source_height > 0 && *source_height != expected.source_height) ||
+            (expected.input_width > 0 && *input_width != expected.input_width) ||
+            (expected.input_height > 0 && *input_height != expected.input_height) ||
+            (expected.scale_x > 0.0 && std::abs(*scale_x - expected.scale_x) > 1.0e-9) ||
+            (expected.scale_y > 0.0 && std::abs(*scale_y - expected.scale_y) > 1.0e-9) ||
+            (!expected.resample.empty() && resample != expected.resample)) {
+            return fail(L"OCR 预处理元数据与请求不匹配。");
+        }
+        output.preprocess = {
+            *source_width,
+            *source_height,
+            *input_width,
+            *input_height,
+            *scale_x,
+            *scale_y,
+            resample,
+            tiled,
+            *tile_count,
+            *tile_size,
+            *tile_overlap,
+        };
+
+        const auto timings = root.GetNamedObject(L"timings");
+        if (timings.Size() != 5 || !timings.HasKey(L"decodeMs") ||
+            !timings.HasKey(L"modelInitMs") ||
+            !timings.HasKey(L"inferenceMs") ||
+            !timings.HasKey(L"mergeMs") || !timings.HasKey(L"totalMs")) {
+            return fail(L"OCR timing 字段不完整或包含未知字段。");
+        }
+        const auto decode_ms = finite_number(
+            timings, L"decodeMs", 0.0, kMaxOcrProtocolTimingMs);
+        const auto model_init_ms = finite_number(
+            timings, L"modelInitMs", 0.0, kMaxOcrProtocolTimingMs);
+        const auto inference_ms = finite_number(
+            timings, L"inferenceMs", 0.0, kMaxOcrProtocolTimingMs);
+        const auto merge_ms = finite_number(
+            timings, L"mergeMs", 0.0, kMaxOcrProtocolTimingMs);
+        const auto total_ms = finite_number(
+            timings, L"totalMs", 0.0, kMaxOcrProtocolTimingMs);
+        if (!decode_ms || !model_init_ms || !inference_ms || !merge_ms || !total_ms ||
+            *total_ms + 0.001 < std::max({
+                *decode_ms, *model_init_ms, *inference_ms, *merge_ms})) {
+            return fail(L"OCR timing 数值无效。");
+        }
+        output.timings = {
+            *decode_ms,
+            *model_init_ms,
+            *inference_ms,
+            *merge_ms,
+            *total_ms,
+        };
+
+        const auto blocks = root.GetNamedArray(L"blocks");
+        if (blocks.Size() > kMaxOcrProtocolBlocks) {
+            return fail(L"OCR 文字块数量超过上限。");
+        }
+        output.blocks.reserve(blocks.Size());
+        std::size_t total_text_characters = 0;
+        for (const auto& value : blocks) {
+            const auto block_object = value.GetObject();
+            if (block_object.Size() != 3 || !block_object.HasKey(L"quad") ||
+                !block_object.HasKey(L"text") || !block_object.HasKey(L"score")) {
+                return fail(L"OCR 文字块字段无效。");
+            }
+            std::wstring text = block_object.GetNamedString(L"text").c_str();
+            const auto first_non_space = std::ranges::find_if_not(
+                text,
+                [](wchar_t character) { return std::iswspace(character) != 0; });
+            const auto last_non_space = std::find_if_not(
+                text.rbegin(),
+                text.rend(),
+                [](wchar_t character) { return std::iswspace(character) != 0; });
+            if (first_non_space == text.end()) {
+                return fail(L"OCR 文字块包含空文本。");
+            }
+            text = std::wstring(first_non_space, last_non_space.base());
+            if (text.size() > kMaxOcrBlockTextCharacters ||
+                total_text_characters > kMaxOcrTotalTextCharacters - text.size() ||
+                std::ranges::any_of(text, [](wchar_t character) {
+                    return character < L' ' || character == 0x7f;
+                }) ||
+                to_utf8(text).empty()) {
+                return fail(L"OCR 文字块文本无效或超过上限。");
+            }
+            total_text_characters += text.size();
+            const double score = block_object.GetNamedNumber(L"score");
+            if (!std::isfinite(score) || score < 0.0 || score > 1.0) {
+                return fail(L"OCR 文字块置信度无效。");
+            }
+
+            const auto quad = block_object.GetNamedArray(L"quad");
+            if (quad.Size() != 4) {
+                return fail(L"OCR 文字块 quad 必须包含四个点。");
+            }
+            OcrBlock block;
+            block.text = std::move(text);
+            block.score = score;
+            double left = std::numeric_limits<double>::max();
+            double top = std::numeric_limits<double>::max();
+            double right = std::numeric_limits<double>::lowest();
+            double bottom = std::numeric_limits<double>::lowest();
+            for (std::uint32_t point_index = 0; point_index < 4; ++point_index) {
+                const auto point = quad.GetAt(point_index).GetArray();
+                if (point.Size() != 2) {
+                    return fail(L"OCR quad 点坐标格式无效。");
+                }
+                const double input_x = point.GetAt(0).GetNumber();
+                const double input_y = point.GetAt(1).GetNumber();
+                if (!std::isfinite(input_x) || !std::isfinite(input_y) ||
+                    input_x < 0.0 || input_y < 0.0 ||
+                    input_x > static_cast<double>(*input_width) ||
+                    input_y > static_cast<double>(*input_height)) {
+                    return fail(L"OCR quad 坐标越界或不是有限数值。");
+                }
+                const double source_x = std::clamp(
+                    input_x / *scale_x,
+                    0.0,
+                    static_cast<double>(*source_width));
+                const double source_y = std::clamp(
+                    input_y / *scale_y,
+                    0.0,
+                    static_cast<double>(*source_height));
+                block.quad[point_index] = {source_x, source_y};
+                left = std::min(left, source_x);
+                top = std::min(top, source_y);
+                right = std::max(right, source_x);
+                bottom = std::max(bottom, source_y);
+            }
+            if (right - left < 0.25 || bottom - top < 0.25) {
+                return fail(L"OCR quad 退化为无效区域。");
+            }
+            output.blocks.push_back(std::move(block));
+        }
+
+        const auto bounds = [](const OcrBlock& block) {
+            std::array<double, 6> result{
+                std::numeric_limits<double>::max(),
+                std::numeric_limits<double>::max(),
+                std::numeric_limits<double>::lowest(),
+                std::numeric_limits<double>::lowest(),
+                0.0,
+                0.0,
+            };
+            for (const auto& point : block.quad) {
+                result[0] = std::min(result[0], point.x);
+                result[1] = std::min(result[1], point.y);
+                result[2] = std::max(result[2], point.x);
+                result[3] = std::max(result[3], point.y);
+            }
+            result[4] = (result[1] + result[3]) * 0.5;
+            result[5] = result[3] - result[1];
+            return result;
+        };
+        std::vector<std::size_t> order(output.blocks.size());
+        for (std::size_t index = 0; index < order.size(); ++index) {
+            order[index] = index;
+        }
+        std::ranges::sort(order, [&output, &bounds](std::size_t first, std::size_t second) {
+            const auto first_bounds = bounds(output.blocks[first]);
+            const auto second_bounds = bounds(output.blocks[second]);
+            if (first_bounds[4] != second_bounds[4]) {
+                return first_bounds[4] < second_bounds[4];
+            }
+            if (first_bounds[0] != second_bounds[0]) {
+                return first_bounds[0] < second_bounds[0];
+            }
+            if (first_bounds[1] != second_bounds[1]) {
+                return first_bounds[1] < second_bounds[1];
+            }
+            return output.blocks[first].text < output.blocks[second].text;
+        });
+
+        struct TextLine {
+            std::vector<std::size_t> blocks;
+            double center_sum{};
+            double height_sum{};
+            double top{std::numeric_limits<double>::max()};
+            double left{std::numeric_limits<double>::max()};
+        };
+        std::vector<TextLine> lines;
+        for (const std::size_t block_index : order) {
+            const auto block_bounds = bounds(output.blocks[block_index]);
+            std::optional<std::size_t> best_line;
+            if (!lines.empty()) {
+                const auto& line = lines.back();
+                const double count = static_cast<double>(line.blocks.size());
+                const double line_center = line.center_sum / count;
+                const double line_height = line.height_sum / count;
+                const double distance = std::abs(block_bounds[4] - line_center);
+                if (distance <=
+                    std::max(2.0, 0.55 * std::max(block_bounds[5], line_height))) {
+                    best_line = lines.size() - 1;
+                }
+            }
+            if (!best_line) {
+                lines.push_back({
+                    {block_index},
+                    block_bounds[4],
+                    block_bounds[5],
+                    block_bounds[1],
+                    block_bounds[0],
+                });
+            } else {
+                auto& line = lines[*best_line];
+                line.blocks.push_back(block_index);
+                line.center_sum += block_bounds[4];
+                line.height_sum += block_bounds[5];
+                line.top = std::min(line.top, block_bounds[1]);
+                line.left = std::min(line.left, block_bounds[0]);
+            }
+        }
+        std::ranges::sort(lines, [](const TextLine& first, const TextLine& second) {
+            if (first.top != second.top) {
+                return first.top < second.top;
+            }
+            return first.left < second.left;
+        });
+
+        std::vector<OcrBlock> sorted_blocks;
+        sorted_blocks.reserve(output.blocks.size());
+        std::vector<std::wstring> text_lines;
+        text_lines.reserve(lines.size());
+        for (auto& line : lines) {
+            std::ranges::sort(line.blocks, [&output, &bounds](std::size_t first, std::size_t second) {
+                const auto first_bounds = bounds(output.blocks[first]);
+                const auto second_bounds = bounds(output.blocks[second]);
+                if (first_bounds[0] != second_bounds[0]) {
+                    return first_bounds[0] < second_bounds[0];
+                }
+                if (first_bounds[4] != second_bounds[4]) {
+                    return first_bounds[4] < second_bounds[4];
+                }
+                return output.blocks[first].text < output.blocks[second].text;
+            });
+            std::wstring line_text;
+            for (const std::size_t block_index : line.blocks) {
+                if (!line_text.empty()) {
+                    line_text.push_back(L' ');
+                }
+                line_text += output.blocks[block_index].text;
+                sorted_blocks.push_back(std::move(output.blocks[block_index]));
+            }
+            text_lines.push_back(std::move(line_text));
+        }
+        output.blocks = std::move(sorted_blocks);
+        output.text = join_ocr_lines(text_lines);
+        output.ok = !output.text.empty();
+        if (!output.ok) {
+            output.error = L"OCR 未识别到任何文本。";
+        }
+        return output;
+    } catch (...) {
+        return fail(L"OCR JSON 结构或字段类型无效。");
+    }
+}
+
+namespace {
+
+struct WarmWorkerResponse {
+    bool ok{};
+    OcrOutput output;
+    std::wstring error;
+};
+
+std::optional<WarmWorkerResponse> parse_warm_worker_response(
+    std::string_view response_utf8,
+    std::uint64_t expected_request_id,
+    std::wstring_view expected_profile,
+    const std::filesystem::path& expected_root,
+    std::uint64_t expected_sequence,
+    const OcrProtocolExpectations& expected_image,
+    std::wstring* protocol_error) {
+    const auto fail = [protocol_error](std::wstring_view reason)
+        -> std::optional<WarmWorkerResponse> {
+        if (protocol_error) {
+            *protocol_error = reason;
+        }
+        return std::nullopt;
+    };
+    if (protocol_error) {
+        protocol_error->clear();
+    }
+    if (response_utf8.empty() || response_utf8.size() > kMaxWarmWorkerResponseBytes) {
+        return fail(L"温热 worker 响应为空或超过上限。");
+    }
+    const std::wstring response_json = from_utf8(response_utf8);
+    if (response_json.empty()) {
+        return fail(L"温热 worker 响应不是合法 UTF-8。");
+    }
+    StrictJsonScanner scanner(response_json);
+    if (!scanner.valid()) {
+        return fail(L"温热 worker 响应 JSON 无效或包含重复字段。");
+    }
+
+    try {
+        const ScopedWinrtApartment apartment;
+        const auto root = winrt::Windows::Data::Json::JsonObject::Parse(response_json);
+        const bool has_result = root.HasKey(L"result");
+        const bool has_error = root.HasKey(L"error");
+        if (root.Size() != 7 || !root.HasKey(L"schemaVersion") ||
+            !root.HasKey(L"requestId") || !root.HasKey(L"profile") ||
+            !root.HasKey(L"dependencyRoot") ||
+            !root.HasKey(L"dependencySequence") || !root.HasKey(L"ok") ||
+            has_result == has_error) {
+            return fail(L"温热 worker 响应字段不符合 schema。");
+        }
+        const auto exact_uint64 = [&root](
+                                      std::wstring_view name,
+                                      std::uint64_t minimum,
+                                      std::uint64_t maximum)
+            -> std::optional<std::uint64_t> {
+            const double value = root.GetNamedNumber(winrt::hstring(name));
+            if (!std::isfinite(value) || std::trunc(value) != value ||
+                value < static_cast<double>(minimum) ||
+                value > static_cast<double>(maximum)) {
+                return std::nullopt;
+            }
+            return static_cast<std::uint64_t>(value);
+        };
+        const auto schema = exact_uint64(
+            L"schemaVersion", 1, kWarmWorkerSchemaVersion);
+        const auto request_id = exact_uint64(
+            L"requestId", 1, kMaxSafeJsonInteger);
+        const auto sequence = exact_uint64(
+            L"dependencySequence", 1, kMaxSafeJsonInteger);
+        const std::wstring profile = root.GetNamedString(L"profile").c_str();
+        const std::wstring dependency_root =
+            root.GetNamedString(L"dependencyRoot").c_str();
+        const bool ok = root.GetNamedBoolean(L"ok");
+        if (!schema || *schema != kWarmWorkerSchemaVersion ||
+            !request_id || *request_id != expected_request_id ||
+            !sequence || *sequence != expected_sequence ||
+            profile != expected_profile ||
+            dependency_root != expected_root.wstring() || ok != has_result) {
+            return fail(L"温热 worker 响应身份与当前请求不匹配。");
+        }
+
+        WarmWorkerResponse response;
+        response.ok = ok;
+        if (!ok) {
+            response.error = root.GetNamedString(L"error").c_str();
+            if (response.error.empty() || response.error.size() > 4'096 ||
+                std::ranges::any_of(response.error, [](wchar_t character) {
+                    return character < L' ' || character == 0x7f;
+                }) ||
+                to_utf8(response.error).empty()) {
+                return fail(L"温热 worker 错误字段无效。");
+            }
+            return response;
+        }
+
+        const std::wstring result_json =
+            root.GetNamedObject(L"result").Stringify().c_str();
+        const std::string result_utf8 = to_utf8(result_json);
+        if (result_utf8.empty()) {
+            return fail(L"温热 worker 嵌套结果无法编码为 UTF-8。");
+        }
+        std::wstring result_error;
+        auto parsed_result = parse_ocr_runner_protocol(
+            result_utf8,
+            expected_image,
+            &result_error);
+        if (!parsed_result) {
+            return fail(L"温热 worker 嵌套结果无效：" + result_error);
+        }
+        response.output = std::move(*parsed_result);
+        return response;
+    } catch (...) {
+        return fail(L"温热 worker 响应字段类型无效。");
+    }
+}
+
+bool warm_equals_ignore_case(std::wstring_view first, std::wstring_view second) {
+    return first.size() == second.size() &&
+           CompareStringOrdinal(
+               first.data(),
+               static_cast<int>(first.size()),
+               second.data(),
+               static_cast<int>(second.size()),
+               TRUE) == CSTR_EQUAL;
+}
+
+bool warm_starts_with_ignore_case(std::wstring_view value, std::wstring_view prefix) {
+    return value.size() >= prefix.size() &&
+           CompareStringOrdinal(
+               value.data(),
+               static_cast<int>(prefix.size()),
+               prefix.data(),
+               static_cast<int>(prefix.size()),
+               TRUE) == CSTR_EQUAL;
+}
+
+bool warm_remove_environment_entry(std::wstring_view entry) {
+    const std::size_t search_from = !entry.empty() && entry.front() == L'=' ? 1U : 0U;
+    const std::size_t separator = entry.find(L'=', search_from);
+    if (separator == std::wstring_view::npos) {
+        return false;
+    }
+    const std::wstring_view name = entry.substr(0, separator);
+    return warm_starts_with_ignore_case(name, L"PYTHON") ||
+           warm_starts_with_ignore_case(name, L"_PYI_") ||
+           warm_equals_ignore_case(name, L"_MEIPASS2") ||
+           warm_equals_ignore_case(name, L"PYINSTALLER_RESET_ENVIRONMENT");
+}
+
+std::optional<std::vector<wchar_t>> warm_runner_environment_block() {
+    LPWCH raw_environment = GetEnvironmentStringsW();
+    if (!raw_environment) {
+        return std::nullopt;
+    }
+    try {
+        std::vector<std::wstring> entries;
+        for (const wchar_t* cursor = raw_environment; *cursor != L'\0';) {
+            const std::wstring_view entry(cursor);
+            if (!warm_remove_environment_entry(entry)) {
+                entries.emplace_back(entry);
+            }
+            cursor += entry.size() + 1U;
+        }
+        FreeEnvironmentStringsW(raw_environment);
+        raw_environment = nullptr;
+        entries.emplace_back(L"PYINSTALLER_RESET_ENVIRONMENT=1");
+        std::ranges::sort(entries, [](const std::wstring& first, const std::wstring& second) {
+            const int insensitive = CompareStringOrdinal(
+                first.c_str(), static_cast<int>(first.size()),
+                second.c_str(), static_cast<int>(second.size()), TRUE);
+            if (insensitive != CSTR_EQUAL) {
+                return insensitive == CSTR_LESS_THAN;
+            }
+            return CompareStringOrdinal(
+                       first.c_str(), static_cast<int>(first.size()),
+                       second.c_str(), static_cast<int>(second.size()), FALSE) == CSTR_LESS_THAN;
+        });
+        std::size_t characters = 1;
+        for (const auto& entry : entries) {
+            if (entry.size() > std::numeric_limits<std::size_t>::max() - characters - 1U) {
+                return std::nullopt;
+            }
+            characters += entry.size() + 1U;
+        }
+        std::vector<wchar_t> block;
+        block.reserve(characters);
+        for (const auto& entry : entries) {
+            block.insert(block.end(), entry.begin(), entry.end());
+            block.push_back(L'\0');
+        }
+        block.push_back(L'\0');
+        return block;
+    } catch (...) {
+        if (raw_environment) {
+            FreeEnvironmentStringsW(raw_environment);
+        }
+        return std::nullopt;
+    }
+}
+
+std::filesystem::path warm_system_directory() {
+    std::wstring buffer(32'768, L'\0');
+    const UINT size = GetSystemDirectoryW(buffer.data(), static_cast<UINT>(buffer.size()));
+    if (size == 0 || size >= buffer.size()) {
+        return {};
+    }
+    buffer.resize(size);
+    return std::filesystem::path(buffer);
+}
+
+std::optional<std::wstring> warm_current_dll_directory() {
+    SetLastError(ERROR_SUCCESS);
+    DWORD required = GetDllDirectoryW(0, nullptr);
+    if (required == 0) {
+        return GetLastError() == ERROR_SUCCESS
+                   ? std::optional<std::wstring>(std::wstring{})
+                   : std::nullopt;
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::wstring directory(required, L'\0');
+        SetLastError(ERROR_SUCCESS);
+        const DWORD size = GetDllDirectoryW(
+            static_cast<DWORD>(directory.size()), directory.data());
+        if (size == 0) {
+            return GetLastError() == ERROR_SUCCESS
+                       ? std::optional<std::wstring>(std::wstring{})
+                       : std::nullopt;
+        }
+        if (size < directory.size()) {
+            directory.resize(size);
+            return directory;
+        }
+        required = size;
+    }
+    return std::nullopt;
+}
+
+bool warm_paths_equal(
+    const std::filesystem::path& first,
+    const std::filesystem::path& second) {
+    const std::wstring first_text = first.lexically_normal().generic_wstring();
+    const std::wstring second_text = second.lexically_normal().generic_wstring();
+    return warm_equals_ignore_case(first_text, second_text);
+}
+
+std::optional<std::string> make_warm_worker_request(
+    std::uint64_t request_id,
+    std::wstring_view profile,
+    const std::filesystem::path& dependency_root,
+    std::uint64_t dependency_sequence,
+    const std::filesystem::path& image_path,
+    const OcrProtocolExpectations& image) {
+    try {
+        using winrt::Windows::Data::Json::JsonObject;
+        using winrt::Windows::Data::Json::JsonValue;
+        const ScopedWinrtApartment apartment;
+        JsonObject image_object;
+        image_object.Insert(L"path", JsonValue::CreateStringValue(image_path.wstring()));
+        image_object.Insert(L"sourceWidth", JsonValue::CreateNumberValue(image.source_width));
+        image_object.Insert(L"sourceHeight", JsonValue::CreateNumberValue(image.source_height));
+        image_object.Insert(L"inputWidth", JsonValue::CreateNumberValue(image.input_width));
+        image_object.Insert(L"inputHeight", JsonValue::CreateNumberValue(image.input_height));
+        image_object.Insert(L"scaleX", JsonValue::CreateNumberValue(image.scale_x));
+        image_object.Insert(L"scaleY", JsonValue::CreateNumberValue(image.scale_y));
+        image_object.Insert(L"resample", JsonValue::CreateStringValue(image.resample));
+
+        JsonObject root;
+        root.Insert(
+            L"schemaVersion",
+            JsonValue::CreateNumberValue(static_cast<double>(kWarmWorkerSchemaVersion)));
+        root.Insert(
+            L"requestId", JsonValue::CreateNumberValue(static_cast<double>(request_id)));
+        root.Insert(L"profile", JsonValue::CreateStringValue(profile));
+        root.Insert(
+            L"dependencyRoot", JsonValue::CreateStringValue(dependency_root.wstring()));
+        root.Insert(
+            L"dependencySequence",
+            JsonValue::CreateNumberValue(static_cast<double>(dependency_sequence)));
+        root.Insert(L"image", image_object);
+        const std::string result = to_utf8(root.Stringify().c_str());
+        if (result.empty() || result.size() > kMaxWarmWorkerRequestBytes) {
+            return std::nullopt;
+        }
+        return result;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+}  // namespace
+
+namespace {
+
+enum class WarmAttemptStatus {
+    completed,
+    cancelled,
+    unavailable,
+};
+
+bool warm_worker_key_matches_impl(
+    bool process_healthy,
+    const std::filesystem::path& current_root,
+    std::uint64_t current_sequence,
+    std::wstring_view current_profile,
+    int current_ort_threads,
+    const std::filesystem::path& requested_root,
+    std::uint64_t requested_sequence,
+    std::wstring_view requested_profile,
+    int requested_ort_threads) {
+    return process_healthy && current_sequence == requested_sequence &&
+           current_profile == requested_profile &&
+           current_ort_threads == requested_ort_threads &&
+           warm_paths_equal(current_root, requested_root);
+}
+
+bool warm_attempt_allows_fallback(
+    WarmAttemptStatus status,
+    bool stop_requested) noexcept {
+    return status == WarmAttemptStatus::unavailable && !stop_requested;
+}
+
+std::optional<std::uint32_t> decode_warm_frame_size(
+    std::span<const char> header,
+    std::size_t maximum) noexcept {
+    if (header.size() < 4U) {
+        return std::nullopt;
+    }
+    const auto byte = [&header](std::size_t index) {
+        return static_cast<std::uint32_t>(
+            static_cast<unsigned char>(header[index]));
+    };
+    const std::uint32_t size =
+        byte(0) | (byte(1) << 8U) | (byte(2) << 16U) | (byte(3) << 24U);
+    if (size == 0 || size > maximum) {
+        return std::nullopt;
+    }
+    return size;
+}
+
+struct WarmAttempt {
+    WarmAttemptStatus status{WarmAttemptStatus::unavailable};
+    OcrOutput output;
+    std::wstring error;
+};
+
+class WarmOcrWorkerManager {
+public:
+    ~WarmOcrWorkerManager() {
+        std::scoped_lock lock(mutex_);
+        discard_locked(125);
+    }
+
+    WarmOcrWorkerManager(const WarmOcrWorkerManager&) = delete;
+    WarmOcrWorkerManager& operator=(const WarmOcrWorkerManager&) = delete;
+
+    static WarmOcrWorkerManager& instance() {
+        // The kernel closes the Job handle and kills the worker when the host
+        // exits. Intentionally avoid a blocking static destructor racing a
+        // still-unwinding OCR thread during process shutdown.
+        static WarmOcrWorkerManager* const manager = new WarmOcrWorkerManager();
+        return *manager;
+    }
+
+    WarmAttempt recognize(
+        const OcrDependencyLease& dependency_lease,
+        std::wstring_view profile,
+        const std::filesystem::path& model_directory,
+        const std::filesystem::path& image_path,
+        const OcrProtocolExpectations& image,
+        int ort_threads,
+        std::stop_token stop_token) {
+        std::unique_lock lock(mutex_, std::defer_lock);
+        while (!lock.try_lock()) {
+            if (stop_token.stop_requested()) {
+                return {WarmAttemptStatus::cancelled, {}, L"OCR 已取消。"};
+            }
+            Sleep(5);
+        }
+        if (stop_token.stop_requested()) {
+            return {WarmAttemptStatus::cancelled, {}, L"OCR 已取消。"};
+        }
+        if (!dependency_lease.valid()) {
+            return {WarmAttemptStatus::unavailable, {}, L"温热 OCR 依赖 lease 无效。"};
+        }
+        const int effective_ort_threads =
+            std::clamp(ort_threads, 1, 4);
+
+        if (!worker_healthy_locked() ||
+            !key_matches_locked(
+                dependency_lease.root(),
+                dependency_lease.sequence(),
+                profile,
+                effective_ort_threads)) {
+            discard_locked(125);
+        }
+        if (!process_.get()) {
+            std::wstring start_error;
+            if (!start_locked(
+                    dependency_lease,
+                    profile,
+                    model_directory,
+                    effective_ort_threads,
+                    &start_error)) {
+                discard_locked(125);
+                return {
+                    WarmAttemptStatus::unavailable,
+                    {},
+                    start_error.empty() ? L"温热 OCR worker 启动失败。" : start_error,
+                };
+            }
+        }
+
+        std::vector<char> unexpected_stdout;
+        std::vector<char> startup_diagnostic;
+        bool stdout_limit = false;
+        bool diagnostic_limit = false;
+        if (!append_available_output(
+                stdout_read_.get(),
+                unexpected_stdout,
+                kMaxWarmWorkerResponseBytes + 4U,
+                stdout_limit) ||
+            !append_available_output(
+                stderr_read_.get(),
+                startup_diagnostic,
+                kMaxOcrProcessDiagnosticBytes,
+                diagnostic_limit) ||
+            stdout_limit || diagnostic_limit || !unexpected_stdout.empty()) {
+            discard_locked(125);
+            return {
+                WarmAttemptStatus::unavailable,
+                {},
+                L"温热 OCR worker 在请求前输出了非预期数据。",
+            };
+        }
+
+        const std::uint64_t request_id = next_request_id();
+        const auto request = make_warm_worker_request(
+            request_id,
+            profile,
+            dependency_lease.root(),
+            dependency_lease.sequence(),
+            image_path,
+            image);
+        if (!request) {
+            discard_locked(125);
+            return {
+                WarmAttemptStatus::unavailable,
+                {},
+                L"无法编码温热 OCR worker 请求。",
+            };
+        }
+        std::vector<std::byte> frame(4U + request->size());
+        const std::uint32_t request_size = static_cast<std::uint32_t>(request->size());
+        frame[0] = static_cast<std::byte>(request_size & 0xffU);
+        frame[1] = static_cast<std::byte>((request_size >> 8U) & 0xffU);
+        frame[2] = static_cast<std::byte>((request_size >> 16U) & 0xffU);
+        frame[3] = static_cast<std::byte>((request_size >> 24U) & 0xffU);
+        std::memcpy(frame.data() + 4U, request->data(), request->size());
+        if (!write_all_locked(frame)) {
+            discard_locked(125);
+            return {
+                WarmAttemptStatus::unavailable,
+                {},
+                L"温热 OCR worker 请求管道已断开。",
+            };
+        }
+
+        std::vector<char> response_bytes;
+        response_bytes.reserve(4096);
+        std::vector<char> diagnostic_bytes;
+        diagnostic_bytes.reserve(1024);
+        bool response_limit = false;
+        diagnostic_limit = false;
+        const ULONGLONG deadline = GetTickCount64() + kOcrProcessTimeoutMs;
+        std::optional<std::uint32_t> expected_response_size;
+        for (;;) {
+            if (stop_token.stop_requested()) {
+                discard_locked(122, kWarmWorkerCancelWaitMs);
+                return {WarmAttemptStatus::cancelled, {}, L"OCR 已取消。"};
+            }
+            const bool stdout_ok = append_available_output(
+                stdout_read_.get(),
+                response_bytes,
+                kMaxWarmWorkerResponseBytes + 4U,
+                response_limit);
+            const bool stderr_ok = append_available_output(
+                stderr_read_.get(),
+                diagnostic_bytes,
+                kMaxOcrProcessDiagnosticBytes,
+                diagnostic_limit);
+            if (!stdout_ok || !stderr_ok || response_limit || diagnostic_limit) {
+                discard_locked(125);
+                return {
+                    WarmAttemptStatus::unavailable,
+                    {},
+                    response_limit
+                        ? L"温热 OCR worker 响应超过 8 MiB。"
+                        : diagnostic_limit
+                              ? L"温热 OCR worker 诊断超过 1 MiB。"
+                              : L"温热 OCR worker 管道读取失败。",
+                };
+            }
+            if (!expected_response_size && response_bytes.size() >= 4U) {
+                expected_response_size = decode_warm_frame_size(
+                    std::span<const char>(response_bytes).first(4),
+                    kMaxWarmWorkerResponseBytes);
+                if (!expected_response_size) {
+                    discard_locked(125);
+                    return {
+                        WarmAttemptStatus::unavailable,
+                        {},
+                        L"温热 OCR worker 帧长度无效。",
+                    };
+                }
+            }
+            if (expected_response_size) {
+                const std::size_t frame_size = 4U + *expected_response_size;
+                if (response_bytes.size() > frame_size) {
+                    discard_locked(125);
+                    return {
+                        WarmAttemptStatus::unavailable,
+                        {},
+                        L"温热 OCR worker 返回了帧外数据。",
+                    };
+                }
+                if (response_bytes.size() == frame_size) {
+                    const std::string_view response(
+                        response_bytes.data() + 4U,
+                        *expected_response_size);
+                    std::wstring response_error;
+                    const auto parsed = parse_warm_worker_response(
+                        response,
+                        request_id,
+                        profile,
+                        dependency_lease.root(),
+                        dependency_lease.sequence(),
+                        image,
+                        &response_error);
+                    if (!parsed) {
+                        discard_locked(125);
+                        return {
+                            WarmAttemptStatus::unavailable,
+                            {},
+                            L"温热 OCR worker 协议错误：" + response_error,
+                        };
+                    }
+                    if (!parsed->ok) {
+                        const std::wstring worker_error = parsed->error;
+                        discard_locked(125);
+                        return {
+                            WarmAttemptStatus::unavailable,
+                            {},
+                            L"温热 OCR worker 执行失败：" + worker_error,
+                        };
+                    }
+                    return {
+                        WarmAttemptStatus::completed,
+                        parsed->output,
+                        {},
+                    };
+                }
+            }
+
+            const DWORD wait_result = WaitForSingleObject(process_.get(), 25);
+            if (wait_result == WAIT_OBJECT_0) {
+                discard_locked(125);
+                return {
+                    WarmAttemptStatus::unavailable,
+                    {},
+                    L"温热 OCR worker 在响应前退出。",
+                };
+            }
+            if (wait_result == WAIT_FAILED) {
+                discard_locked(125);
+                return {
+                    WarmAttemptStatus::unavailable,
+                    {},
+                    L"等待温热 OCR worker 时发生错误。",
+                };
+            }
+            if (GetTickCount64() >= deadline) {
+                discard_locked(124);
+                return {
+                    WarmAttemptStatus::unavailable,
+                    {},
+                    L"温热 OCR worker 超过 120 秒。",
+                };
+            }
+        }
+    }
+
+    void stop() {
+        std::scoped_lock lock(mutex_);
+        discard_locked(125);
+    }
+
+private:
+    WarmOcrWorkerManager() = default;
+
+    static std::uint64_t next_request_id() noexcept {
+        static std::atomic<std::uint64_t> next{1};
+        std::uint64_t value = next.fetch_add(1, std::memory_order_relaxed);
+        if (value == 0 || value > kMaxSafeJsonInteger) {
+            next.store(2, std::memory_order_relaxed);
+            value = 1;
+        }
+        return value;
+    }
+
+    bool worker_healthy_locked() {
+        if (!process_.get()) {
+            return false;
+        }
+        const DWORD wait_result = WaitForSingleObject(process_.get(), 0);
+        if (wait_result == WAIT_TIMEOUT) {
+            return true;
+        }
+        discard_locked(125);
+        return false;
+    }
+
+    bool key_matches_locked(
+        const std::filesystem::path& root,
+        std::uint64_t sequence,
+        std::wstring_view profile,
+        int ort_threads) const {
+        return warm_worker_key_matches_impl(
+            process_.get() != nullptr,
+            root_,
+            sequence_,
+            profile_,
+            ort_threads_,
+            root,
+            sequence,
+            profile,
+            ort_threads);
+    }
+
+    bool write_all_locked(std::span<const std::byte> bytes) {
+        std::size_t offset = 0;
+        while (offset < bytes.size()) {
+            const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(
+                bytes.size() - offset, std::numeric_limits<DWORD>::max()));
+            DWORD written = 0;
+            if (!WriteFile(
+                    stdin_write_.get(),
+                    bytes.data() + offset,
+                    chunk,
+                    &written,
+                    nullptr) ||
+                written == 0) {
+                return false;
+            }
+            offset += written;
+        }
+        return true;
+    }
+
+    bool start_locked(
+        const OcrDependencyLease& dependency_lease,
+        std::wstring_view profile,
+        const std::filesystem::path& model_directory,
+        int ort_threads,
+        std::wstring* error) {
+        const std::filesystem::path runner_path =
+            dependency_lease.root() / L"rapidocr_runner.exe";
+        std::wstring runner_error;
+        auto runner_guard = open_locked_path(runner_path, false, &runner_error);
+        if (!runner_guard) {
+            if (error) {
+                *error = L"无法锁定温热 OCR runner：" + runner_error;
+            }
+            return false;
+        }
+        const auto verified_runner = final_path_from_handle(
+            runner_guard->get(), &runner_error);
+        if (!verified_runner) {
+            if (error) {
+                *error = L"无法解析温热 OCR runner 最终路径：" + runner_error;
+            }
+            return false;
+        }
+
+        std::vector<UniqueHandle> dependency_guards;
+        dependency_guards.reserve(dependency_lease.handles().size());
+        for (const HANDLE source : dependency_lease.handles()) {
+            HANDLE duplicate = nullptr;
+            if (!DuplicateHandle(
+                    GetCurrentProcess(),
+                    source,
+                    GetCurrentProcess(),
+                    &duplicate,
+                    0,
+                    FALSE,
+                    DUPLICATE_SAME_ACCESS)) {
+                if (error) {
+                    *error = L"无法延长温热 OCR 依赖锁：" +
+                             windows_error_message(GetLastError());
+                }
+                return false;
+            }
+            dependency_guards.emplace_back(duplicate);
+        }
+
+        SECURITY_ATTRIBUTES pipe_security{sizeof(pipe_security), nullptr, TRUE};
+        HANDLE raw_stdin_read = nullptr;
+        HANDLE raw_stdin_write = nullptr;
+        if (!CreatePipe(
+                &raw_stdin_read,
+                &raw_stdin_write,
+                &pipe_security,
+                static_cast<DWORD>(kMaxWarmWorkerRequestBytes + 4U))) {
+            if (error) {
+                *error = L"创建温热 OCR 输入管道失败。";
+            }
+            return false;
+        }
+        UniqueHandle child_stdin(raw_stdin_read);
+        UniqueHandle parent_stdin(raw_stdin_write);
+        HANDLE raw_stdout_read = nullptr;
+        HANDLE raw_stdout_write = nullptr;
+        if (!CreatePipe(&raw_stdout_read, &raw_stdout_write, &pipe_security, 0)) {
+            if (error) {
+                *error = L"创建温热 OCR 输出管道失败。";
+            }
+            return false;
+        }
+        UniqueHandle parent_stdout(raw_stdout_read);
+        UniqueHandle child_stdout(raw_stdout_write);
+        HANDLE raw_stderr_read = nullptr;
+        HANDLE raw_stderr_write = nullptr;
+        if (!CreatePipe(&raw_stderr_read, &raw_stderr_write, &pipe_security, 0)) {
+            if (error) {
+                *error = L"创建温热 OCR 诊断管道失败。";
+            }
+            return false;
+        }
+        UniqueHandle parent_stderr(raw_stderr_read);
+        UniqueHandle child_stderr(raw_stderr_write);
+        if (!SetHandleInformation(parent_stdin.get(), HANDLE_FLAG_INHERIT, 0) ||
+            !SetHandleInformation(parent_stdout.get(), HANDLE_FLAG_INHERIT, 0) ||
+            !SetHandleInformation(parent_stderr.get(), HANDLE_FLAG_INHERIT, 0)) {
+            if (error) {
+                *error = L"限制温热 OCR 管道句柄继承失败。";
+            }
+            return false;
+        }
+
+        UniqueHandle job(CreateJobObjectW(nullptr, nullptr));
+        if (!job.get() || !configure_kill_on_close_job(job.get())) {
+            if (error) {
+                *error = L"创建温热 OCR Job 失败。";
+            }
+            return false;
+        }
+
+        SIZE_T attribute_bytes = 0;
+        InitializeProcThreadAttributeList(nullptr, 2, 0, &attribute_bytes);
+        if (attribute_bytes == 0) {
+            if (error) {
+                *error = L"初始化温热 OCR 句柄白名单失败。";
+            }
+            return false;
+        }
+        std::vector<std::byte> attribute_storage(attribute_bytes);
+        auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
+            attribute_storage.data());
+        if (!InitializeProcThreadAttributeList(attributes, 2, 0, &attribute_bytes)) {
+            if (error) {
+                *error = L"初始化温热 OCR 句柄白名单失败。";
+            }
+            return false;
+        }
+        HANDLE inherited_handles[]{
+            child_stdin.get(), child_stdout.get(), child_stderr.get()};
+        if (!UpdateProcThreadAttribute(
+                attributes,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                inherited_handles,
+                sizeof(inherited_handles),
+                nullptr,
+                nullptr)) {
+            DeleteProcThreadAttributeList(attributes);
+            if (error) {
+                *error = L"配置温热 OCR 句柄白名单失败。";
+            }
+            return false;
+        }
+        const DWORD64 mitigation_policy =
+            PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_REMOTE_ALWAYS_ON |
+            PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON |
+            PROCESS_CREATION_MITIGATION_POLICY_IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON;
+        if (!UpdateProcThreadAttribute(
+                attributes,
+                0,
+                PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+                const_cast<DWORD64*>(&mitigation_policy),
+                sizeof(mitigation_policy),
+                nullptr,
+                nullptr)) {
+            DeleteProcThreadAttributeList(attributes);
+            if (error) {
+                *error = L"配置温热 OCR 进程缓解策略失败。";
+            }
+            return false;
+        }
+
+        std::wstring command_line = quote_argument(verified_runner->wstring());
+        command_line += L" --server --model-dir " + quote_argument(model_directory.wstring());
+        command_line += L" --ocr-profile " + quote_argument(profile);
+        command_line += L" --ort-threads " + std::to_wstring(std::clamp(ort_threads, 1, 4));
+        command_line += L" --dependency-root " +
+                        quote_argument(dependency_lease.root().wstring());
+        command_line += L" --dependency-sequence " +
+                        std::to_wstring(dependency_lease.sequence());
+
+        STARTUPINFOEXW startup{};
+        startup.StartupInfo.cb = sizeof(startup);
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = child_stdin.get();
+        startup.StartupInfo.hStdOutput = child_stdout.get();
+        startup.StartupInfo.hStdError = child_stderr.get();
+        startup.lpAttributeList = attributes;
+        auto environment = warm_runner_environment_block();
+        const auto working_directory = warm_system_directory();
+        const auto inherited_dll_directory = warm_current_dll_directory();
+        if (!environment || working_directory.empty() || !inherited_dll_directory) {
+            DeleteProcThreadAttributeList(attributes);
+            if (error) {
+                *error = L"无法构造温热 OCR runner 隔离环境。";
+            }
+            return false;
+        }
+        const bool clear_dll_directory = !inherited_dll_directory->empty();
+        if (clear_dll_directory && !SetDllDirectoryW(L"")) {
+            const DWORD dll_error = GetLastError();
+            DeleteProcThreadAttributeList(attributes);
+            if (error) {
+                *error = L"无法隔离温热 OCR DLL 搜索目录：" +
+                         windows_error_message(dll_error);
+            }
+            return false;
+        }
+
+        PROCESS_INFORMATION process{};
+        const BOOL created = CreateProcessW(
+            verified_runner->c_str(),
+            command_line.data(),
+            nullptr,
+            nullptr,
+            TRUE,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED |
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            environment->data(),
+            working_directory.c_str(),
+            &startup.StartupInfo,
+            &process);
+        const DWORD create_error = created ? ERROR_SUCCESS : GetLastError();
+        const BOOL restored =
+            !clear_dll_directory || SetDllDirectoryW(inherited_dll_directory->c_str());
+        const DWORD restore_error = restored ? ERROR_SUCCESS : GetLastError();
+        DeleteProcThreadAttributeList(attributes);
+        UniqueHandle process_handle(process.hProcess);
+        UniqueHandle thread_handle(process.hThread);
+        child_stdin.reset();
+        child_stdout.reset();
+        child_stderr.reset();
+        if (!restored) {
+            if (created) {
+                TerminateProcess(process_handle.get(), 125);
+                WaitForSingleObject(process_handle.get(), kWarmWorkerCancelWaitMs);
+            }
+            if (error) {
+                *error = L"无法恢复 OCR DLL 搜索目录：" +
+                         windows_error_message(restore_error);
+            }
+            return false;
+        }
+        if (!created) {
+            if (error) {
+                *error = L"无法启动温热 OCR runner：" +
+                         windows_error_message(create_error);
+            }
+            return false;
+        }
+        if (!AssignProcessToJobObject(job.get(), process_handle.get())) {
+            TerminateProcess(process_handle.get(), 125);
+            WaitForSingleObject(process_handle.get(), kWarmWorkerCancelWaitMs);
+            if (error) {
+                *error = L"无法隔离温热 OCR runner：" +
+                         windows_error_message(GetLastError());
+            }
+            return false;
+        }
+        if (ResumeThread(thread_handle.get()) == static_cast<DWORD>(-1)) {
+            TerminateJobObject(job.get(), 125);
+            WaitForSingleObject(process_handle.get(), kWarmWorkerCancelWaitMs);
+            if (error) {
+                *error = L"无法恢复温热 OCR runner 线程。";
+            }
+            return false;
+        }
+
+        root_ = dependency_lease.root();
+        sequence_ = dependency_lease.sequence();
+        profile_ = profile;
+        ort_threads_ = std::clamp(ort_threads, 1, 4);
+        dependency_guards_ = std::move(dependency_guards);
+        runner_guard_ = std::move(*runner_guard);
+        job_ = std::move(job);
+        process_ = std::move(process_handle);
+        stdin_write_ = std::move(parent_stdin);
+        stdout_read_ = std::move(parent_stdout);
+        stderr_read_ = std::move(parent_stderr);
+        return true;
+    }
+
+    void discard_locked(DWORD exit_code, DWORD wait_ms = kWarmWorkerCancelWaitMs) {
+        stdin_write_.reset();
+        if (job_.get() && process_.get() &&
+            WaitForSingleObject(process_.get(), 0) == WAIT_TIMEOUT) {
+            TerminateJobObject(job_.get(), exit_code);
+            WaitForSingleObject(process_.get(), wait_ms);
+        }
+        job_.reset();
+        process_.reset();
+        stdout_read_.reset();
+        stderr_read_.reset();
+        runner_guard_.reset();
+        dependency_guards_.clear();
+        root_.clear();
+        sequence_ = 0;
+        profile_.clear();
+        ort_threads_ = 0;
+    }
+
+    std::mutex mutex_;
+    std::filesystem::path root_;
+    std::uint64_t sequence_{};
+    std::wstring profile_;
+    int ort_threads_{};
+    std::vector<UniqueHandle> dependency_guards_;
+    UniqueHandle runner_guard_;
+    UniqueHandle job_;
+    UniqueHandle process_;
+    UniqueHandle stdin_write_;
+    UniqueHandle stdout_read_;
+    UniqueHandle stderr_read_;
+};
+
+void stop_warm_ocr_worker() {
+    WarmOcrWorkerManager::instance().stop();
+}
+
+}  // namespace
+
 namespace ocr_test_support {
 
 std::optional<std::uint64_t>
@@ -3091,6 +5089,145 @@ bool update_sequence_file(
                error);
 }
 
+Bitmap resize_bitmap_high_quality(
+    const Bitmap& source,
+    int target_width,
+    int target_height) {
+    return resize_bitmap_high_quality_impl(
+        source,
+        target_width,
+        target_height);
+}
+
+double select_preprocess_scale(
+    int width,
+    int height) noexcept {
+    return select_preprocess_scale_impl(width, height);
+}
+
+int select_thread_count(
+    std::uint64_t pixels,
+    unsigned int logical_processors,
+    bool accurate_profile) noexcept {
+    return select_thread_count_impl(
+        pixels,
+        logical_processors,
+        accurate_profile);
+}
+
+std::optional<WarmWorkerResponseResult>
+parse_warm_worker_response(
+    std::string_view response_utf8,
+    std::uint64_t expected_request_id,
+    std::wstring_view expected_profile,
+    const std::filesystem::path& expected_root,
+    std::uint64_t expected_sequence,
+    const OcrProtocolExpectations& expected_image,
+    std::wstring* protocol_error) {
+    const auto parsed = ::airshot::parse_warm_worker_response(
+        response_utf8,
+        expected_request_id,
+        expected_profile,
+        expected_root,
+        expected_sequence,
+        expected_image,
+        protocol_error);
+    if (!parsed) {
+        return std::nullopt;
+    }
+    return WarmWorkerResponseResult{
+        parsed->ok,
+        parsed->output,
+        parsed->error,
+    };
+}
+
+bool warm_worker_key_matches(
+    bool process_healthy,
+    const std::filesystem::path& current_root,
+    std::uint64_t current_sequence,
+    std::wstring_view current_profile,
+    int current_ort_threads,
+    const std::filesystem::path& requested_root,
+    std::uint64_t requested_sequence,
+    std::wstring_view requested_profile,
+    int requested_ort_threads) {
+    return warm_worker_key_matches_impl(
+        process_healthy,
+        current_root,
+        current_sequence,
+        current_profile,
+        current_ort_threads,
+        requested_root,
+        requested_sequence,
+        requested_profile,
+        requested_ort_threads);
+}
+
+bool dependency_hash_cache_key_matches(
+    bool same_file_object_value,
+    const std::filesystem::path& cached_root,
+    std::uint64_t cached_sequence,
+    std::wstring_view cached_relative_path,
+    std::wstring_view cached_sha256,
+    std::uint64_t cached_size,
+    const std::filesystem::path& requested_root,
+    std::uint64_t requested_sequence,
+    std::wstring_view requested_relative_path,
+    std::wstring_view requested_sha256,
+    std::uint64_t requested_size) {
+    return dependency_hash_cache_key_matches_impl(
+        same_file_object_value,
+        cached_root,
+        cached_sequence,
+        cached_relative_path,
+        cached_sha256,
+        cached_size,
+        requested_root,
+        requested_sequence,
+        requested_relative_path,
+        requested_sha256,
+        requested_size);
+}
+
+std::optional<std::wstring> sha256_file(
+    const std::filesystem::path& path,
+    std::stop_token stop_token,
+    std::wstring* error) {
+    if (ocr_stop_requested(stop_token, error)) {
+        return std::nullopt;
+    }
+    auto handle = open_locked_path(
+        path,
+        false,
+        error);
+    if (!handle) {
+        return std::nullopt;
+    }
+    const auto digest = sha256_handle(
+        handle->get(),
+        error,
+        stop_token);
+    if (!digest) {
+        return std::nullopt;
+    }
+    return hex_digest(*digest);
+}
+
+bool warm_failure_allows_fallback(
+    bool cancelled,
+    bool stop_requested) noexcept {
+    return warm_attempt_allows_fallback(
+        cancelled ? WarmAttemptStatus::cancelled : WarmAttemptStatus::unavailable,
+        stop_requested);
+}
+
+std::optional<std::uint32_t> decode_warm_frame_size(
+    std::span<const char> header,
+    std::size_t maximum) noexcept {
+    return ::airshot::decode_warm_frame_size(header, maximum);
+}
+
 HANDLE lock_path(
     const std::filesystem::path& path,
     bool directory,
@@ -3112,13 +5249,22 @@ acquire_ocr_dependency_lease(
     const std::filesystem::path& root,
     bool verify_hashes,
     bool update_high_watermark,
-    std::wstring* error) {
+    std::wstring* error,
+    std::stop_token stop_token) {
     if (error) {
         error->clear();
     }
     try {
+        if (stop_token.stop_requested()) {
+            if (error) {
+                *error = L"OCR 已取消。";
+            }
+            return std::nullopt;
+        }
         const auto persisted =
-            read_sequence_high_watermark(error);
+            read_sequence_high_watermark(
+                error,
+                stop_token);
         if (!persisted) {
             return std::nullopt;
         }
@@ -3144,6 +5290,7 @@ acquire_ocr_dependency_lease(
                 normalized_root,
                 verify_hashes,
                 minimum,
+                stop_token,
                 error);
         if (!verified) {
             return std::nullopt;
@@ -3151,7 +5298,12 @@ acquire_ocr_dependency_lease(
         if (update_high_watermark &&
             !persist_sequence_high_watermark(
                 verified->manifest.sequence,
-                error)) {
+                error,
+                stop_token)) {
+            return std::nullopt;
+        }
+
+        if (ocr_stop_requested(stop_token, error)) {
             return std::nullopt;
         }
 
@@ -3479,6 +5631,8 @@ bool download_ocr_dependencies(
     const std::function<void(int)>& progress_callback,
     std::wstring* error,
     std::stop_token stop_token) try {
+    stop_warm_ocr_worker();
+    clear_dependency_hash_cache();
     if (!valid_https_url(manifest_url) ||
         manifest_url.find_first_of(L"?#") != std::wstring_view::npos) {
         if (error) {
@@ -3965,13 +6119,17 @@ OcrOutput recognize_text(
                 root,
                 true,
                 true,
-                &candidate_problem);
+                &candidate_problem,
+                stop_token);
         if (candidate) {
             runtime_directory =
                 candidate->root();
             dependency_lease =
                 std::move(*candidate);
             break;
+        }
+        if (stop_token.stop_requested()) {
+            return {false, {}, L"OCR 已取消。"};
         }
         if (dependency_problem.empty() &&
             GetFileAttributesW(root.c_str()) !=
@@ -4008,9 +6166,30 @@ OcrOutput recognize_text(
     }
     ScopedDirectoryCleanup cleanup(*temporary_directory);
 
-    Bitmap ocr_bitmap;
+    Bitmap resized_bitmap;
+    const Bitmap* ocr_bitmap = &bitmap;
+    std::wstring preprocess_mode = L"none";
     try {
-        ocr_bitmap = resize_bitmap_for_ocr(bitmap);
+        const double requested_scale =
+            select_preprocess_scale_impl(bitmap.width, bitmap.height);
+        const int target_width = std::clamp(
+            static_cast<int>(std::lround(bitmap.width * requested_scale)),
+            1,
+            kMaxOcrImageEdge);
+        const int target_height = std::clamp(
+            static_cast<int>(std::lround(bitmap.height * requested_scale)),
+            1,
+            kMaxOcrImageEdge);
+        if (target_width != bitmap.width || target_height != bitmap.height) {
+            resized_bitmap = resize_bitmap_high_quality_impl(
+                bitmap,
+                target_width,
+                target_height);
+            ocr_bitmap = &resized_bitmap;
+            preprocess_mode = requested_scale > 1.0
+                                  ? L"bilinear-upscale"
+                                  : L"progressive-bilinear-downscale";
+        }
     } catch (const std::bad_alloc&) {
         return {
             false,
@@ -4024,7 +6203,7 @@ OcrOutput recognize_text(
             L"OCR 图像尺寸超出可处理范围。",
         };
     }
-    if (ocr_bitmap.empty()) {
+    if (ocr_bitmap->empty()) {
         return {
             false,
             {},
@@ -4037,7 +6216,7 @@ OcrOutput recognize_text(
     const std::filesystem::path temporary_png =
         *temporary_directory / L"selection.png";
     std::wstring save_error;
-    if (!save_png(ocr_bitmap, temporary_png, &save_error)) {
+    if (!save_png(*ocr_bitmap, temporary_png, &save_error)) {
         return {
             false,
             {},
@@ -4076,12 +6255,63 @@ OcrOutput recognize_text(
         quote_argument(runtime_directory->wstring());
     command_line +=
         L" --ocr-profile " + quote_argument(std::wstring(spec.id));
-    command_line += L" --ort-threads 2";
+    const double scale_x =
+        static_cast<double>(ocr_bitmap->width) / static_cast<double>(bitmap.width);
+    const double scale_y =
+        static_cast<double>(ocr_bitmap->height) / static_cast<double>(bitmap.height);
+    const std::uint64_t input_pixels =
+        static_cast<std::uint64_t>(ocr_bitmap->width) *
+        static_cast<std::uint64_t>(ocr_bitmap->height);
+    unsigned int processors = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (processors == 0) {
+        processors = 1;
+    }
+    const int ort_threads = select_thread_count_impl(
+        input_pixels,
+        processors,
+        spec.id == kOcrEngineRapidV5Accurate);
+    command_line += L" --source-width " + std::to_wstring(bitmap.width);
+    command_line += L" --source-height " + std::to_wstring(bitmap.height);
+    command_line += L" --input-width " + std::to_wstring(ocr_bitmap->width);
+    command_line += L" --input-height " + std::to_wstring(ocr_bitmap->height);
+    command_line += L" --scale-x " + std::format(L"{:.17g}", scale_x);
+    command_line += L" --scale-y " + std::format(L"{:.17g}", scale_y);
+    command_line += L" --preprocess-mode " + quote_argument(preprocess_mode);
+    command_line += L" --ort-threads " + std::to_wstring(ort_threads);
+
+    const OcrProtocolExpectations expected{
+        spec.id,
+        bitmap.width,
+        bitmap.height,
+        ocr_bitmap->width,
+        ocr_bitmap->height,
+        scale_x,
+        scale_y,
+        preprocess_mode,
+    };
+
+    WarmAttempt warm_attempt = WarmOcrWorkerManager::instance().recognize(
+        *dependency_lease,
+        spec.id,
+        *runtime_directory / std::wstring(spec.profile_directory),
+        temporary_png,
+        expected,
+        ort_threads,
+        stop_token);
+    if (warm_attempt.status == WarmAttemptStatus::completed) {
+        return std::move(warm_attempt.output);
+    }
+    if (!warm_attempt_allows_fallback(
+            warm_attempt.status,
+            stop_token.stop_requested())) {
+        return {false, {}, L"OCR 已取消。"};
+    }
 
     return run_ocr_process(
         executable,
         std::move(command_line),
         *dependency_lease,
+        expected,
         stop_token);
 }
 

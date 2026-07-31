@@ -53,6 +53,62 @@ void test_command_contract() {
     expect(
         !airshot::command_waits_for_user_input(immediate_capture),
         L"screen capture retains the bounded operation timeout");
+    const auto repeat = airshot::parse_cli(
+        std::vector<std::wstring>{L"capture", L"repeat"});
+    const auto* repeat_command =
+        repeat.command
+            ? std::get_if<airshot::CaptureCommand>(&*repeat.command)
+            : nullptr;
+    expect(
+        repeat.code == airshot::ExitCode::success && repeat_command &&
+            repeat_command->mode == airshot::CaptureMode::repeat &&
+            repeat_command->output == airshot::CaptureOutput::clipboard &&
+            !airshot::command_waits_for_user_input(*repeat.command),
+        L"repeat capture is an immediate command that defaults to clipboard output");
+    std::wstring repeat_error;
+    const auto decoded_repeat = airshot::command_from_json(
+        repeat.request_json,
+        &repeat_error);
+    const auto* decoded_repeat_command =
+        decoded_repeat
+            ? std::get_if<airshot::CaptureCommand>(&*decoded_repeat)
+            : nullptr;
+    expect(
+        decoded_repeat_command &&
+            decoded_repeat_command->mode == airshot::CaptureMode::repeat &&
+            decoded_repeat_command->output ==
+                airshot::CaptureOutput::clipboard &&
+            repeat_error.empty(),
+        L"repeat capture round trips through the canonical protocol");
+    const auto repeat_file = airshot::parse_cli(
+        std::vector<std::wstring>{
+            L"capture",
+            L"repeat",
+            L"--path",
+            L"repeat-shot"});
+    const auto* repeat_file_command =
+        repeat_file.command
+            ? std::get_if<airshot::CaptureCommand>(&*repeat_file.command)
+            : nullptr;
+    expect(
+        repeat_file.code == airshot::ExitCode::success &&
+            repeat_file_command &&
+            repeat_file_command->output == airshot::CaptureOutput::file &&
+            repeat_file_command->path.is_absolute() &&
+            repeat_file_command->path.extension() == L".png",
+        L"repeat capture supports an absolute normalized file destination");
+    expect(
+        airshot::parse_cli(
+            std::vector<std::wstring>{
+                L"capture",
+                L"repeat",
+                L"--monitor",
+                L"primary"})
+                .code == airshot::ExitCode::invalid_arguments &&
+            !airshot::command_from_json(
+                LR"({"v":1,"json":false,"command":"capture","mode":"repeat","output":"clipboard","monitor":"primary"})",
+                &repeat_error),
+        L"repeat capture rejects screen-only monitor targeting");
     expect(
         airshot::command_waits_for_user_input(airshot::OcrCommand{}),
         L"OCR selection is not constrained by the transport operation timeout");
@@ -83,6 +139,38 @@ void test_command_contract() {
     expect(app.code == airshot::ExitCode::success && app.json &&
                app.request_json.find(LR"("action":"status")") != std::wstring::npos,
            L"app accepts --json and normalizes its action");
+    const auto tray_show = airshot::parse_cli(
+        std::vector<std::wstring>{L"app", L"tray", L"show", L"--json"});
+    const auto* tray_show_command =
+        tray_show.command
+            ? std::get_if<airshot::AppCommand>(&*tray_show.command)
+            : nullptr;
+    expect(
+        tray_show.code == airshot::ExitCode::success && tray_show.json &&
+            tray_show_command &&
+            tray_show_command->action == airshot::AppAction::tray_show &&
+            tray_show.request_json.find(LR"("action":"tray-show")") !=
+                std::wstring::npos,
+        L"hidden tray recovery has a typed canonical command");
+    std::wstring tray_show_error;
+    const auto decoded_tray_show = airshot::command_from_json(
+        tray_show.request_json,
+        &tray_show_error);
+    const auto* decoded_tray_show_command =
+        decoded_tray_show
+            ? std::get_if<airshot::AppCommand>(&*decoded_tray_show)
+            : nullptr;
+    expect(
+        decoded_tray_show_command &&
+            decoded_tray_show_command->action ==
+                airshot::AppAction::tray_show &&
+            tray_show_error.empty(),
+        L"tray recovery round trips through the protocol");
+    expect(
+        airshot::parse_cli(
+            std::vector<std::wstring>{L"app", L"tray", L"hide"})
+                .code == airshot::ExitCode::invalid_arguments,
+        L"tray recovery rejects unsupported mutations");
 
     const auto pin = airshot::parse_cli(
         std::vector<std::wstring>{L"PIN", L"CLIPBOARD", L"--JSON"});
@@ -108,6 +196,61 @@ void test_command_contract() {
             restore_pin_command->action ==
                 airshot::PinAction::restore_interaction,
         L"pin interaction can be restored even without a tray icon");
+    const auto toggle_pin = airshot::parse_cli(
+        std::vector<std::wstring>{L"pin", L"toggle", L"--json"});
+    const auto* toggle_pin_command =
+        toggle_pin.command
+            ? std::get_if<airshot::PinCommand>(&*toggle_pin.command)
+            : nullptr;
+    expect(
+        toggle_pin_command &&
+            toggle_pin_command->action ==
+                airshot::PinAction::toggle_interaction &&
+            toggle_pin.request_json.find(LR"("action":"toggle")") !=
+                std::wstring::npos,
+        L"pin toggle has a typed canonical protocol");
+
+    const auto file_pin = airshot::parse_cli(
+        std::vector<std::wstring>{L"pin", L"file", L".\\pin-input.png"});
+    const auto* file_pin_command =
+        file_pin.command
+            ? std::get_if<airshot::PinCommand>(&*file_pin.command)
+            : nullptr;
+    expect(
+        file_pin.code == airshot::ExitCode::success &&
+            file_pin_command &&
+            file_pin_command->action == airshot::PinAction::file &&
+            file_pin_command->path.is_absolute(),
+        L"pin file resolves a CLI-relative path before crossing IPC");
+    std::wstring file_pin_error;
+    const auto decoded_file_pin = airshot::command_from_json(
+        file_pin.request_json,
+        &file_pin_error);
+    const auto* decoded_file_pin_command =
+        decoded_file_pin
+            ? std::get_if<airshot::PinCommand>(&*decoded_file_pin)
+            : nullptr;
+    expect(
+        decoded_file_pin_command &&
+            decoded_file_pin_command->action == airshot::PinAction::file &&
+            decoded_file_pin_command->path == file_pin_command->path &&
+            file_pin_error.empty(),
+        L"pin file absolute path round trips through the command protocol");
+    std::wstring relative_pin_error;
+    expect(
+        !airshot::command_from_json(
+            LR"({"v":1,"json":false,"command":"pin","action":"file","path":"relative.png"})",
+            &relative_pin_error) &&
+            !relative_pin_error.empty(),
+        L"pin file protocol rejects paths relative to the host working directory");
+    expect(
+        airshot::parse_cli(
+            std::vector<std::wstring>{L"pin", L"toggle", L"extra"})
+                .code == airshot::ExitCode::invalid_arguments &&
+            airshot::parse_cli(
+                std::vector<std::wstring>{L"pin", L"file"})
+                .code == airshot::ExitCode::invalid_arguments,
+        L"pin toggle and file reject malformed arity");
     expect(
         airshot::parse_cli(
             std::vector<std::wstring>{L"pin", L"unknown"})
@@ -330,7 +473,160 @@ void test_config_contract() {
                    round_trip->last_update_check_unix == 1'725'000'000 &&
                    round_trip->warned_update_target ==
                        LR"(c:\readonly\airscreenshot.exe)",
-               L"update scheduling state round trips through schema 2");
+                L"update scheduling state round trips through schema 2");
+    }
+
+    airshot::AppConfig style_config;
+    airshot::AnnotationToolStyleConfig rectangle_style;
+    rectangle_style.color = L"#123ABC";
+    rectangle_style.width = 8;
+    rectangle_style.text_size = 32;
+    rectangle_style.text_style = L"outline";
+    rectangle_style.highlight_alpha = 144;
+    rectangle_style.effect_strength = 73;
+    rectangle_style.effect_rect = true;
+    rectangle_style.fill_style = L"translucent";
+    rectangle_style.stroke_pattern = L"dashed";
+    rectangle_style.arrow_head_style = L"both";
+    rectangle_style.rounded_rectangle = true;
+    style_config.annotation_tool_styles.emplace(
+        L"rect", rectangle_style);
+    const std::wstring serialized_styles =
+        airshot::config_to_json(style_config);
+    const auto style_round_trip =
+        airshot::config_from_json(serialized_styles);
+    expect(
+        style_round_trip &&
+            style_round_trip->annotation_tool_styles.contains(L"rect") &&
+            style_round_trip->annotation_tool_styles.at(L"rect") ==
+                rectangle_style,
+        L"every persisted per-tool annotation style field survives a config round trip");
+
+    airshot::AppConfig clamped_style_config;
+    airshot::AnnotationToolStyleConfig clamped_style;
+    clamped_style.width = 999;
+    clamped_style.text_size = -12;
+    clamped_style.highlight_alpha = 500;
+    clamped_style.effect_strength = -20;
+    clamped_style_config.annotation_tool_styles.emplace(
+        L"highlight", clamped_style);
+    const auto clamped_style_round_trip = airshot::config_from_json(
+        airshot::config_to_json(clamped_style_config));
+    expect(
+        clamped_style_round_trip &&
+            clamped_style_round_trip->annotation_tool_styles.at(L"highlight")
+                    .width == 50 &&
+            clamped_style_round_trip->annotation_tool_styles.at(L"highlight")
+                    .text_size == 12 &&
+            clamped_style_round_trip->annotation_tool_styles.at(L"highlight")
+                    .highlight_alpha == 192 &&
+            clamped_style_round_trip->annotation_tool_styles.at(L"highlight")
+                    .effect_strength == 0,
+        L"serialized per-tool style values are strictly clamped to product limits");
+
+    const auto directly_clamped_styles = airshot::config_from_json(
+        LR"({"schemaVersion":2,"annotation":{"toolStyles":{"blur":{"width":-40,"textSize":400,"highlightAlpha":-1,"effectStrength":1000}}}})");
+    expect(
+        directly_clamped_styles &&
+            directly_clamped_styles->annotation_tool_styles.at(L"blur")
+                    .width == 1 &&
+            directly_clamped_styles->annotation_tool_styles.at(L"blur")
+                    .text_size == 96 &&
+            directly_clamped_styles->annotation_tool_styles.at(L"blur")
+                    .highlight_alpha == 24 &&
+            directly_clamped_styles->annotation_tool_styles.at(L"blur")
+                    .effect_strength == 100,
+        L"loaded per-tool style integers are clamped without breaking old configuration files");
+    expect(
+        legacy && legacy->annotation_tool_styles.empty(),
+        L"legacy configs without toolStyles retain the historical in-memory defaults");
+
+    constexpr std::array malformed_tool_styles{
+        std::wstring_view(
+            LR"({"schemaVersion":2,"annotation":{"toolStyles":[]}})"),
+        std::wstring_view(
+            LR"({"schemaVersion":2,"annotation":{"toolStyles":{"rect":false}}})"),
+        std::wstring_view(
+            LR"({"schemaVersion":2,"annotation":{"toolStyles":{"rect":{"color":"red"}}}})"),
+        std::wstring_view(
+            LR"({"schemaVersion":2,"annotation":{"toolStyles":{"text":{"textStyle":"glow"}}}})"),
+        std::wstring_view(
+            LR"({"schemaVersion":2,"annotation":{"toolStyles":{"arrow":{"arrowHeadStyle":"sideways"}}}})"),
+        std::wstring_view(
+            LR"({"schemaVersion":2,"annotation":{"toolStyles":{"pen":{"width":2.5}}}})"),
+    };
+    for (const auto malformed : malformed_tool_styles) {
+        std::wstring style_error;
+        expect(
+            !airshot::config_from_json(malformed, &style_error) &&
+                !style_error.empty(),
+            L"schema 2 rejects malformed known per-tool style fields with a diagnostic");
+    }
+
+    const auto extended_styles = airshot::config_from_json(
+        LR"({"schemaVersion":2,"annotation":{"toolStyles":{"rect":{"width":4,"futureDash":17},"futureBrush":{"glow":3}}}})");
+    expect(
+        extended_styles &&
+            airshot::config_to_json(*extended_styles).find(
+                LR"("futureDash":17)") != std::wstring::npos &&
+            airshot::config_to_json(*extended_styles).find(
+                LR"("futureBrush":{"glow":3})") != std::wstring::npos,
+        L"unknown future tool-style keys survive a same-schema save");
+
+    const auto region_history = airshot::config_from_json(
+        LR"({"schemaVersion":2,"capture":{"lastRegion":{"left":-1920,"top":-10,"width":640,"height":480,"topology":"v1-0123456789abcdef"}}})");
+    expect(
+        region_history && region_history->last_region_capture &&
+            region_history->last_region_capture->bounds.left == -1920 &&
+            region_history->last_region_capture->bounds.top == -10 &&
+            region_history->last_region_capture->bounds.right == -1280 &&
+            region_history->last_region_capture->bounds.bottom == 470 &&
+            region_history->last_region_capture->topology_signature ==
+                L"v1-0123456789abcdef",
+        L"last successful region loads with negative physical coordinates");
+    if (region_history) {
+        const std::wstring serialized =
+            airshot::config_to_json(*region_history);
+        const auto round_trip = airshot::config_from_json(serialized);
+        expect(
+            serialized.find(LR"("lastRegion":{)") !=
+                    std::wstring::npos &&
+                serialized.find(LR"("topology":"v1-0123456789abcdef")") !=
+                    std::wstring::npos,
+            L"last successful region is serialized using physical bounds and topology");
+        expect(
+            round_trip && round_trip->last_region_capture &&
+                round_trip->last_region_capture->bounds.right == -1280 &&
+                round_trip->last_region_capture->bounds.bottom == 470,
+            L"last successful region survives a config serialization round trip");
+    }
+    const auto no_region_history = airshot::config_from_json(
+        LR"({"schemaVersion":2,"capture":{"lastRegion":null}})");
+    expect(
+        no_region_history && !no_region_history->last_region_capture &&
+            airshot::config_to_json(*no_region_history).find(
+                LR"("lastRegion":null)") != std::wstring::npos,
+        L"missing repeat-region history is explicitly persisted as null");
+    constexpr std::array malformed_region_history{
+        std::wstring_view(
+            LR"({"schemaVersion":2,"capture":{"lastRegion":[]}})"),
+        std::wstring_view(
+            LR"({"schemaVersion":2,"capture":{"lastRegion":{"left":0,"top":0,"width":10,"height":10}}})"),
+        std::wstring_view(
+            LR"({"schemaVersion":2,"capture":{"lastRegion":{"left":0.0,"top":0,"width":10,"height":10,"topology":"v1-0123456789abcdef"}}})"),
+        std::wstring_view(
+            LR"({"schemaVersion":2,"capture":{"lastRegion":{"left":0,"top":0,"width":1,"height":10,"topology":"v1-0123456789abcdef"}}})"),
+        std::wstring_view(
+            LR"({"schemaVersion":2,"capture":{"lastRegion":{"left":0,"top":0,"width":10,"height":10,"topology":"v1-0123456789ABCDEF"}}})"),
+        std::wstring_view(
+            LR"({"schemaVersion":2,"capture":{"lastRegion":{"left":2147483647,"top":0,"width":2,"height":10,"topology":"v1-0123456789abcdef"}}})"),
+    };
+    for (const auto malformed : malformed_region_history) {
+        std::wstring history_error;
+        expect(
+            !airshot::config_from_json(malformed, &history_error) &&
+                !history_error.empty(),
+            L"malformed repeat-region history is rejected with a diagnostic");
     }
 
     const auto precise_unknown_numbers = airshot::config_from_json(
@@ -389,6 +685,9 @@ void test_config_contract() {
     expect(!airshot::config_from_json(
                LR"({"schemaVersion":2,"capture":{"theme":"sepia"}})"),
            L"schema 2 rejects an invalid known enum");
+    expect(!airshot::config_from_json(
+               LR"({"schemaVersion":2,"capture":{"includeCursor":"true"}})"),
+           L"schema 2 rejects a malformed cursor capture flag");
     expect(!airshot::config_from_json(
                LR"({"schemaVersion":2,"annotation":{"hiddenTools":["pen",7]}})"),
            L"schema 2 rejects a malformed known string array");

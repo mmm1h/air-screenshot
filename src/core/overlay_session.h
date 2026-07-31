@@ -64,6 +64,18 @@ public:
     [[nodiscard]] float active_width() const noexcept { return active_width_; }
     [[nodiscard]] float active_text_size() const noexcept { return active_text_size_; }
     [[nodiscard]] TextStyle active_text_style() const noexcept { return active_text_style_; }
+    [[nodiscard]] ShapeFillStyle active_fill_style() const noexcept {
+        return active_fill_style_;
+    }
+    [[nodiscard]] StrokePattern active_stroke_pattern() const noexcept {
+        return active_stroke_pattern_;
+    }
+    [[nodiscard]] ArrowHeadStyle active_arrow_head_style() const noexcept {
+        return active_arrow_head_style_;
+    }
+    [[nodiscard]] bool active_rectangle_rounded() const noexcept {
+        return active_rectangle_rounded_;
+    }
     [[nodiscard]] int active_highlight_alpha() const noexcept { return active_highlight_alpha_; }
     [[nodiscard]] int mosaic_strength() const noexcept { return mosaic_strength_; }
     [[nodiscard]] int watermark_opacity() const noexcept { return watermark_opacity_; }
@@ -78,6 +90,11 @@ public:
     [[nodiscard]] std::wstring hovered_button_id() const noexcept { return hovered_button_id_; }
     [[nodiscard]] bool dragging_selection() const noexcept { return dragging_selection_; }
     [[nodiscard]] POINT cursor_pos() const noexcept { return cursor_pos_; }
+    [[nodiscard]] RectI dimension_badge_bounds() const noexcept;
+    [[nodiscard]] bool dimension_badge_hovered() const noexcept {
+        return dimension_badge_hovered_;
+    }
+    [[nodiscard]] bool can_edit_selection_size() const noexcept;
     [[nodiscard]] bool color_format_hex() const noexcept { return color_format_hex_; }
     [[nodiscard]] bool is_over_toolbar(POINT point) const noexcept;
     [[nodiscard]] bool is_over_toolbar_drag_handle(POINT point) const noexcept;
@@ -97,6 +114,7 @@ public:
     }
 
 private:
+    [[nodiscard]] unsigned int ui_dpi_at(POINT point) const noexcept;
     void build_toolbar();
     void build_sub_toolbar();
     void invoke_sub(std::wstring_view id, HWND source);
@@ -106,6 +124,7 @@ private:
     bool erase_annotation_at(POINT relative);
     void record_annotation_change();
     void mark_annotation_visual_changed() noexcept;
+    void mark_preview_visual_changed() noexcept;
     void begin_annotation_transaction();
     void mark_annotation_transaction_changed() noexcept;
     void commit_annotation_transaction();
@@ -114,15 +133,27 @@ private:
         POINT point) const noexcept;
     void reset_annotation_drag_state() noexcept;
     void duplicate_selected_annotation();
+    void open_selection_size_prompt(HWND source);
+    [[nodiscard]] Tool style_context_tool() const noexcept;
+    void load_persisted_tool_styles() noexcept;
+    void remember_active_style(Tool tool) noexcept;
+    void remember_current_style() noexcept;
+    void load_active_style(Tool tool) noexcept;
     void sync_active_style_from_selected();
     void apply_active_style_to_selected();
     void edit_selected_text(HWND source);
+    [[nodiscard]] bool settle_active_interaction(
+        HWND source,
+        InteractionSettleMode mode);
     [[nodiscard]] bool cancel_active_interaction(HWND source);
     void release_capture_if_owned(HWND source) noexcept;
     void undo();
     void redo();
     Bitmap original_selection() const;
     [[nodiscard]] const Bitmap& cached_rendered_selection() const;
+    [[nodiscard]] bool effect_preview_active() const noexcept;
+    [[nodiscard]] std::uint64_t rendered_source_revision() const noexcept;
+    [[nodiscard]] const Bitmap& cached_rendered_selection_for_display() const;
     Bitmap rendered_selection() const;
     void complete_default(HWND owner);
     void complete_clipboard();
@@ -136,6 +167,7 @@ private:
     void run_scroll_capture(HWND source);
     void capture_scroll_frame();
     void handle_scroll_frame_completion();
+    void toggle_scroll_pause();
     void stop_scroll_worker();
     void finish_scroll_capture(bool cancelled);
     void destroy_scroll_windows();
@@ -154,9 +186,12 @@ private:
     std::vector<WindowCandidate> window_candidates_;
     std::vector<std::unique_ptr<OverlayWindow>> windows_;
     RectI virtual_bounds_;
+    std::wstring capture_topology_signature_;
     RectI selection_;
     RectI hover_;
     RectI clicked_window_;
+    std::size_t hover_ancestor_offset_{};
+    std::optional<POINT> hover_cycle_anchor_;
     POINT drag_start_{};
     POINT annotation_anchor_{};
     bool dragging_selection_{};
@@ -173,9 +208,13 @@ private:
     std::optional<std::vector<Annotation>> annotation_transaction_before_;
     bool annotation_transaction_changed_{};
     std::uint64_t annotation_revision_{1};
+    std::uint64_t visual_revision_{1};
     mutable Bitmap rendered_selection_cache_;
     mutable std::uint64_t rendered_selection_cache_revision_{};
     mutable RectI rendered_selection_cache_bounds_;
+    mutable Bitmap effect_preview_cache_;
+    mutable std::uint64_t effect_preview_cache_revision_{};
+    mutable RectI effect_preview_cache_bounds_;
     std::vector<ToolbarButton> toolbar_;
     bool dragging_toolbar_{};
     bool dragging_slider_{};
@@ -194,11 +233,16 @@ private:
     float active_width_{4.0F};
     float active_text_size_{18.0F};
     TextStyle active_text_style_{TextStyle::normal};
+    ShapeFillStyle active_fill_style_{ShapeFillStyle::outline};
+    StrokePattern active_stroke_pattern_{StrokePattern::solid};
+    ArrowHeadStyle active_arrow_head_style_{ArrowHeadStyle::forward};
+    bool active_rectangle_rounded_{};
     int active_highlight_alpha_{96};
     int mosaic_strength_{50};
     int watermark_opacity_{42};
     std::wstring watermark_text_{L"Air Screenshot"};
     std::wstring hovered_button_id_;
+    bool dimension_badge_hovered_{};
     POINT cursor_pos_{};
     bool color_format_hex_{true};
     int selected_annotation_idx_{-1};
@@ -209,6 +253,8 @@ private:
     bool annotation_drag_clone_created_{};
     bool mosaic_is_blur_{};
     bool mosaic_is_rect_{};
+    bool highlight_constraint_active_{};
+    ToolStylePalette tool_styles_;
     bool text_size_dropdown_open_{};
     int text_size_hovered_idx_{-1};
     HWND prompt_window_{};
@@ -238,6 +284,8 @@ private:
         ScrollControlState control_state;
         HWND border_window{};
         HWND control_window{};
+        HWND keyboard_sink{};
+        HHOOK keyboard_hook{};
         int locked_direction{};
         int consecutive_failures{};
         bool paused{};

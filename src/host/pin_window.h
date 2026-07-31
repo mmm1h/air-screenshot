@@ -1,7 +1,10 @@
 #pragma once
 
 #include "airshot/bitmap.h"
+#include "airshot/pin_workflow.h"
 #include <windows.h>
+#include <shellapi.h>
+#include <functional>
 #include <memory>
 
 namespace airshot {
@@ -12,6 +15,10 @@ constexpr UINT WM_PIN_CLICK_THROUGH_ENABLED = WM_APP + 12;
 
 class PinWindow {
 public:
+    using ReplacementGuard = std::function<std::optional<std::wstring>(
+        std::size_t current_bytes,
+        const Bitmap& replacement)>;
+
     static void register_class(HINSTANCE instance);
 
     static std::unique_ptr<PinWindow> create(
@@ -20,7 +27,8 @@ public:
         Bitmap bitmap,
         int x,
         int y,
-        bool click_through_available = true);
+        bool click_through_available = true,
+        ReplacementGuard replacement_guard = {});
 
     PinWindow(HWND hwnd, Bitmap bitmap);
     ~PinWindow();
@@ -30,6 +38,9 @@ public:
         return bitmap_.pixels.size();
     }
     void request_close() noexcept;
+    void request_hide() noexcept;
+    void request_show() noexcept;
+    [[nodiscard]] bool hidden() const noexcept;
     [[nodiscard]] bool click_through() const noexcept;
     [[nodiscard]] bool set_click_through(bool enabled) noexcept;
     void set_click_through_available(bool available) noexcept;
@@ -48,6 +59,14 @@ private:
     void show_message(std::wstring_view message, UINT flags);
     void paint();
     void show_context_menu(POINT screen_pos);
+    void replace_from_drop(HDROP drop);
+    void notify_click_through_enabled() const noexcept;
+    [[nodiscard]] bool set_alpha(int alpha) noexcept;
+    void zoom_by_steps(double steps);
+    void toggle_smooth_scaling() noexcept;
+    void toggle_visual_effect(PinVisualEffectAction action);
+    [[nodiscard]] Bitmap visible_bitmap() const;
+    void set_scale_percent(int percent);
     void rotate(bool cw);
     void flip(bool horizontal);
     [[nodiscard]] bool resize_to_scale(double scale, POINT anchor_screen) noexcept;
@@ -60,11 +79,14 @@ private:
     HWND owner_{};
     Bitmap bitmap_{};
     HBITMAP hbitmap_{};
-    void* bitmap_bits_{};
     double scale_{1.0};
     int alpha_{255};
+    bool smooth_scaling_{true};
+    PinVisualEffects visual_effects_{};
     bool topmost_{true};
     bool click_through_available_{true};
+    PinLifecycleState lifecycle_{PinLifecycleState::visible};
+    ReplacementGuard replacement_guard_;
     unsigned int capture_suspend_depth_{};
     bool visible_before_capture_{};
     bool notify_owner_{};

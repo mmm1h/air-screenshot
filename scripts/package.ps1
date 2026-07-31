@@ -158,6 +158,13 @@ if (Test-Path -LiteralPath $ocrSource -PathType Container) {
     Copy-Item -Path (Join-Path $ocrSource "*") -Destination $ocrTarget -Recurse -Force
 
     $files = Get-ChildItem -LiteralPath $ocrTarget -File -Recurse |
+        Where-Object {
+            $_.DirectoryName -ne $ocrTarget -or
+            $_.Name -notin @(
+                ".airshot-manifest.json",
+                ".airshot-manifest.sig"
+            )
+        } |
         Sort-Object FullName |
         ForEach-Object {
             $relative = [IO.Path]::GetRelativePath($ocrTarget, $_.FullName).Replace("\", "/")
@@ -260,6 +267,21 @@ if (Test-Path -LiteralPath $ocrSource -PathType Container) {
             -LiteralPath (Join-Path $site "ocr-dependencies.json.sig") `
             -Value $ocrSignature `
             -Encoding utf8NoBOM
+    }
+
+    # Keep exact signed installation metadata beside the offline payload. The
+    # public manifest intentionally does not list these two files, avoiding a
+    # self-referential hash while exercising the normal runtime trust path.
+    Copy-Item `
+        -LiteralPath $ocrManifestPath `
+        -Destination (Join-Path $ocrTarget ".airshot-manifest.json") `
+        -Force
+    $generatedOcrSignaturePath = Join-Path $site "ocr-dependencies.json.sig"
+    if (Test-Path -LiteralPath $generatedOcrSignaturePath -PathType Leaf) {
+        Copy-Item `
+            -LiteralPath $generatedOcrSignaturePath `
+            -Destination (Join-Path $ocrTarget ".airshot-manifest.sig") `
+            -Force
     }
 }
 

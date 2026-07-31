@@ -8,6 +8,7 @@ namespace airshot {
 
 enum class CaptureMode {
     region,
+    repeat,
     window,
     screen,
 };
@@ -43,11 +44,14 @@ struct OcrCommand {
 
 enum class PinAction {
     clipboard,
+    file,
     restore_interaction,
+    toggle_interaction,
 };
 
 struct PinCommand {
     PinAction action{PinAction::clipboard};
+    std::filesystem::path path;
 };
 
 enum class ModuleAction {
@@ -72,6 +76,7 @@ enum class AppAction {
     stop,
     status,
     settings,
+    tray_show,
 };
 
 struct AppCommand {

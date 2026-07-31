@@ -10,7 +10,7 @@
 
 namespace {
 
-void open_app_page(HWND window) {
+void open_page(HWND window, int page) {
     RECT client{};
     if (!window || !GetClientRect(window, &client)) {
         return;
@@ -19,7 +19,10 @@ void open_app_page(HWND window) {
         static_cast<float>(client.right - client.left) / 920.0f,
         static_cast<float>(client.bottom - client.top) / 720.0f);
     const int x = static_cast<int>(100.0f * scale);
-    const int y = static_cast<int>((96.0f + 4.0f * 48.0f + 20.0f) * scale);
+    const int safe_page = std::clamp(page, 0, 5);
+    const int y = static_cast<int>(
+        (96.0f + static_cast<float>(safe_page) * 48.0f + 20.0f) *
+        scale);
     PostMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
     PostMessageW(window, WM_LBUTTONUP, 0, MAKELPARAM(x, y));
 }
@@ -42,6 +45,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     } else if (command_line.find(L"--pixel") != std::wstring_view::npos) {
         config.app_icon = std::wstring(airshot::kAppIconPixelConsole);
     }
+    const int page =
+        command_line.find(L"--update") != std::wstring_view::npos ? 5 : 4;
 
     bool completed = false;
     HWND window = airshot::show_settings_window_async(
@@ -49,7 +54,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         config,
         [&](std::optional<airshot::AppConfig>) { completed = true; });
     if (window) {
-        open_app_page(window);
+        open_page(window, page);
     }
 
     MSG message{};
