@@ -230,7 +230,7 @@ add_executable(AirScreenshot WIN32
     src/host/host_app.cpp
     src/host/cli_app.cpp
     src/host/main.cpp
-    src/host/settings_window.cpp
+    src/host/settings_window_v2.cpp
     src/host/pin_window.cpp
     src/core/ocr_cli_main.cpp
     src/host/resources.rc
