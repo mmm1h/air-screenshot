@@ -412,6 +412,32 @@ int named_clamped_integer(const JsonNode& object, std::wstring_view name, int fa
     return std::clamp(named_integer(object, name, fallback), minimum, maximum);
 }
 
+std::int64_t named_nonnegative_int64(
+    const JsonNode& object,
+    std::wstring_view name,
+    std::int64_t fallback) {
+    const auto* value = member(object, name);
+    if (!value || value->kind != JsonKind::number ||
+        value->number_lexeme.empty() ||
+        !std::ranges::all_of(
+            value->number_lexeme,
+            [](wchar_t character) {
+                return character >= L'0' && character <= L'9';
+            })) {
+        return fallback;
+    }
+
+    std::int64_t parsed = 0;
+    for (const wchar_t character : value->number_lexeme) {
+        const int digit = character - L'0';
+        if (parsed > (std::numeric_limits<std::int64_t>::max() - digit) / 10) {
+            return fallback;
+        }
+        parsed = parsed * 10 + digit;
+    }
+    return parsed;
+}
+
 std::optional<int> schema_version(const JsonNode& object) {
     const auto* value = member(object, L"schemaVersion");
     if (!value) {
@@ -574,10 +600,36 @@ bool validate_current_config(const JsonNode& root, std::wstring* error) {
     }
     if (shell &&
         (!validate_optional_kind(*shell, L"shell", L"enabled", JsonKind::boolean, error) ||
+         !validate_optional_kind(*shell, L"shell", L"trayIconVisible", JsonKind::boolean, error) ||
          !validate_optional_kind(*shell, L"shell", L"startAtLogin", JsonKind::boolean, error) ||
          !validate_optional_kind(
              *shell, L"shell", L"notificationsEnabled", JsonKind::boolean, error))) {
         return false;
+    }
+
+    const auto* update = validate_optional_section(root, L"update", error, valid);
+    if (!valid) {
+        return false;
+    }
+    if (update &&
+        (!validate_optional_kind(
+             *update, L"update", L"automatic", JsonKind::boolean, error) ||
+         !validate_optional_integer(
+             *update, L"update", L"lastCheckUnix", error) ||
+         !validate_optional_kind(
+             *update, L"update", L"warnedTarget", JsonKind::string, error))) {
+        return false;
+    }
+    if (update) {
+        const auto* last_check = member(*update, L"lastCheckUnix");
+        if (last_check &&
+            named_nonnegative_int64(
+                *update, L"lastCheckUnix", -1) < 0) {
+            set_config_error(
+                error,
+                L"配置字段 update.lastCheckUnix 必须是非负整数。");
+            return false;
+        }
     }
 
     const auto* hotkey = validate_optional_section(root, L"hotkey", error, valid);
@@ -586,6 +638,7 @@ bool validate_current_config(const JsonNode& root, std::wstring* error) {
     }
     if (hotkey &&
         (!validate_optional_kind(*hotkey, L"hotkey", L"capture", JsonKind::string, error) ||
+         !validate_optional_kind(*hotkey, L"hotkey", L"pin", JsonKind::string, error) ||
          !validate_optional_kind(
              *hotkey, L"hotkey", L"globalOcrEnabled", JsonKind::boolean, error) ||
          !validate_optional_kind(*hotkey, L"hotkey", L"globalOcr", JsonKind::string, error))) {
@@ -1265,6 +1318,14 @@ void migrate_legacy_hotkeys(AppConfig& config) {
         capture = parse_hotkey(config.capture_hotkey);
     }
 
+    auto pin = parse_hotkey(config.pin_hotkey);
+    if (!config.pin_hotkey.empty() &&
+        (!pin || !has_global_hotkey_modifier(*pin) ||
+         (capture && same_hotkey(*capture, *pin)))) {
+        config.pin_hotkey = defaults.pin_hotkey;
+        pin = parse_hotkey(config.pin_hotkey);
+    }
+
     auto global_ocr = parse_hotkey(config.global_ocr_hotkey);
     const bool invalid_global_ocr =
         config.global_ocr_hotkey.empty() ||
@@ -1275,7 +1336,13 @@ void migrate_legacy_hotkeys(AppConfig& config) {
         capture &&
         global_ocr &&
         same_hotkey(*capture, *global_ocr);
-    if (invalid_global_ocr || conflicting_global_ocr) {
+    const bool conflicting_pin =
+        config.global_ocr_enabled &&
+        pin &&
+        global_ocr &&
+        same_hotkey(*pin, *global_ocr);
+    if (invalid_global_ocr || conflicting_global_ocr ||
+        conflicting_pin) {
         config.global_ocr_enabled = false;
         config.global_ocr_hotkey = defaults.global_ocr_hotkey;
     }
@@ -1308,8 +1375,16 @@ bool validate_global_hotkeys(const AppConfig& config, std::wstring* error) {
         error->clear();
     }
     std::optional<Hotkey> capture;
+    std::optional<Hotkey> pin;
     std::optional<Hotkey> global_ocr;
     if (!validate(config.capture_hotkey, L"hotkey.capture", capture)) {
+        return false;
+    }
+    if (!validate(config.pin_hotkey, L"hotkey.pin", pin)) {
+        return false;
+    }
+    if (capture && pin && same_hotkey(*capture, *pin)) {
+        set_config_error(error, L"剪贴板贴图快捷键不能与截图快捷键相同。");
         return false;
     }
     if (config.global_ocr_enabled && config.global_ocr_hotkey.empty()) {
@@ -1324,6 +1399,13 @@ bool validate_global_hotkeys(const AppConfig& config, std::wstring* error) {
         global_ocr &&
         same_hotkey(*capture, *global_ocr)) {
         set_config_error(error, L"全局 OCR 快捷键不能与截图快捷键相同。");
+        return false;
+    }
+    if (config.global_ocr_enabled &&
+        pin &&
+        global_ocr &&
+        same_hotkey(*pin, *global_ocr)) {
+        set_config_error(error, L"全局 OCR 快捷键不能与剪贴板贴图快捷键相同。");
         return false;
     }
     return true;
@@ -1385,15 +1467,21 @@ std::wstring known_config_to_json(const AppConfig& config) {
     result += L",\"textFontFamily\":" + quote_json(config.text_font_family);
     result += L",\"textFontBold\":" + std::wstring(json_boolean(config.text_font_bold));
     result += L",\"textFontItalic\":" + std::wstring(json_boolean(config.text_font_italic));
-    result += L",\"highlightAlpha\":" + std::to_wstring(std::clamp(config.annotation_highlight_alpha, 24, 192));
-    result += L",\"nextSerial\":" + std::to_wstring(std::max(1, config.annotation_next_serial)) + L"}";
+    result += L",\"highlightAlpha\":" + std::to_wstring(std::clamp(config.annotation_highlight_alpha, 24, 192)) + L"}";
     result += L",\"ocr\":{\"enabled\":" + std::wstring(json_boolean(config.ocr_enabled));
     result += L",\"engine\":" + quote_json(normalize_ocr_engine(config.ocr_engine));
     result += L",\"downloadUrl\":" + quote_json(config.ocr_download_url) + L"}";
     result += L",\"shell\":{\"enabled\":" + std::wstring(json_boolean(config.shell_enabled));
+    result += L",\"trayIconVisible\":" + std::wstring(json_boolean(config.tray_icon_visible));
     result += L",\"startAtLogin\":" + std::wstring(json_boolean(config.start_at_login));
     result += L",\"notificationsEnabled\":" + std::wstring(json_boolean(config.notifications_enabled)) + L"}";
+    result += L",\"update\":{\"automatic\":" +
+              std::wstring(json_boolean(config.automatic_updates_enabled));
+    result += L",\"lastCheckUnix\":" +
+              std::to_wstring(std::max<std::int64_t>(0, config.last_update_check_unix));
+    result += L",\"warnedTarget\":" + quote_json(config.warned_update_target) + L"}";
     result += L",\"hotkey\":{\"capture\":" + quote_json(config.capture_hotkey);
+    result += L",\"pin\":" + quote_json(config.pin_hotkey);
     result += L",\"globalOcrEnabled\":" + std::wstring(json_boolean(config.global_ocr_enabled));
     result += L",\"globalOcr\":" + quote_json(config.global_ocr_hotkey) + L"}";
     result += L",\"shortcut\":{\"captureOcr\":" + quote_json(config.capture_ocr_shortcut);
@@ -1432,6 +1520,11 @@ std::wstring config_to_json(const AppConfig& config) {
     auto preserved = JsonParser(config.preserved_json).parse();
     if (!preserved || preserved->kind != JsonKind::object) {
         return known_json;
+    }
+    if (auto annotation = preserved->object.find(L"annotation");
+        annotation != preserved->object.end() &&
+        annotation->second.kind == JsonKind::object) {
+        annotation->second.object.erase(L"nextSerial");
     }
     merge_json(*preserved, *known);
     return serialize_json(*preserved);
@@ -1479,7 +1572,6 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text, std::wstr
         config.text_font_bold = named_boolean(*annotation, L"textFontBold", false);
         config.text_font_italic = named_boolean(*annotation, L"textFontItalic", false);
         config.annotation_highlight_alpha = named_clamped_integer(*annotation, L"highlightAlpha", 96, 24, 192);
-        config.annotation_next_serial = std::max(1, named_integer(*annotation, L"nextSerial", 1));
     }
     if (const auto* ocr = member(*root, L"ocr")) {
         config.ocr_enabled = named_boolean(*ocr, L"enabled", true);
@@ -1488,14 +1580,38 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text, std::wstr
     }
     if (const auto* shell = member(*root, L"shell")) {
         config.shell_enabled = named_boolean(*shell, L"enabled", true);
+        config.tray_icon_visible = named_boolean(*shell, L"trayIconVisible", true);
         config.start_at_login =
             named_boolean(*shell, L"startAtLogin", config.schema_version <= 1);
         config.notifications_enabled = named_boolean(*shell, L"notificationsEnabled", false);
     }
+    if (const auto* update = member(*root, L"update")) {
+        config.automatic_updates_enabled =
+            named_boolean(*update, L"automatic", true);
+        config.last_update_check_unix =
+            named_nonnegative_int64(*update, L"lastCheckUnix", 0);
+        config.warned_update_target =
+            named_string(*update, L"warnedTarget", L"");
+    }
     if (const auto* hotkey = member(*root, L"hotkey")) {
         config.capture_hotkey = named_string(*hotkey, L"capture", L"Ctrl+Alt+A");
+        config.pin_hotkey = named_string(*hotkey, L"pin", L"");
         config.global_ocr_enabled = named_boolean(*hotkey, L"globalOcrEnabled", false);
         config.global_ocr_hotkey = named_string(*hotkey, L"globalOcr", L"Ctrl+Alt+O");
+        if (!member(*hotkey, L"pin")) {
+            const auto capture = parse_hotkey(config.capture_hotkey);
+            const auto pin = parse_hotkey(config.pin_hotkey);
+            const auto global_ocr =
+                parse_hotkey(config.global_ocr_hotkey);
+            if ((capture && pin && same_hotkey(*capture, *pin)) ||
+                (config.global_ocr_enabled && pin && global_ocr &&
+                 same_hotkey(*pin, *global_ocr))) {
+                // The pin hotkey is an additive schema-2 field. Do not make an
+                // older schema-2 file unreadable when it already used the new
+                // default combination for another command.
+                config.pin_hotkey.clear();
+            }
+        }
     }
     if (const auto* shortcut = member(*root, L"shortcut")) {
         config.capture_ocr_shortcut = named_string(*shortcut, L"captureOcr", L"Shift+C");

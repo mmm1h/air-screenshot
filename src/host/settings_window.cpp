@@ -2,6 +2,7 @@
 
 #include "airshot/ocr.h"
 #include "airshot/strings.h"
+#include "airshot/ui_theme.h"
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wrl/client.h>
@@ -27,14 +28,13 @@ namespace {
 constexpr int kSettingsWidth = 740;
 constexpr int kSettingsHeight = 760;
 constexpr int kWorkAreaMargin = 8;
-constexpr int kGeneralSwitchCount = 7;
-constexpr int kGeneralRowHeight = 34;
+constexpr int kGeneralSwitchCount = 8;
+constexpr int kGeneralRowHeight = 30;
 
 enum class SettingsFocusKind {
     tab,
     general_switch,
     font_family,
-    reset_serial,
     text_bold,
     text_italic,
     ocr_engine,
@@ -61,6 +61,7 @@ struct SettingsFocusTarget {
 
 enum ShortcutIdx {
     idx_capture_hotkey = 0,
+    idx_pin_hotkey,
     idx_global_ocr_hotkey,
     idx_capture_ocr_shortcut,
     idx_tool_shortcut_select,
@@ -84,7 +85,11 @@ struct SettingsState {
     HWND window{};
     HWND owner{};
     SettingsWindowCompletion completion;
+    SettingsWindowValidator validator;
     bool is_light_theme{};
+    bool high_contrast{};
+    UiPalette palette{};
+    std::wstring ui_font_family{L"Segoe UI"};
     
     // UI state
     int active_tab{0}; // 0: 常规设置, 1: 工具栏, 2: 快捷键
@@ -106,6 +111,7 @@ struct SettingsState {
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> text_grey_brush;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> blue_brush;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> hover_blue_brush;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> accent_text_brush;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> border_brush;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> active_tab_brush;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> control_bg_brush;
@@ -189,6 +195,7 @@ SIZE fitted_settings_size(UINT dpi, const RECT& work_area) noexcept {
 std::wstring* get_shortcut_ptr(AppConfig& config, int idx) {
     switch (idx) {
         case idx_capture_hotkey: return &config.capture_hotkey;
+        case idx_pin_hotkey: return &config.pin_hotkey;
         case idx_global_ocr_hotkey: return &config.global_ocr_hotkey;
         case idx_capture_ocr_shortcut: return &config.capture_ocr_shortcut;
         case idx_tool_shortcut_select: return &config.tool_shortcut_select;
@@ -210,6 +217,7 @@ std::wstring* get_shortcut_ptr(AppConfig& config, int idx) {
 const std::wstring* get_shortcut_ptr(const AppConfig& config, int idx) {
     switch (idx) {
         case idx_capture_hotkey: return &config.capture_hotkey;
+        case idx_pin_hotkey: return &config.pin_hotkey;
         case idx_global_ocr_hotkey: return &config.global_ocr_hotkey;
         case idx_capture_ocr_shortcut: return &config.capture_ocr_shortcut;
         case idx_tool_shortcut_select: return &config.tool_shortcut_select;
@@ -230,6 +238,7 @@ const std::wstring* get_shortcut_ptr(const AppConfig& config, int idx) {
 
 constexpr std::array<std::wstring_view, shortcut_count> kShortcutLabels{
     L"截图",
+    L"剪贴板贴图",
     L"全局 OCR",
     L"选区 OCR",
     L"选择工具",
@@ -257,6 +266,9 @@ std::optional<std::wstring> shortcut_validation_error(const AppConfig& config) {
     for (int index = 0; index < shortcut_count; ++index) {
         const std::wstring* value = get_shortcut_ptr(config, index);
         if (!value || value->empty()) {
+            if (index == idx_capture_hotkey) {
+                return L"“截图”的快捷键不能为空。";
+            }
             continue;
         }
         parsed[static_cast<std::size_t>(index)] = parse_hotkey(*value);
@@ -510,6 +522,31 @@ bool leave_settings_modal(SettingsState* state) {
     return true;
 }
 
+bool toggle_tray_icon(SettingsState* state) {
+    if (!state->config.shell_enabled) {
+        return true;
+    }
+    if (state->config.tray_icon_visible) {
+        enter_settings_modal(state);
+        const int choice = MessageBoxW(
+            state->window,
+            L"隐藏托盘图标后，Air Screenshot 仍会在后台运行，截图快捷键也会继续生效。\n\n"
+            L"如需恢复图标，请运行：\n"
+            L"AirScreenshot.exe app settings\n\n"
+            L"确定隐藏托盘图标吗？",
+            L"隐藏托盘图标",
+            MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2);
+        if (!leave_settings_modal(state)) {
+            return false;
+        }
+        if (choice != IDYES) {
+            return true;
+        }
+    }
+    state->config.tray_icon_visible = !state->config.tray_icon_visible;
+    return true;
+}
+
 bool accept_settings(SettingsState* state) {
     if (const auto validation_error = shortcut_validation_error(state->config)) {
         state->active_tab = 2;
@@ -523,6 +560,25 @@ bool accept_settings(SettingsState* state) {
         }
         InvalidateRect(state->window, nullptr, TRUE);
         return true;
+    }
+    if (state->validator) {
+        std::wstring validation_error;
+        if (!state->validator(state->config, &validation_error)) {
+            state->active_tab = 2;
+            enter_settings_modal(state);
+            MessageBoxW(
+                state->window,
+                validation_error.empty()
+                    ? L"所选全局快捷键当前不可用，请换一个组合。"
+                    : validation_error.c_str(),
+                L"快捷键不可用",
+                MB_OK | MB_ICONWARNING);
+            if (!leave_settings_modal(state)) {
+                return false;
+            }
+            InvalidateRect(state->window, nullptr, TRUE);
+            return true;
+        }
     }
     state->accepted = true;
     PostMessageW(state->window, WM_CLOSE, 0, 0);
@@ -650,14 +706,12 @@ std::wstring get_tool_display_name(std::wstring_view id) {
 void discard_resources(SettingsState* state);
 
 void refresh_settings_theme(SettingsState* state) {
-    const bool light = should_use_light_theme(state->config.theme);
-    if (state->is_light_theme == light) {
-        return;
-    }
-    state->is_light_theme = light;
+    state->palette = resolve_ui_palette(state->config.theme);
+    state->is_light_theme = state->palette.light;
+    state->high_contrast = state->palette.high_contrast;
     discard_resources(state);
     if (state->window) {
-        BOOL use_dark = !light;
+        BOOL use_dark = !state->is_light_theme && !state->high_contrast;
         DwmSetWindowAttribute(state->window, 20, &use_dark, sizeof(use_dark));
         DwmSetWindowAttribute(state->window, 19, &use_dark, sizeof(use_dark));
         InvalidateRect(state->window, nullptr, TRUE);
@@ -670,7 +724,7 @@ bool ensure_resources(SettingsState* state) {
     }
 
     if (state->window) {
-        BOOL use_dark = !state->is_light_theme;
+        BOOL use_dark = !state->is_light_theme && !state->high_contrast;
         DwmSetWindowAttribute(state->window, 20, &use_dark, sizeof(use_dark));
         DwmSetWindowAttribute(state->window, 19, &use_dark, sizeof(use_dark));
     }
@@ -702,52 +756,32 @@ bool ensure_resources(SettingsState* state) {
     const float dpi = 96.0f * settings_layout_scale(state->window);
     state->render_target->SetDpi(dpi, dpi);
 
-    // Create Brushes
-    if (state->is_light_theme) {
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xF2F3F5), state->bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xF2F3F5), state->sidebar_bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x1F2329), state->text_white_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x646A73), state->text_grey_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x0066FF), state->blue_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x3385FF), state->hover_blue_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xDEE0E3), state->border_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xE5E7EB), state->active_tab_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF), state->control_bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xD2D6DC), state->switch_track_off_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF), state->card_bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xE5E7EB), state->card_border_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xF0F1F3), state->separator_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xF5F7FA), state->hover_bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xD2D6DC), state->cancel_btn_border_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x0066FF), state->accent_indicator_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xD0D3D8), state->keycap_shadow_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x0066FF, 0.15f), state->switch_glow_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xFFEAEA), state->close_btn_hover_bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xE81123), state->red_brush.GetAddressOf());
-    } else {
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(22.0f / 255.0f, 23.0f / 255.0f, 28.0f / 255.0f), state->bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(22.0f / 255.0f, 23.0f / 255.0f, 28.0f / 255.0f), state->sidebar_bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(240.0f / 255.0f, 240.0f / 255.0f, 240.0f / 255.0f), state->text_white_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(150.0f / 255.0f, 160.0f / 255.0f, 175.0f / 255.0f), state->text_grey_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0.0f / 255.0f, 102.0f / 255.0f, 255.0f / 255.0f), state->blue_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(51.0f / 255.0f, 136.0f / 255.0f, 255.0f / 255.0f), state->hover_blue_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(45.0f / 255.0f, 48.0f / 255.0f, 56.0f / 255.0f), state->border_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(35.0f / 255.0f, 37.0f / 255.0f, 44.0f / 255.0f), state->active_tab_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(28.0f / 255.0f, 30.0f / 255.0f, 34.0f / 255.0f), state->control_bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(76.0f / 255.0f, 82.0f / 255.0f, 93.0f / 255.0f), state->switch_track_off_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(30.0f / 255.0f, 32.0f / 255.0f, 38.0f / 255.0f), state->card_bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(45.0f / 255.0f, 48.0f / 255.0f, 56.0f / 255.0f), state->card_border_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(40.0f / 255.0f, 43.0f / 255.0f, 50.0f / 255.0f), state->separator_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(38.0f / 255.0f, 41.0f / 255.0f, 48.0f / 255.0f), state->hover_bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(60.0f / 255.0f, 64.0f / 255.0f, 72.0f / 255.0f), state->cancel_btn_border_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(51.0f / 255.0f, 136.0f / 255.0f, 255.0f / 255.0f), state->accent_indicator_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(20.0f / 255.0f, 22.0f / 255.0f, 26.0f / 255.0f), state->keycap_shadow_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0.0f / 255.0f, 102.0f / 255.0f, 255.0f / 255.0f, 0.25f), state->switch_glow_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x401515), state->close_btn_hover_bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xE81123), state->red_brush.GetAddressOf());
-    }
+    // Create brushes from the shared system-aware palette.
+    const UiPalette& palette = state->palette;
+    state->render_target->CreateSolidColorBrush(palette.background, state->bg_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.sidebar, state->sidebar_bg_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.text, state->text_white_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.muted, state->text_grey_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.accent, state->blue_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.accent_hover, state->hover_blue_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.accent_text, state->accent_text_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.border, state->border_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.active, state->active_tab_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.control, state->control_bg_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.switch_off, state->switch_track_off_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.card, state->card_bg_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.card_border, state->card_border_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.separator, state->separator_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.hover, state->hover_bg_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.cancel_border, state->cancel_btn_border_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.accent_indicator, state->accent_indicator_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.keycap_shadow, state->keycap_shadow_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.switch_glow, state->switch_glow_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.danger_surface, state->close_btn_hover_bg_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.danger, state->red_brush.GetAddressOf());
     if (!state->bg_brush || !state->sidebar_bg_brush || !state->text_white_brush ||
         !state->text_grey_brush || !state->blue_brush || !state->hover_blue_brush ||
+        !state->accent_text_brush ||
         !state->border_brush || !state->active_tab_brush || !state->control_bg_brush ||
         !state->switch_track_off_brush || !state->card_bg_brush || !state->card_border_brush ||
         !state->separator_brush || !state->hover_bg_brush || !state->cancel_btn_border_brush ||
@@ -756,12 +790,14 @@ bool ensure_resources(SettingsState* state) {
         return fail();
     }
 
-    // Create Text Formats
-    state->dwrite_factory->CreateTextFormat(L"Microsoft YaHei", nullptr, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16.0f, L"zh-CN", state->title_format.GetAddressOf());
-    state->dwrite_factory->CreateTextFormat(L"Microsoft YaHei", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"zh-CN", state->text_format.GetAddressOf());
-    state->dwrite_factory->CreateTextFormat(L"Microsoft YaHei", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"zh-CN", state->small_format.GetAddressOf());
+    // Use the Windows UI family and let font linking provide Chinese glyphs.
+    state->ui_font_family =
+        preferred_ui_font_family(state->dwrite_factory.Get());
+    state->dwrite_factory->CreateTextFormat(state->ui_font_family.c_str(), nullptr, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16.0f, L"zh-CN", state->title_format.GetAddressOf());
+    state->dwrite_factory->CreateTextFormat(state->ui_font_family.c_str(), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"zh-CN", state->text_format.GetAddressOf());
+    state->dwrite_factory->CreateTextFormat(state->ui_font_family.c_str(), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"zh-CN", state->small_format.GetAddressOf());
     state->dwrite_factory->CreateTextFormat(L"Consolas", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"zh-CN", state->hotkey_format.GetAddressOf());
-    state->dwrite_factory->CreateTextFormat(L"Microsoft YaHei", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"zh-CN", state->btn_text_format.GetAddressOf());
+    state->dwrite_factory->CreateTextFormat(state->ui_font_family.c_str(), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"zh-CN", state->btn_text_format.GetAddressOf());
     if (!state->title_format || !state->text_format || !state->small_format ||
         !state->hotkey_format || !state->btn_text_format) {
         return fail();
@@ -789,6 +825,7 @@ void discard_resources(SettingsState* state) {
     state->text_grey_brush.Reset();
     state->blue_brush.Reset();
     state->hover_blue_brush.Reset();
+    state->accent_text_brush.Reset();
     state->border_brush.Reset();
     state->active_tab_brush.Reset();
     state->control_bg_brush.Reset();
@@ -847,8 +884,7 @@ void draw_switch(SettingsState* state, int x, int y, bool is_on) {
         8.0f,
         8.0f
     );
-    ID2D1SolidColorBrush* thumb_brush = state->is_light_theme ? state->control_bg_brush.Get() : state->text_white_brush.Get();
-    state->render_target->FillEllipse(thumb, thumb_brush);
+    state->render_target->FillEllipse(thumb, state->accent_text_brush.Get());
 }
 
 void draw_button(SettingsState* state, int x1, int y1, int x2, int y2, const wchar_t* label, bool is_hovered, ButtonStyle style = btn_primary) {
@@ -863,8 +899,7 @@ void draw_button(SettingsState* state, int x1, int y1, int x2, int y2, const wch
             state->render_target->FillRoundedRectangle(rounded, state->blue_brush.Get());
             state->render_target->DrawRoundedRectangle(rounded, state->blue_brush.Get(), 1.0f);
         }
-        ID2D1SolidColorBrush* text_brush = state->is_light_theme ? state->control_bg_brush.Get() : state->text_white_brush.Get();
-        state->render_target->DrawTextW(label, static_cast<UINT32>(wcslen(label)), state->btn_text_format.Get(), rect, text_brush);
+        state->render_target->DrawTextW(label, static_cast<UINT32>(wcslen(label)), state->btn_text_format.Get(), rect, state->accent_text_brush.Get());
     } else {
         if (is_hovered) {
             state->render_target->FillRoundedRectangle(rounded, state->hover_bg_brush.Get());
@@ -883,8 +918,7 @@ void draw_choice_button(SettingsState* state, int x1, int y1, int x2, int y2, co
 
     if (is_selected) {
         state->render_target->FillRoundedRectangle(rounded, state->blue_brush.Get());
-        ID2D1SolidColorBrush* text_brush = state->is_light_theme ? state->control_bg_brush.Get() : state->text_white_brush.Get();
-        state->render_target->DrawTextW(label, static_cast<UINT32>(wcslen(label)), state->btn_text_format.Get(), rect, text_brush);
+        state->render_target->DrawTextW(label, static_cast<UINT32>(wcslen(label)), state->btn_text_format.Get(), rect, state->accent_text_brush.Get());
     } else {
         state->render_target->FillRoundedRectangle(rounded, is_hovered ? state->hover_bg_brush.Get() : state->control_bg_brush.Get());
         state->render_target->DrawRoundedRectangle(rounded, state->card_border_brush.Get(), 1.0f);
@@ -910,7 +944,16 @@ void draw_hotkey_box(SettingsState* state, int x1, int y1, int x2, int y2, const
         } else {
             state->render_target->DrawRoundedRectangle(rounded, state->card_border_brush.Get(), 1.0f);
         }
-        state->render_target->DrawTextW(hotkey_str, static_cast<UINT32>(wcslen(hotkey_str)), state->hotkey_format.Get(), rect, state->text_white_brush.Get());
+        const bool configured = hotkey_str && hotkey_str[0] != L'\0';
+        const wchar_t* display = configured ? hotkey_str : L"未设置";
+        state->render_target->DrawTextW(
+            display,
+            static_cast<UINT32>(wcslen(display)),
+            state->hotkey_format.Get(),
+            rect,
+            configured
+                ? state->text_white_brush.Get()
+                : state->text_grey_brush.Get());
     }
 }
 
@@ -924,12 +967,14 @@ std::vector<SettingsFocusTarget> settings_focus_targets(const SettingsState* sta
 
     if (state->active_tab == 0) {
         for (int index = 0; index < kGeneralSwitchCount; ++index) {
-            if (index != 2 || state->config.ocr_enabled) {
+            const bool available =
+                (index != 2 || state->config.ocr_enabled) &&
+                ((index != 4 && index != 5) || state->config.shell_enabled);
+            if (available) {
                 targets.push_back({SettingsFocusKind::general_switch, index});
             }
         }
         targets.push_back({SettingsFocusKind::font_family});
-        targets.push_back({SettingsFocusKind::reset_serial});
         targets.push_back({SettingsFocusKind::text_bold});
         targets.push_back({SettingsFocusKind::text_italic});
         if (!state->is_downloading) {
@@ -995,10 +1040,7 @@ std::optional<D2D1_ROUNDED_RECT> settings_focus_bounds(
             break;
         }
         case SettingsFocusKind::font_family:
-            rect = D2D1::RectF(250.0f, 405.0f, 450.0f, 435.0f);
-            break;
-        case SettingsFocusKind::reset_serial:
-            rect = D2D1::RectF(530.0f, 405.0f, 690.0f, 435.0f);
+            rect = D2D1::RectF(250.0f, 405.0f, 690.0f, 435.0f);
             break;
         case SettingsFocusKind::text_bold:
             rect = D2D1::RectF(347.0f, 449.0f, 397.0f, 477.0f);
@@ -1210,13 +1252,18 @@ bool activate_settings_focus(
                     state->config.shell_enabled = !state->config.shell_enabled;
                     break;
                 case 4:
-                    state->config.start_at_login = !state->config.start_at_login;
+                    if (!toggle_tray_icon(state)) {
+                        return false;
+                    }
                     break;
                 case 5:
+                    state->config.start_at_login = !state->config.start_at_login;
+                    break;
+                case 6:
                     state->config.notifications_enabled =
                         !state->config.notifications_enabled;
                     break;
-                case 6:
+                case 7:
                     state->config.annotation_locked_tool =
                         !state->config.annotation_locked_tool;
                     break;
@@ -1226,18 +1273,6 @@ bool activate_settings_focus(
             break;
         case SettingsFocusKind::font_family:
             return show_font_family_menu(state);
-        case SettingsFocusKind::reset_serial:
-            state->config.annotation_next_serial = 1;
-            enter_settings_modal(state);
-            MessageBoxW(
-                state->window,
-                L"标注序号计数器已成功重置为 1。",
-                L"设置",
-                MB_OK | MB_ICONINFORMATION);
-            if (!leave_settings_modal(state)) {
-                return false;
-            }
-            break;
         case SettingsFocusKind::text_bold:
             state->config.text_font_bold = !state->config.text_font_bold;
             break;
@@ -1374,10 +1409,9 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
         }
 
         case WM_SETTINGCHANGE:
+        case WM_SYSCOLORCHANGE:
         case WM_THEMECHANGED: {
-            if (state->config.theme == L"system") {
-                refresh_settings_theme(state);
-            }
+            refresh_settings_theme(state);
             return 0;
         }
 
@@ -1389,11 +1423,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                 state->render_target->BeginDraw();
                 
                 // Clear background
-                if (state->is_light_theme) {
-                    state->render_target->Clear(D2D1::ColorF(0xF2F3F5));
-                } else {
-                    state->render_target->Clear(D2D1::ColorF(22.0f / 255.0f, 23.0f / 255.0f, 28.0f / 255.0f));
-                }
+                state->render_target->Clear(state->palette.background);
 
                 // Draw custom title bar (y: 0 to 50)
                 D2D1_RECT_F title_bar_rect = D2D1::RectF(0.0f, 0.0f, 740.0f, 50.0f);
@@ -1472,7 +1502,8 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                         L"启用屏幕标注 (Screen Annotation)",
                         L"启用 OCR 识别 (OCR Recognition)",
                         L"启用全局 OCR 热键 (Global OCR Hotkey)",
-                        L"运行系统托盘 (System Tray Icon)",
+                        L"运行后台服务与快捷键 (Background Service)",
+                        L"显示系统托盘图标 (Show Tray Icon)",
                         L"开机自动启动 (Start at Login)",
                         L"启用提示通知 (Show Notifications)",
                         L"标注后保持当前工具 (Keep tool active)"
@@ -1482,6 +1513,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                         state->config.ocr_enabled,
                         state->config.ocr_enabled && state->config.global_ocr_enabled,
                         state->config.shell_enabled,
+                        state->config.tray_icon_visible,
                         state->config.start_at_login,
                         state->config.notifications_enabled,
                         state->config.annotation_locked_tool
@@ -1489,7 +1521,9 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
 
                     for (int i = 0; i < kGeneralSwitchCount; ++i) {
                         float row_y = 110.0f + i * static_cast<float>(kGeneralRowHeight);
-                        const bool row_enabled = i != 2 || state->config.ocr_enabled;
+                        const bool row_enabled =
+                            (i != 2 || state->config.ocr_enabled) &&
+                            ((i != 4 && i != 5) || state->config.shell_enabled);
                         
                         // Row hover background
                         D2D1_RECT_F row_rect = D2D1::RectF(
@@ -1541,13 +1575,10 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                     state->render_target->FillRoundedRectangle(rounded_card2, state->card_bg_brush.Get());
                     state->render_target->DrawRoundedRectangle(rounded_card2, state->card_border_brush.Get(), 1.0f);
 
-                    // Row 0: Font Family & Reset serial
+                    // Row 0: Font family
                     std::wstring font_desc = L"文本字体: " + state->config.text_font_family;
-                    bool font_hovered = (state->mouse_pos.x >= 250 && state->mouse_pos.x <= 450 && state->mouse_pos.y >= 405 && state->mouse_pos.y <= 435);
-                    draw_button(state, 250, 405, 450, 435, font_desc.c_str(), font_hovered, btn_secondary);
-
-                    bool reset_hovered = (state->mouse_pos.x >= 530 && state->mouse_pos.x <= 690 && state->mouse_pos.y >= 405 && state->mouse_pos.y <= 435);
-                    draw_button(state, 530, 405, 690, 435, L"重置序号计数", reset_hovered, btn_secondary);
+                    bool font_hovered = (state->mouse_pos.x >= 250 && state->mouse_pos.x <= 690 && state->mouse_pos.y >= 405 && state->mouse_pos.y <= 435);
+                    draw_button(state, 250, 405, 690, 435, font_desc.c_str(), font_hovered, btn_secondary);
 
                     // Row 1: Text Bold & Italic
                     D2D1_RECT_F bold_label_rect = D2D1::RectF(250.0f, 445.0f, 340.0f, 480.0f);
@@ -1673,8 +1704,8 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                             // Draw white checkmark
                             float cx = 248.0f;
                             float cy = y + 13.0f;
-                            state->render_target->DrawLine(D2D1::Point2F(cx - 3.0f, cy), D2D1::Point2F(cx - 1.0f, cy + 2.0f), state->is_light_theme ? state->control_bg_brush.Get() : state->text_white_brush.Get(), 1.5f);
-                            state->render_target->DrawLine(D2D1::Point2F(cx - 1.0f, cy + 2.0f), D2D1::Point2F(cx + 3.0f, cy - 2.0f), state->is_light_theme ? state->control_bg_brush.Get() : state->text_white_brush.Get(), 1.5f);
+                            state->render_target->DrawLine(D2D1::Point2F(cx - 3.0f, cy), D2D1::Point2F(cx - 1.0f, cy + 2.0f), state->accent_text_brush.Get(), 1.5f);
+                            state->render_target->DrawLine(D2D1::Point2F(cx - 1.0f, cy + 2.0f), D2D1::Point2F(cx + 3.0f, cy - 2.0f), state->accent_text_brush.Get(), 1.5f);
                         } else {
                             state->render_target->DrawRoundedRectangle(cb_rounded, state->text_grey_brush.Get(), 1.0f);
                         }
@@ -1755,12 +1786,12 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
 
                     // Symmetrical columns
                     const wchar_t* col1_labels[] = {
-                        L"全局截图热键", L"全局 OCR 热键", L"屏幕识字快捷键", L"选择工具快捷键",
-                        L"矩形工具快捷键", L"椭圆工具快捷键", L"直线工具快捷键", L"箭头工具快捷键"
+                        L"全局截图热键", L"剪贴板贴图热键", L"全局 OCR 热键", L"屏幕识字快捷键",
+                        L"选择工具快捷键", L"矩形工具快捷键", L"椭圆工具快捷键", L"直线工具快捷键"
                     };
                     const wchar_t* col2_labels[] = {
-                        L"画笔工具快捷键", L"马赛克快捷键", L"模糊工具快捷键", L"高亮工具快捷键",
-                        L"文本工具快捷键", L"序号工具快捷键", L"橡皮擦快捷键"
+                        L"箭头工具快捷键", L"画笔工具快捷键", L"马赛克快捷键", L"模糊工具快捷键",
+                        L"高亮工具快捷键", L"文本工具快捷键", L"序号工具快捷键", L"橡皮擦快捷键"
                     };
 
                     // Draw middle vertical divider line
@@ -1779,7 +1810,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                     }
 
                     // Col 2
-                    for (int i = 8; i < 15; ++i) {
+                    for (int i = 8; i < shortcut_count; ++i) {
                         float y = 95.0f + (i - 8) * 65.0f;
                         D2D1_RECT_F text_rect = D2D1::RectF(485.0f, y, 590.0f, y + 26.0f);
                         state->render_target->DrawTextW(col2_labels[i - 8], static_cast<UINT32>(wcslen(col2_labels[i - 8])), state->text_format.Get(), text_rect, state->text_white_brush.Get());
@@ -1920,29 +1951,37 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                                         !state->config.global_ocr_enabled;
                                 }
                                 break;
-                            case 3: state->config.shell_enabled = !state->config.shell_enabled; break;
-                            case 4: state->config.start_at_login = !state->config.start_at_login; break;
-                            case 5: state->config.notifications_enabled = !state->config.notifications_enabled; break;
-                            case 6: state->config.annotation_locked_tool = !state->config.annotation_locked_tool; break;
+                            case 3:
+                                state->config.shell_enabled = !state->config.shell_enabled;
+                                break;
+                            case 4:
+                                if (!state->config.shell_enabled ||
+                                    !toggle_tray_icon(state)) {
+                                    return 0;
+                                }
+                                break;
+                            case 5:
+                                if (state->config.shell_enabled) {
+                                    state->config.start_at_login =
+                                        !state->config.start_at_login;
+                                }
+                                break;
+                            case 6:
+                                state->config.notifications_enabled =
+                                    !state->config.notifications_enabled;
+                                break;
+                            case 7:
+                                state->config.annotation_locked_tool =
+                                    !state->config.annotation_locked_tool;
+                                break;
                         }
                         InvalidateRect(window, nullptr, TRUE);
                         return 0;
                     }
                 }
                 // Font Family button (with popup menu)
-                if (pt.x >= 250 && pt.x <= 450 && pt.y >= 405 && pt.y <= 435) {
+                if (pt.x >= 250 && pt.x <= 690 && pt.y >= 405 && pt.y <= 435) {
                     (void)show_font_family_menu(state);
-                    return 0;
-                }
-                // Reset serial button
-                if (pt.x >= 530 && pt.x <= 690 && pt.y >= 405 && pt.y <= 435) {
-                    state->config.annotation_next_serial = 1;
-                    enter_settings_modal(state);
-                    MessageBoxW(window, L"标注序号计数器已成功重置为 1。", L"设置", MB_OK | MB_ICONINFORMATION);
-                    if (!leave_settings_modal(state)) {
-                        return 0;
-                    }
-                    InvalidateRect(window, nullptr, TRUE);
                     return 0;
                 }
                 // Bold switch
@@ -2074,7 +2113,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                     }
                 }
             } else if (state->active_tab == 2) {
-                // Shortcuts tab: check 15 boxes
+                // Shortcuts tab: check every shortcut box
                 // Col 1: i = 0..7
                 for (int i = 0; i < 8; ++i) {
                     int sy = 95 + i * 65;
@@ -2084,8 +2123,8 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                         return 0;
                     }
                 }
-                // Col 2: i = 8..14
-                for (int i = 8; i < 15; ++i) {
+                // Col 2: remaining shortcuts
+                for (int i = 8; i < shortcut_count; ++i) {
                     int sy = 95 + (i - 8) * 65;
                     if (pt.x >= 595 && pt.x <= 695 && pt.y >= sy && pt.y <= sy + 26) {
                         state->capturing_idx_ = i;
@@ -2237,11 +2276,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                     }
                 }
                 // Font Family button
-                if (pt.x >= 250 && pt.x <= 450 && pt.y >= 405 && pt.y <= 435) {
-                    is_hovering_interactive = true;
-                }
-                // Reset serial button
-                if (pt.x >= 530 && pt.x <= 690 && pt.y >= 405 && pt.y <= 435) {
+                if (pt.x >= 250 && pt.x <= 690 && pt.y >= 405 && pt.y <= 435) {
                     is_hovering_interactive = true;
                 }
                 // Bold switch
@@ -2300,7 +2335,7 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
                     }
                 }
                 // Col 2 boxes
-                for (int i = 8; i < 15; ++i) {
+                for (int i = 8; i < shortcut_count; ++i) {
                     int sy = 95 + (i - 8) * 65;
                     if (pt.x >= 595 && pt.x <= 695 && pt.y >= sy && pt.y <= sy + 26) {
                         is_hovering_interactive = true;
@@ -2372,7 +2407,11 @@ LRESULT CALLBACK settings_proc(HWND window, UINT message, WPARAM w_param, LPARAM
 
 } // namespace
 
-HWND show_settings_window_async(HWND owner, AppConfig config, SettingsWindowCompletion completion) {
+HWND show_settings_window_async(
+    HWND owner,
+    AppConfig config,
+    SettingsWindowCompletion completion,
+    SettingsWindowValidator validator) {
     static std::once_flag class_flag;
     std::call_once(class_flag, [] {
         WNDCLASSEXW window_class{sizeof(window_class)};
@@ -2380,7 +2419,7 @@ HWND show_settings_window_async(HWND owner, AppConfig config, SettingsWindowComp
         window_class.lpfnWndProc = settings_proc;
         window_class.hInstance = GetModuleHandleW(nullptr);
         window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        window_class.hbrBackground = CreateSolidBrush(RGB(18, 19, 22));
+        window_class.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
         window_class.lpszClassName = L"AirScreenshot.Settings";
         RegisterClassExW(&window_class);
     });
@@ -2395,9 +2434,12 @@ HWND show_settings_window_async(HWND owner, AppConfig config, SettingsWindowComp
     state->config = std::move(config);
     state->config.default_output =
         _wcsicmp(state->config.default_output.c_str(), L"file") == 0 ? L"file" : L"clipboard";
-    state->is_light_theme = should_use_light_theme(state->config.theme);
+    state->palette = resolve_ui_palette(state->config.theme);
+    state->is_light_theme = state->palette.light;
+    state->high_contrast = state->palette.high_contrast;
     state->owner = owner;
     state->completion = std::move(completion);
+    state->validator = std::move(validator);
     UINT dpi = owner ? GetDpiForWindow(owner) : GetDpiForSystem();
     if (dpi == 0) {
         dpi = 96;
@@ -2458,7 +2500,7 @@ HWND show_settings_window_async(HWND owner, AppConfig config, SettingsWindowComp
     MARGINS margins = { 1, 1, 1, 1 };
     DwmExtendFrameIntoClientArea(window, &margins);
 
-    BOOL use_dark = !state->is_light_theme;
+    BOOL use_dark = !state->is_light_theme && !state->high_contrast;
     DwmSetWindowAttribute(window, 20, &use_dark, sizeof(use_dark));
     DwmSetWindowAttribute(window, 19, &use_dark, sizeof(use_dark));
     DWORD corner_preference = 2; // DWMWCP_ROUND

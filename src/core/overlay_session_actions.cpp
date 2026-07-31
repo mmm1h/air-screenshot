@@ -3,6 +3,7 @@
 #include <dwmapi.h>
 
 #include <array>
+#include <exception>
 
 namespace airshot::overlay_detail {
 namespace {
@@ -23,58 +24,6 @@ void add_separator(std::vector<std::pair<std::wstring, std::wstring>>& items) {
     }
 }
 
-class CaptureWindowHider {
-public:
-    CaptureWindowHider(HWND border, HWND control)
-        : border_(border), control_(control) {
-        border_hidden_ = hide_if_needed(border_);
-        control_hidden_ = hide_if_needed(control_);
-        if (border_hidden_ || control_hidden_) {
-            DwmFlush();
-        }
-    }
-
-    ~CaptureWindowHider() {
-        restore();
-    }
-
-    CaptureWindowHider(const CaptureWindowHider&) = delete;
-    CaptureWindowHider& operator=(const CaptureWindowHider&) = delete;
-
-    void restore() noexcept {
-        if (restored_) {
-            return;
-        }
-        restored_ = true;
-        if (border_hidden_ && border_ && IsWindow(border_)) {
-            ShowWindow(border_, SW_SHOWNOACTIVATE);
-        }
-        if (control_hidden_ && control_ && IsWindow(control_)) {
-            ShowWindow(control_, SW_SHOWNOACTIVATE);
-        }
-    }
-
-private:
-    static bool hide_if_needed(HWND window) noexcept {
-        if (!window || !IsWindow(window) || !IsWindowVisible(window)) {
-            return false;
-        }
-        DWORD affinity = WDA_NONE;
-        if (GetWindowDisplayAffinity(window, &affinity) &&
-            affinity == WDA_EXCLUDEFROMCAPTURE) {
-            return false;
-        }
-        ShowWindow(window, SW_HIDE);
-        return true;
-    }
-
-    HWND border_{};
-    HWND control_{};
-    bool border_hidden_{};
-    bool control_hidden_{};
-    bool restored_{};
-};
-
 struct ToolbarMetrics {
     int button_width;
     int button_height;
@@ -88,11 +37,13 @@ struct ToolbarRow {
 };
 
 int item_width(std::wstring_view id, const ToolbarMetrics& metrics) {
-    if (id == L"|") return 14;
+    if (id == L"drag") return 20;
+    if (id == L"|") return 9;
     if (id == L"text_size_btn") return 86;
     if (id == L"mosaic_strength_slider" || id == L"watermark_opacity_slider") return 188;
     if (id == L"watermark_text") return 122;
     if (id == L"watermark_apply" || id == L"watermark_clear") return 54;
+    if (id.starts_with(L"effect_") || id.starts_with(L"mode_")) return 68;
     return metrics.button_width;
 }
 
@@ -253,7 +204,7 @@ bool tool_supports_color(Tool tool) {
 
 bool tool_supports_width(Tool tool) {
     return tool == Tool::rectangle || tool == Tool::ellipse || tool == Tool::line || tool == Tool::arrow ||
-           tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::eraser ||
+           tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::serial ||
            tool == Tool::blur;
 }
 
@@ -289,6 +240,7 @@ void add_feishu_palette(std::vector<std::pair<std::wstring, std::wstring>>& item
     items.push_back({L"color_black", L""});
     items.push_back({L"color_gray", L""});
     items.push_back({L"color_white", L""});
+    items.push_back({L"color_custom", L""});
 }
 
 class HighlightCoverage {
@@ -576,7 +528,12 @@ bool draw_text_with_style(
     SetBkMode(dc, TRANSPARENT);
 
     RECT measured = bounds;
-    DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &measured, DT_LEFT | DT_TOP | DT_CALCRECT);
+    DrawTextW(
+        dc,
+        text.c_str(),
+        static_cast<int>(text.size()),
+        &measured,
+        DT_LEFT | DT_TOP | DT_CALCRECT | DT_NOPREFIX);
     measured.right += 8;
     measured.bottom += 6;
 
@@ -587,7 +544,12 @@ bool draw_text_with_style(
         }
         FillRect(dc, &measured, reinterpret_cast<HBRUSH>(background.get()));
         SetTextColor(dc, RGB(255, 255, 255));
-        DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &bounds, DT_LEFT | DT_TOP);
+        DrawTextW(
+            dc,
+            text.c_str(),
+            static_cast<int>(text.size()),
+            &bounds,
+            DT_LEFT | DT_TOP | DT_NOPREFIX);
     } else if (style == TextStyle::outline) {
         SetTextColor(dc, RGB(255, 255, 255));
         for (int dy = -2; dy <= 2; ++dy) {
@@ -597,14 +559,29 @@ bool draw_text_with_style(
                 }
                 RECT outline = bounds;
                 OffsetRect(&outline, dx, dy);
-                DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &outline, DT_LEFT | DT_TOP);
+                DrawTextW(
+                    dc,
+                    text.c_str(),
+                    static_cast<int>(text.size()),
+                    &outline,
+                    DT_LEFT | DT_TOP | DT_NOPREFIX);
             }
         }
         SetTextColor(dc, color);
-        DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &bounds, DT_LEFT | DT_TOP);
+        DrawTextW(
+            dc,
+            text.c_str(),
+            static_cast<int>(text.size()),
+            &bounds,
+            DT_LEFT | DT_TOP | DT_NOPREFIX);
     } else {
         SetTextColor(dc, color);
-        DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &bounds, DT_LEFT | DT_TOP);
+        DrawTextW(
+            dc,
+            text.c_str(),
+            static_cast<int>(text.size()),
+            &bounds,
+            DT_LEFT | DT_TOP | DT_NOPREFIX);
     }
 
     return true;
@@ -670,7 +647,16 @@ bool blend_watermark(HDC compatible_dc,
     SetBkMode(mask_dc.get(), TRANSPARENT);
     SetTextColor(mask_dc.get(), RGB(255, 255, 255));
 
-    const int step_x = std::max(120, static_cast<int>(annotation.text.size()) * 24 + 80);
+    SIZE text_extent{};
+    if (!GetTextExtentPoint32W(
+            mask_dc.get(),
+            annotation.text.c_str(),
+            static_cast<int>(annotation.text.size()),
+            &text_extent)) {
+        return false;
+    }
+    const int step_x =
+        std::max(120, static_cast<int>(text_extent.cx) + 72);
     const int step_y = std::max(70, static_cast<int>(annotation.width * 3.2F));
     for (int y = -step_y; y < height + step_y; y += step_y) {
         for (int x = -step_x; x < width + step_x; x += step_x) {
@@ -716,6 +702,7 @@ bool blend_watermark(HDC compatible_dc,
 void OverlaySession::build_toolbar() {
     toolbar_.clear();
     std::vector<std::pair<std::wstring, std::wstring>> items;
+    items.push_back({L"drag", L""});
 
     auto split_by_comma = [](std::wstring_view value) {
         std::vector<std::wstring> result;
@@ -775,8 +762,6 @@ void OverlaySession::build_toolbar() {
     int last_category = -1;
     for (const auto& token : split_by_comma(request_.config.toolbar_order)) {
         if (token == L"blur") continue;
-        if (token == L"undo" && annotations_.empty()) continue;
-        if (token == L"redo" && redo_.empty()) continue;
         if (token == L"ocr" && !request_.config.ocr_enabled) continue;
         if (token == L"lock" && !request_.config.annotation_enabled) continue;
 
@@ -788,7 +773,14 @@ void OverlaySession::build_toolbar() {
             token == L"serial" || token == L"eraser" || token == L"undo" || token == L"redo";
         if (annotation_tool && !request_.config.annotation_enabled) continue;
 
-        if (hidden(request_.config, token) && token != L"close") continue;
+        if (token == L"mosaic") {
+            if (hidden(request_.config, L"mosaic") &&
+                hidden(request_.config, L"blur")) {
+                continue;
+            }
+        } else if (hidden(request_.config, token) && token != L"close") {
+            continue;
+        }
 
         std::wstring label = get_tool_label(token);
         if (label.empty()) continue;
@@ -802,7 +794,7 @@ void OverlaySession::build_toolbar() {
     trim_trailing_separators(items);
 
     const RectI host_bounds = toolbar_host_bounds(monitors_, selection_, virtual_bounds_);
-    const ToolbarMetrics metrics{40, 38, 5, 7};
+    const ToolbarMetrics metrics{40, 40, 4, 8};
     const auto rows = wrap_toolbar_items(items, metrics, host_bounds);
     const int total_width = toolbar_width(rows, metrics);
     const int total_height = toolbar_height(rows, metrics);
@@ -812,17 +804,59 @@ void OverlaySession::build_toolbar() {
         return;
     }
 
-    const int preferred_left = selection_.right - total_width;
-    const int left = clamp_axis(preferred_left, total_width, host_bounds.left, host_bounds.right);
-    const int below_top = selection_.bottom + 6;
-    const int above_top = selection_.top - total_height - 6;
-    int top = below_top;
-    if (below_top + total_height > host_bounds.bottom && above_top >= host_bounds.top) {
-        top = above_top;
+    int left = 0;
+    int top = 0;
+    if (toolbar_custom_origin_) {
+        left = clamp_axis(
+            toolbar_custom_origin_->x,
+            total_width,
+            host_bounds.left,
+            host_bounds.right);
+        top = clamp_axis(
+            toolbar_custom_origin_->y,
+            total_height,
+            host_bounds.top,
+            host_bounds.bottom);
+        *toolbar_custom_origin_ = POINT{left, top};
+    } else {
+        const int preferred_left = selection_.right - total_width;
+        left = clamp_axis(
+            preferred_left,
+            total_width,
+            host_bounds.left,
+            host_bounds.right);
+        const int below_top = selection_.bottom + 8;
+        const int above_top = selection_.top - total_height - 8;
+        top = below_top;
+        if (below_top + total_height > host_bounds.bottom &&
+            above_top >= host_bounds.top) {
+            top = above_top;
+        }
+        top = clamp_axis(
+            top,
+            total_height,
+            host_bounds.top,
+            host_bounds.bottom);
     }
-    top = clamp_axis(top, total_height, host_bounds.top, host_bounds.bottom);
 
     place_toolbar_rows(toolbar_, rows, metrics, left, top);
+    for (auto& button : toolbar_) {
+        if (button.id == L"undo" && !annotation_history_.can_undo()) {
+            button.enabled = false;
+            button.disabled_reason = L"暂无可撤销操作";
+        } else if (button.id == L"redo" && !annotation_history_.can_redo()) {
+            button.enabled = false;
+            button.disabled_reason = L"暂无可重做操作";
+        } else if (
+            button.id == L"scroll" &&
+            (selection_.width() < 64 || selection_.height() < 64)) {
+            button.enabled = false;
+            button.disabled_reason = L"选区至少需要 64 × 64 像素";
+        } else if (button.id == L"scroll" && !annotations_.empty()) {
+            button.enabled = false;
+            button.disabled_reason = L"请先撤销标注再开始长截图";
+        }
+    }
     build_sub_toolbar();
 }
 
@@ -831,17 +865,38 @@ void OverlaySession::build_sub_toolbar() {
     if (active_tool_ == Tool::none) {
         return;
     }
+    Tool style_tool = active_tool_;
+    const bool editing_selected =
+        active_tool_ == Tool::select &&
+        selected_annotation_idx_ >= 0 &&
+        selected_annotation_idx_ < static_cast<int>(annotations_.size());
+    if (editing_selected) {
+        style_tool =
+            annotations_[static_cast<std::size_t>(selected_annotation_idx_)].tool;
+    }
     std::vector<std::pair<std::wstring, std::wstring>> items;
 
-    if (active_tool_ == Tool::mosaic || active_tool_ == Tool::blur) {
-        items.push_back({L"effect_mosaic", L"马赛克"});
-        items.push_back({L"effect_blur", L"模糊"});
-        items.push_back({L"|", L""});
-        items.push_back({L"mode_smear", L"涂抹"});
-        items.push_back({L"mode_rect", L"框选"});
+    if (style_tool == Tool::mosaic || style_tool == Tool::blur) {
+        const bool mosaic_available =
+            !hidden(request_.config, L"mosaic");
+        const bool blur_available =
+            !hidden(request_.config, L"blur");
+        if (mosaic_available && blur_available) {
+            items.push_back({L"effect_mosaic", L"马赛克"});
+            items.push_back({L"effect_blur", L"模糊"});
+        }
+        if (!editing_selected) {
+            items.push_back({L"|", L""});
+            items.push_back({L"mode_smear", L"涂抹"});
+            items.push_back({L"mode_rect", L"框选"});
+        }
         items.push_back({L"|", L""});
         items.push_back({L"mosaic_strength_slider", L""});
-    } else if (active_tool_ == Tool::text) {
+        items.push_back({L"|", L""});
+        items.push_back({L"width_small", L""});
+        items.push_back({L"width_medium", L""});
+        items.push_back({L"width_large", L""});
+    } else if (style_tool == Tool::text) {
         items.push_back({L"text_style_normal", L""});
         items.push_back({L"text_style_dark", L""});
         items.push_back({L"text_style_outline", L""});
@@ -850,25 +905,27 @@ void OverlaySession::build_sub_toolbar() {
         items.push_back({L"text_size_btn", size_label});
         items.push_back({L"|", L""});
         add_feishu_palette(items);
-    } else if (active_tool_ == Tool::watermark) {
+    } else if (style_tool == Tool::watermark) {
         items.push_back({L"watermark_text", watermark_text_.empty() ? L"水印文字" : watermark_text_});
         items.push_back({L"watermark_apply", L"应用"});
         items.push_back({L"watermark_clear", L"清除"});
         items.push_back({L"|", L""});
+        items.push_back({L"text_size_btn", text_size_label(active_text_size_)});
+        items.push_back({L"|", L""});
         items.push_back({L"watermark_opacity_slider", L""});
         items.push_back({L"|", L""});
         add_feishu_palette(items);
-    } else if (tool_is_feishu_style_shape(active_tool_)) {
+    } else if (tool_is_feishu_style_shape(style_tool)) {
         items.push_back({L"width_small", L""});
         items.push_back({L"width_medium", L""});
         items.push_back({L"width_large", L""});
         items.push_back({L"|", L""});
         add_feishu_palette(items);
     } else {
-        if (tool_supports_color(active_tool_)) {
+        if (tool_supports_color(style_tool)) {
             add_feishu_palette(items);
         }
-        if (tool_supports_width(active_tool_)) {
+        if (tool_supports_width(style_tool)) {
             if (!items.empty()) {
                 items.push_back({L"|", L""});
             }
@@ -876,7 +933,7 @@ void OverlaySession::build_sub_toolbar() {
             items.push_back({L"width_medium", L""});
             items.push_back({L"width_large", L""});
         }
-        if (tool_supports_alpha(active_tool_)) {
+        if (tool_supports_alpha(style_tool)) {
             if (!items.empty()) {
                 items.push_back({L"|", L""});
             }
@@ -891,7 +948,7 @@ void OverlaySession::build_sub_toolbar() {
 
     if (toolbar_.empty()) return;
     const RectI host_bounds = toolbar_host_bounds(monitors_, selection_, virtual_bounds_);
-    const ToolbarMetrics metrics{34, 32, 5, 7};
+    const ToolbarMetrics metrics{36, 34, 4, 8};
     const auto rows = wrap_toolbar_items(items, metrics, host_bounds);
     const int total_width = toolbar_width(rows, metrics);
     const int total_height = toolbar_height(rows, metrics);
@@ -913,6 +970,17 @@ void OverlaySession::build_sub_toolbar() {
     top = clamp_axis(top, total_height, host_bounds.top, host_bounds.bottom);
 
     place_toolbar_rows(sub_toolbar_, rows, metrics, left, top);
+    const bool has_watermark = std::ranges::any_of(
+        annotations_,
+        [](const Annotation& annotation) {
+            return annotation.tool == Tool::watermark;
+        });
+    for (auto& button : sub_toolbar_) {
+        if (button.id == L"watermark_clear" && !has_watermark) {
+            button.enabled = false;
+            button.disabled_reason = L"当前没有已应用的水印";
+        }
+    }
 }
 
 void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
@@ -938,12 +1006,31 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
                 break;
             }
         }
-        show_rgb_picker_popup(source, custom_color_, button_bounds, virtual_bounds_, [this](COLORREF new_color) {
-            custom_color_ = new_color;
-            active_color_ = new_color;
-            request_.config.custom_color = format_hex_color(new_color);
-            invalidate_all();
-        });
+        begin_annotation_transaction();
+        show_rgb_picker_popup(
+            source,
+            custom_color_,
+            button_bounds,
+            virtual_bounds_,
+            [this](COLORREF new_color) {
+                if (done_) {
+                    return;
+                }
+                custom_color_ = new_color;
+                active_color_ = new_color;
+                request_.config.custom_color = format_hex_color(new_color);
+                apply_active_style_to_selected();
+                invalidate_all();
+            },
+            [this] {
+                if (done_) {
+                    return;
+                }
+                commit_annotation_transaction();
+                build_toolbar();
+                build_sub_toolbar();
+                invalidate_all();
+            });
     } else if (id == L"width_small") {
         active_width_ = 2.0F;
     } else if (id == L"width_medium") {
@@ -992,25 +1079,31 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
                     watermark_text_ = std::move(*text);
                     invalidate_all();
                 }
-            });
+            },
+            watermark_text_);
     } else if (id == L"watermark_apply") {
         apply_watermark();
     } else if (id == L"watermark_clear") {
-        discard_redo();
+        record_annotation_change();
         std::erase_if(annotations_, [](const Annotation& annotation) {
             return annotation.tool == Tool::watermark;
         });
+        renumber_serial_annotations(annotations_);
         build_toolbar();
         build_sub_toolbar();
     } else if (id == L"effect_mosaic") {
-        active_tool_ = Tool::mosaic;
         mosaic_is_blur_ = false;
-        preview_.tool = Tool::mosaic;
+        if (active_tool_ != Tool::select) {
+            active_tool_ = Tool::mosaic;
+            preview_.tool = Tool::mosaic;
+        }
         build_sub_toolbar();
     } else if (id == L"effect_blur") {
-        active_tool_ = Tool::blur;
         mosaic_is_blur_ = true;
-        preview_.tool = Tool::blur;
+        if (active_tool_ != Tool::select) {
+            active_tool_ = Tool::blur;
+            preview_.tool = Tool::blur;
+        }
         build_sub_toolbar();
     } else if (id == L"mode_smear") {
         mosaic_is_rect_ = false;
@@ -1020,24 +1113,43 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
         preview_.points.clear();
         build_sub_toolbar();
     }
+    apply_active_style_to_selected();
 }
 
 void OverlaySession::invoke(std::wstring_view id, HWND source) {
+    if (ocr_running_) {
+        if (id == L"close") {
+            cancel_ocr();
+        }
+        return;
+    }
     if (id == L"lock") {
         request_.config.annotation_locked_tool = !request_.config.annotation_locked_tool;
     } else if (id == L"mosaic") {
-        const Tool target = mosaic_is_blur_ ? Tool::blur : Tool::mosaic;
+        const bool mosaic_available =
+            !hidden(request_.config, L"mosaic");
+        const bool blur_available =
+            !hidden(request_.config, L"blur");
+        const Tool target =
+            !mosaic_available && blur_available
+                ? Tool::blur
+                : (mosaic_is_blur_ && blur_available
+                       ? Tool::blur
+                       : Tool::mosaic);
         const bool switching_on = active_tool_ != target;
         active_tool_ = switching_on ? target : Tool::none;
+        selected_annotation_idx_ = -1;
     } else if (id == L"watermark") {
         const bool switching_on = active_tool_ != Tool::watermark;
         active_tool_ = switching_on ? Tool::watermark : Tool::none;
+        selected_annotation_idx_ = -1;
         if (switching_on && active_color_ == RGB(245, 34, 45)) {
             active_color_ = RGB(255, 150, 150);
         }
     } else if (const Tool tool = tool_from_id(id); tool != Tool::none) {
         const bool switching_on = active_tool_ != tool;
         active_tool_ = switching_on ? tool : Tool::none;
+        selected_annotation_idx_ = -1;
         if (switching_on && tool == Tool::highlight && active_color_ == RGB(245, 34, 45)) {
             active_color_ = RGB(250, 219, 20);
         }
@@ -1067,7 +1179,7 @@ void OverlaySession::apply_watermark() {
     if (selection_.empty()) {
         return;
     }
-    discard_redo();
+    record_annotation_change();
     std::erase_if(annotations_, [](const Annotation& annotation) {
         return annotation.tool == Tool::watermark;
     });
@@ -1079,7 +1191,11 @@ void OverlaySession::apply_watermark() {
     annotation.text = watermark_text_.empty() ? L"Air Screenshot" : watermark_text_;
     annotation.color = active_color_;
     annotation.width = active_text_size_;
-    annotation.alpha = std::clamp(static_cast<int>(std::lround(watermark_opacity_ * 255.0 / 100.0)), 16, 220);
+    annotation.alpha = std::clamp(
+        static_cast<int>(
+            std::lround(watermark_opacity_ * 255.0 / 100.0)),
+        0,
+        255);
     annotation.text_style = active_text_style_;
     annotations_.push_back(std::move(annotation));
     finish_annotation();
@@ -1094,28 +1210,225 @@ void OverlaySession::finish_annotation() {
     invalidate_all();
 }
 
-void OverlaySession::undo() {
-    if (!annotations_.empty()) {
-        redo_.push_back(std::move(annotations_.back()));
-        annotations_.pop_back();
-        invalidate_all();
+void OverlaySession::record_annotation_change() {
+    if (annotation_transaction_before_) {
+        mark_annotation_transaction_changed();
+        return;
     }
+    annotation_history_.record(annotations_);
+    mark_annotation_visual_changed();
+}
+
+void OverlaySession::mark_annotation_visual_changed() noexcept {
+    if (annotation_revision_ == std::numeric_limits<std::uint64_t>::max()) {
+        annotation_revision_ = 1;
+    } else {
+        ++annotation_revision_;
+    }
+}
+
+void OverlaySession::begin_annotation_transaction() {
+    if (annotation_transaction_before_) {
+        return;
+    }
+    annotation_transaction_before_ = annotations_;
+    annotation_transaction_changed_ = false;
+}
+
+void OverlaySession::mark_annotation_transaction_changed() noexcept {
+    if (annotation_transaction_before_) {
+        annotation_transaction_changed_ = true;
+        mark_annotation_visual_changed();
+    }
+}
+
+void OverlaySession::commit_annotation_transaction() {
+    if (!annotation_transaction_before_) {
+        return;
+    }
+    if (annotation_transaction_changed_) {
+        annotation_history_.record(std::move(*annotation_transaction_before_));
+    }
+    annotation_transaction_before_.reset();
+    annotation_transaction_changed_ = false;
+}
+
+void OverlaySession::cancel_annotation_transaction() {
+    if (!annotation_transaction_before_) {
+        return;
+    }
+    if (annotation_transaction_changed_) {
+        annotations_ = std::move(*annotation_transaction_before_);
+        mark_annotation_visual_changed();
+    }
+    annotation_transaction_before_.reset();
+    annotation_transaction_changed_ = false;
+}
+
+void OverlaySession::sync_active_style_from_selected() {
+    if (selected_annotation_idx_ < 0 ||
+        selected_annotation_idx_ >= static_cast<int>(annotations_.size())) {
+        return;
+    }
+    const Annotation& annotation =
+        annotations_[static_cast<std::size_t>(selected_annotation_idx_)];
+    if (tool_supports_color(annotation.tool)) {
+        active_color_ = annotation.color;
+    }
+    if (tool_supports_width(annotation.tool)) {
+        active_width_ = annotation.width;
+    }
+    if (annotation.tool == Tool::text) {
+        active_text_size_ = nearest_text_size(annotation.width);
+        active_text_style_ = annotation.text_style;
+    } else if (annotation.tool == Tool::highlight) {
+        active_highlight_alpha_ = std::clamp(annotation.alpha, 24, 192);
+    } else if (annotation.tool == Tool::mosaic ||
+               annotation.tool == Tool::blur) {
+        mosaic_is_blur_ = annotation.tool == Tool::blur;
+        mosaic_is_rect_ = annotation.points.empty();
+        mosaic_strength_ = std::clamp(annotation.alpha, 0, 100);
+    }
+}
+
+void OverlaySession::apply_active_style_to_selected() {
+    if (active_tool_ != Tool::select ||
+        selected_annotation_idx_ < 0 ||
+        selected_annotation_idx_ >= static_cast<int>(annotations_.size())) {
+        return;
+    }
+
+    const std::size_t index =
+        static_cast<std::size_t>(selected_annotation_idx_);
+    Annotation updated = annotations_[index];
+    if (tool_supports_color(updated.tool)) {
+        updated.color = active_color_;
+    }
+    if (tool_supports_width(updated.tool)) {
+        updated.width = active_width_;
+    }
+    if (updated.tool == Tool::text) {
+        updated.width = active_text_size_;
+        updated.text_style = active_text_style_;
+    } else if (updated.tool == Tool::highlight) {
+        updated.alpha = active_highlight_alpha_;
+    } else if (updated.tool == Tool::mosaic ||
+               updated.tool == Tool::blur) {
+        updated.tool = mosaic_is_blur_ ? Tool::blur : Tool::mosaic;
+        updated.alpha = mosaic_strength_;
+    }
+
+    const Annotation& current = annotations_[index];
+    const bool changed =
+        updated.tool != current.tool ||
+        updated.color != current.color ||
+        updated.width != current.width ||
+        updated.alpha != current.alpha ||
+        updated.text_style != current.text_style;
+    if (!changed) {
+        return;
+    }
+    record_annotation_change();
+    annotations_[index] = std::move(updated);
+    build_toolbar();
+    build_sub_toolbar();
+    invalidate_all();
+}
+
+void OverlaySession::edit_selected_text(HWND source) {
+    if (active_tool_ != Tool::select ||
+        selected_annotation_idx_ < 0 ||
+        selected_annotation_idx_ >= static_cast<int>(annotations_.size()) ||
+        annotations_[static_cast<std::size_t>(selected_annotation_idx_)].tool !=
+            Tool::text) {
+        return;
+    }
+    if (prompt_window_ && IsWindow(prompt_window_)) {
+        SetForegroundWindow(prompt_window_);
+        return;
+    }
+
+    const std::size_t index =
+        static_cast<std::size_t>(selected_annotation_idx_);
+    const Annotation existing = annotations_[index];
+    const POINT position{
+        selection_.left + existing.start.x,
+        selection_.top + existing.start.y,
+    };
+    const bool is_light = should_use_light_theme(request_.config.theme);
+    prompt_window_ = show_text_prompt(
+        source,
+        position,
+        existing.color,
+        existing.width,
+        is_light,
+        [this, index](std::optional<std::wstring> text) {
+            prompt_window_ = nullptr;
+            if (done_ || !text || text->empty() ||
+                index >= annotations_.size() ||
+                annotations_[index].tool != Tool::text ||
+                annotations_[index].text == *text) {
+                return;
+            }
+            record_annotation_change();
+            annotations_[index].text = std::move(*text);
+            selected_annotation_idx_ = static_cast<int>(index);
+            sync_active_style_from_selected();
+            build_toolbar();
+            build_sub_toolbar();
+            invalidate_all();
+        },
+        existing.text);
+}
+
+void OverlaySession::undo() {
+    cancel_annotation_transaction();
+    if (annotation_history_.undo(annotations_)) {
+        renumber_serial_annotations(annotations_);
+        selected_annotation_idx_ = -1;
+        mark_annotation_visual_changed();
+    }
+    build_toolbar();
+    build_sub_toolbar();
+    invalidate_all();
 }
 
 void OverlaySession::redo() {
-    if (!redo_.empty()) {
-        annotations_.push_back(std::move(redo_.back()));
-        redo_.pop_back();
-        invalidate_all();
+    cancel_annotation_transaction();
+    if (annotation_history_.redo(annotations_)) {
+        renumber_serial_annotations(annotations_);
+        selected_annotation_idx_ = -1;
+        mark_annotation_visual_changed();
     }
-}
-
-void OverlaySession::discard_redo() {
-    redo_.clear();
+    build_toolbar();
+    build_sub_toolbar();
+    invalidate_all();
 }
 
 Bitmap OverlaySession::original_selection() const {
     return compose_selection(monitors_, selection_);
+}
+
+const Bitmap& OverlaySession::cached_rendered_selection() const {
+    const bool same_selection =
+        selection_.left == rendered_selection_cache_bounds_.left &&
+        selection_.top == rendered_selection_cache_bounds_.top &&
+        selection_.right == rendered_selection_cache_bounds_.right &&
+        selection_.bottom == rendered_selection_cache_bounds_.bottom;
+    if (!rendered_selection_cache_.valid() ||
+        rendered_selection_cache_revision_ != annotation_revision_ ||
+        !same_selection) {
+        Bitmap next =
+            render_annotations(original_selection(), annotations_, request_.config);
+        if (next.valid()) {
+            rendered_selection_cache_ = std::move(next);
+            rendered_selection_cache_revision_ = annotation_revision_;
+            rendered_selection_cache_bounds_ = selection_;
+        } else {
+            rendered_selection_cache_ = {};
+        }
+    }
+    return rendered_selection_cache_;
 }
 
 Bitmap render_annotations(Bitmap result,
@@ -1188,7 +1501,12 @@ Bitmap render_annotations(Bitmap result,
                         block_size);
                 } else {
                     for (const POINT point : annotation.points) {
-                        pixelate_circle(result, point, 14, block_size);
+                        const int radius =
+                            std::max(
+                                5,
+                                static_cast<int>(
+                                    annotation.width * 3.5F));
+                        pixelate_circle(result, point, radius, block_size);
                     }
                 }
             } else if (annotation.tool == Tool::blur) {
@@ -1327,9 +1645,25 @@ Bitmap render_annotations(Bitmap result,
 
         const int pen_width =
             std::clamp(static_cast<int>(std::lround(annotation.width)), 1, 1024);
-        OwnedGdiObject pen(CreatePen(PS_SOLID, pen_width, annotation.color));
+        LOGBRUSH pen_brush{};
+        pen_brush.lbStyle = BS_SOLID;
+        pen_brush.lbColor = annotation.color;
+        HPEN native_pen = ExtCreatePen(
+            PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
+            static_cast<DWORD>(pen_width),
+            &pen_brush,
+            0,
+            nullptr);
+        if (!native_pen) {
+            native_pen = CreatePen(PS_SOLID, pen_width, annotation.color);
+        }
+        OwnedGdiObject pen(native_pen);
         SelectedObject selected_pen(dc.get(), pen.get());
-        if (!pen.get() || !selected_pen.valid()) {
+        SelectedObject selected_hollow_brush(
+            dc.get(),
+            GetStockObject(NULL_BRUSH));
+        if (!pen.get() || !selected_pen.valid() ||
+            !selected_hollow_brush.valid()) {
             return {};
         }
         SetTextColor(dc.get(), annotation.color);
@@ -1359,7 +1693,26 @@ Bitmap render_annotations(Bitmap result,
                        annotation.end.y - static_cast<int>(std::sin(angle + offset) * length));
             }
         } else if (annotation.tool == Tool::pen) {
-            draw_polyline(dc.get(), annotation.points);
+            if (annotation.points.size() == 1) {
+                const int radius = std::max(1, (pen_width + 1) / 2);
+                OwnedGdiObject point_brush(
+                    CreateSolidBrush(annotation.color));
+                SelectedObject selected_point_brush(
+                    dc.get(),
+                    point_brush.get());
+                if (!point_brush.get() || !selected_point_brush.valid()) {
+                    return {};
+                }
+                const POINT point = annotation.points.front();
+                Ellipse(
+                    dc.get(),
+                    point.x - radius,
+                    point.y - radius,
+                    point.x + radius + 1,
+                    point.y + radius + 1);
+            } else {
+                draw_polyline(dc.get(), annotation.points);
+            }
         }
     }
     if (!sync_from_dib()) {
@@ -1370,18 +1723,22 @@ Bitmap render_annotations(Bitmap result,
 }
 
 Bitmap OverlaySession::rendered_selection() const {
-    return render_annotations(original_selection(), annotations_, request_.config);
+    return cached_rendered_selection();
 }
 
 void OverlaySession::complete_clipboard() {
     Bitmap rendered = rendered_selection();
     if (rendered.empty()) {
-        finish({ExitCode::operation_failed, L"无法生成截图图像。"});
+        show_output_error(nullptr, L"无法生成截图图像。截图和标注仍会保留，您可以调整后重试。");
         return;
     }
     std::wstring error;
     if (!copy_bitmap_to_clipboard(rendered, &error)) {
-        finish({ExitCode::operation_failed, std::move(error)});
+        show_output_error(
+            nullptr,
+            error.empty()
+                ? L"无法复制到剪贴板。截图和标注仍会保留，您可以重试或改为保存文件。"
+                : error + L"\n\n截图和标注仍会保留，您可以重试或改为保存文件。");
         return;
     }
     finish({ExitCode::success, L"截图已复制到剪贴板。"});
@@ -1413,12 +1770,16 @@ void OverlaySession::complete_file(std::wstring_view requested_path, HWND owner)
     }
     Bitmap rendered = rendered_selection();
     if (rendered.empty()) {
-        finish({ExitCode::operation_failed, L"无法生成截图图像。"});
+        show_output_error(owner, L"无法生成截图图像。截图和标注仍会保留，您可以调整后重试。");
         return;
     }
     std::wstring error;
     if (!save_png(rendered, *path, &error)) {
-        finish({ExitCode::operation_failed, std::move(error)});
+        show_output_error(
+            owner,
+            error.empty()
+                ? L"无法保存截图。截图和标注仍会保留，您可以重新选择保存位置。"
+                : error + L"\n\n截图和标注仍会保留，您可以重新选择保存位置。");
         return;
     }
     RegionResult result{ExitCode::success, L"截图已保存。"};
@@ -1428,30 +1789,166 @@ void OverlaySession::complete_file(std::wstring_view requested_path, HWND owner)
 
 void OverlaySession::complete_ocr() {
     if (!request_.config.ocr_enabled) {
-        finish({ExitCode::module_unavailable, L"OCR 模块已关闭。"});
+        show_output_error(nullptr, L"OCR 模块已关闭。您可以在设置中启用后重试。");
         return;
     }
-    const OcrOutput output = recognize_text(original_selection(), request_.config);
-    if (!output.ok) {
-        finish({ExitCode::operation_failed, output.error});
+    if (ocr_running_) {
         return;
     }
+
+    if (request_.copy_ocr && !pending_ocr_text_.empty()) {
+        std::wstring error;
+        if (!copy_text_to_clipboard(pending_ocr_text_, &error)) {
+            show_output_error(
+                nullptr,
+                (error.empty() ? L"无法复制识别结果。" : error) +
+                    std::wstring(L"\n\n识别结果仍会保留，再次点击 OCR 可重试复制。"));
+            return;
+        }
+        RegionResult result{ExitCode::success, std::wstring(strings::ocr_success)};
+        result.text = std::move(pending_ocr_text_);
+        finish(std::move(result));
+        return;
+    }
+
+    Bitmap bitmap = original_selection();
+    if (bitmap.empty()) {
+        show_output_error(nullptr, L"无法生成 OCR 图像。截图和标注仍会保留，您可以调整选区后重试。");
+        return;
+    }
+
+    const AppConfig config = request_.config;
+    const HWND notification_window = modal_owner();
+    {
+        std::scoped_lock lock(ocr_mutex_);
+        ocr_completion_.reset();
+    }
+    ocr_running_ = true;
+    ocr_cancelling_ = false;
+    invalidate_all();
+
+    try {
+        ocr_thread_ = std::jthread(
+            [this,
+             bitmap = std::move(bitmap),
+             config,
+             notification_window](std::stop_token stop_token) mutable {
+                OcrOutput output;
+                try {
+                    output = recognize_text(bitmap, config, stop_token);
+                } catch (const std::exception& exception) {
+                    output = {
+                        false,
+                        {},
+                        L"OCR 识别异常：" + from_utf8(exception.what()),
+                    };
+                } catch (...) {
+                    output = {false, {}, L"OCR 识别发生未知异常。"};
+                }
+
+                OcrCompletion completion{
+                    std::move(output),
+                    stop_token.stop_requested(),
+                };
+                {
+                    std::scoped_lock lock(ocr_mutex_);
+                    ocr_completion_ = std::move(completion);
+                }
+                if (notification_window && IsWindow(notification_window)) {
+                    PostMessageW(
+                        notification_window,
+                        kOverlayOcrCompletedMessage,
+                        0,
+                        0);
+                }
+            });
+    } catch (const std::exception& exception) {
+        ocr_running_ = false;
+        ocr_cancelling_ = false;
+        show_output_error(
+            nullptr,
+            L"无法启动后台 OCR：" + from_utf8(exception.what()));
+    } catch (...) {
+        ocr_running_ = false;
+        ocr_cancelling_ = false;
+        show_output_error(nullptr, L"无法启动后台 OCR。");
+    }
+}
+
+void OverlaySession::cancel_ocr() {
+    if (!ocr_running_) {
+        return;
+    }
+    ocr_cancelling_ = true;
+    if (ocr_thread_.joinable()) {
+        ocr_thread_.request_stop();
+    }
+    invalidate_all();
+}
+
+void OverlaySession::handle_ocr_completion() {
+    std::optional<OcrCompletion> completion;
+    {
+        std::scoped_lock lock(ocr_mutex_);
+        if (!ocr_completion_) {
+            return;
+        }
+        completion = std::move(ocr_completion_);
+        ocr_completion_.reset();
+    }
+    if (ocr_thread_.joinable()) {
+        ocr_thread_.join();
+    }
+    ocr_running_ = false;
+    ocr_cancelling_ = false;
+
+    if (done_ || completion->cancelled) {
+        invalidate_all();
+        return;
+    }
+    if (!completion->output.ok) {
+        show_output_error(
+            nullptr,
+            completion->output.error.empty()
+                ? L"OCR 识别失败。截图和标注仍会保留，您可以重试。"
+                : completion->output.error +
+                      L"\n\n截图和标注仍会保留，您可以重试。");
+        return;
+    }
+
     if (request_.copy_ocr) {
         std::wstring error;
-        if (!copy_text_to_clipboard(output.text, &error)) {
-            finish({ExitCode::operation_failed, std::move(error)});
+        if (!copy_text_to_clipboard(completion->output.text, &error)) {
+            pending_ocr_text_ = std::move(completion->output.text);
+            show_output_error(
+                nullptr,
+                (error.empty() ? L"无法复制识别结果。" : error) +
+                    std::wstring(L"\n\n识别结果仍会保留，再次点击 OCR 可重试复制。"));
             return;
         }
     }
     RegionResult result{ExitCode::success, request_.copy_ocr ? std::wstring(strings::ocr_success) : L"OCR 完成。"};
-    result.text = output.text;
+    result.text = std::move(completion->output.text);
     finish(std::move(result));
+}
+
+void OverlaySession::stop_ocr_worker() {
+    if (ocr_thread_.joinable()) {
+        ocr_thread_.request_stop();
+        ocr_thread_.join();
+    }
+    {
+        std::scoped_lock lock(ocr_mutex_);
+        ocr_completion_.reset();
+    }
+    ocr_running_ = false;
+    ocr_cancelling_ = false;
 }
 
 void OverlaySession::complete_pin() {
     Bitmap rendered = rendered_selection();
     if (rendered.empty()) {
-        finish({ExitCode::operation_failed, L"无法生成贴图图像。"});
+        show_output_error(nullptr, L"无法生成贴图图像。截图和标注仍会保留，您可以调整后重试。");
         return;
     }
     RegionResult result{ExitCode::success, L"贴图已创建。"};
@@ -1481,9 +1978,22 @@ void OverlaySession::complete_scroll(HWND source) {
 }
 
 void OverlaySession::run_scroll_capture(HWND source) {
+    const auto restore_overlay =
+        [this, source](std::wstring_view message) {
+            for (const auto& window : windows_) {
+                if (window && window->hwnd() && IsWindow(window->hwnd())) {
+                    ShowWindow(window->hwnd(), SW_SHOWNOACTIVATE);
+                    window->invalidate();
+                }
+            }
+            DwmFlush();
+            show_output_error(source, message);
+        };
+
     Bitmap first_frame = capture_rect(selection_);
     if (first_frame.empty()) {
-        finish({ExitCode::operation_failed, L"长截图初始化失败。"});
+        restore_overlay(
+            L"长截图初始化失败。已返回当前选区，您可以调整后重试。");
         return;
     }
 
@@ -1491,9 +2001,29 @@ void OverlaySession::run_scroll_capture(HWND source) {
     active->last_frame = first_frame;
     active->stitcher = std::make_unique<ScrollStitcher>(std::move(first_frame));
     if (!active->stitcher->valid()) {
-        finish({ExitCode::operation_failed, L"长截图选区过大或初始化失败。"});
+        restore_overlay(
+            L"长截图选区过大或初始化失败。已返回当前选区，您可以缩小选区后重试。");
         return;
     }
+    const POINT selection_center{
+        selection_.left + selection_.width() / 2,
+        selection_.top + selection_.height() / 2,
+    };
+    HWND target = WindowFromPoint(selection_center);
+    target = target ? GetAncestor(target, GA_ROOT) : nullptr;
+    DWORD target_process_id = 0;
+    if (target) {
+        GetWindowThreadProcessId(target, &target_process_id);
+        if (target_process_id == GetCurrentProcessId() ||
+            target == GetDesktopWindow() ||
+            !IsWindowVisible(target) ||
+            IsIconic(target)) {
+            target = nullptr;
+            target_process_id = 0;
+        }
+    }
+    active->target_window = target;
+    active->target_process_id = target_process_id;
 
     HINSTANCE instance = GetModuleHandleW(nullptr);
     active->border_window = create_scroll_border_window(instance, source, selection_);
@@ -1506,7 +2036,8 @@ void OverlaySession::run_scroll_capture(HWND source) {
         if (active->border_window) {
             DestroyWindow(active->border_window);
         }
-        finish({ExitCode::operation_failed, L"无法创建长截图控制窗口。"});
+        restore_overlay(
+            L"无法创建长截图控制窗口。已返回当前选区，您可以重试。");
         return;
     }
     std::wstring progress = std::format(L"{} px", active->stitcher->height());
@@ -1521,58 +2052,251 @@ void OverlaySession::capture_scroll_frame() {
 
     ActiveScrollCapture& active = *scroll_capture_;
     active.processing = true;
-    const HWND control = active.control_window;
-    CaptureWindowHider hidden_windows(active.border_window, control);
-    Bitmap new_frame = capture_rect(selection_);
-    hidden_windows.restore();
-
-    if (new_frame.empty()) {
-        ++active.consecutive_failures;
-    } else {
-        const ScrollResult detected =
-            detect_scroll(active.last_frame, new_frame, active.locked_direction);
-        if (detected.status() == ScrollResult::Status::unchanged) {
-            active.consecutive_failures = 0;
-        } else if (detected.status() == ScrollResult::Status::mismatch) {
-            ++active.consecutive_failures;
-        } else if (active.locked_direction != 0 &&
-                   detected.direction != active.locked_direction) {
-            active.paused = true;
-            active.pause_text = L"反向暂停";
-        } else {
-            if (active.locked_direction == 0) {
-                active.locked_direction = detected.direction;
-            }
-            const StitchStatus status =
-                detected.direction > 0
-                    ? active.stitcher->append(new_frame, detected.offset)
-                    : active.stitcher->prepend(new_frame, detected.offset);
-            if (status == StitchStatus::success) {
-                active.last_frame = std::move(new_frame);
-                active.consecutive_failures = 0;
-            } else if (status == StitchStatus::limit_reached) {
-                active.paused = true;
-                active.pause_text = L"已达上限";
-            } else {
-                active.paused = true;
-                active.pause_text =
-                    status == StitchStatus::allocation_failed ? L"内存不足" : L"拼接已暂停";
-            }
-        }
+    if (active.frame_worker.joinable()) {
+        active.frame_worker.join();
+    }
+    {
+        std::scoped_lock lock(active.frame_mutex);
+        active.frame_completion.reset();
     }
 
-    if (!active.paused && active.consecutive_failures >= 4) {
+    ActiveScrollCapture* const active_ptr = &active;
+    const RectI selection = selection_;
+    const int locked_direction = active.locked_direction;
+    const HWND notification_window = modal_owner();
+    try {
+        active.frame_worker = std::jthread(
+            [active_ptr,
+             selection,
+             locked_direction,
+             notification_window](std::stop_token stop_token) {
+                ScrollFrameCompletion completion;
+                try {
+                    if (stop_token.stop_requested()) {
+                        completion.status = ScrollFrameStatus::cancelled;
+                    } else {
+                        bool target_matches = true;
+                        if (active_ptr->target_window) {
+                            DWORD process_id = 0;
+                            GetWindowThreadProcessId(
+                                active_ptr->target_window,
+                                &process_id);
+                            const HWND foreground = GetForegroundWindow();
+                            const HWND foreground_root =
+                                foreground
+                                    ? GetAncestor(foreground, GA_ROOT)
+                                    : nullptr;
+                            target_matches =
+                                IsWindow(active_ptr->target_window) &&
+                                IsWindowVisible(active_ptr->target_window) &&
+                                !IsIconic(active_ptr->target_window) &&
+                                process_id ==
+                                    active_ptr->target_process_id &&
+                                foreground_root ==
+                                    active_ptr->target_window;
+                        }
+                        if (!target_matches) {
+                            completion.status =
+                                ScrollFrameStatus::target_changed;
+                        } else {
+                            Bitmap new_frame = capture_rect(selection);
+                            if (new_frame.empty()) {
+                                completion.status =
+                                    ScrollFrameStatus::capture_failed;
+                            } else if (stop_token.stop_requested()) {
+                                completion.status =
+                                    ScrollFrameStatus::cancelled;
+                            } else {
+                                const ScrollResult detected =
+                                    detect_scroll(
+                                        active_ptr->last_frame,
+                                        new_frame,
+                                        locked_direction);
+                                completion.direction =
+                                    detected.direction;
+                                if (detected.status() ==
+                                    ScrollResult::Status::unchanged) {
+                                    completion.status =
+                                        ScrollFrameStatus::unchanged;
+                                } else if (
+                                    detected.status() ==
+                                    ScrollResult::Status::mismatch) {
+                                    completion.status =
+                                        ScrollFrameStatus::mismatch;
+                                } else if (
+                                    locked_direction != 0 &&
+                                    detected.direction !=
+                                        locked_direction) {
+                                    completion.status =
+                                        ScrollFrameStatus::
+                                            reverse_direction;
+                                } else {
+                                    const StitchStatus status =
+                                        detected.direction > 0
+                                            ? active_ptr->stitcher->append(
+                                                  new_frame,
+                                                  detected.offset)
+                                            : active_ptr->stitcher->prepend(
+                                                  new_frame,
+                                                  detected.offset);
+                                    if (status ==
+                                        StitchStatus::success) {
+                                        active_ptr->last_frame =
+                                            std::move(new_frame);
+                                        completion.status =
+                                            ScrollFrameStatus::stitched;
+                                    } else if (
+                                        status ==
+                                        StitchStatus::limit_reached) {
+                                        completion.status =
+                                            ScrollFrameStatus::
+                                                stitch_limit;
+                                    } else if (
+                                        status ==
+                                        StitchStatus::
+                                            allocation_failed) {
+                                        completion.status =
+                                            ScrollFrameStatus::
+                                                stitch_allocation_failed;
+                                    } else {
+                                        completion.status =
+                                            ScrollFrameStatus::
+                                                stitch_failed;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    completion.stitched_height =
+                        active_ptr->stitcher->height();
+                } catch (...) {
+                    completion.status =
+                        ScrollFrameStatus::
+                            stitch_allocation_failed;
+                }
+                {
+                    std::scoped_lock lock(active_ptr->frame_mutex);
+                    active_ptr->frame_completion =
+                        std::move(completion);
+                }
+                if (notification_window &&
+                    IsWindow(notification_window)) {
+                    PostMessageW(
+                        notification_window,
+                        kOverlayScrollFrameCompletedMessage,
+                        0,
+                        0);
+                }
+            });
+    } catch (...) {
+        active.processing = false;
+        active.paused = true;
+        active.pause_text = L"后台采集失败";
+        if (active.control_window &&
+            IsWindow(active.control_window)) {
+            KillTimer(
+                active.control_window,
+                kScrollCaptureTimer);
+            SetWindowTextW(
+                active.control_window,
+                active.pause_text.c_str());
+        }
+    }
+}
+
+void OverlaySession::handle_scroll_frame_completion() {
+    if (!scroll_capture_) {
+        return;
+    }
+    ActiveScrollCapture& active = *scroll_capture_;
+    std::optional<ScrollFrameCompletion> completion;
+    {
+        std::scoped_lock lock(active.frame_mutex);
+        if (!active.frame_completion) {
+            return;
+        }
+        completion = std::move(active.frame_completion);
+        active.frame_completion.reset();
+    }
+    if (active.frame_worker.joinable()) {
+        active.frame_worker.join();
+    }
+    active.processing = false;
+    if (done_ ||
+        completion->status == ScrollFrameStatus::cancelled) {
+        return;
+    }
+
+    switch (completion->status) {
+        case ScrollFrameStatus::unchanged:
+            active.consecutive_failures = 0;
+            break;
+        case ScrollFrameStatus::capture_failed:
+        case ScrollFrameStatus::mismatch:
+            ++active.consecutive_failures;
+            break;
+        case ScrollFrameStatus::target_changed:
+            active.paused = true;
+            active.pause_text = L"目标已切换";
+            break;
+        case ScrollFrameStatus::reverse_direction:
+            active.paused = true;
+            active.pause_text = L"反向暂停";
+            break;
+        case ScrollFrameStatus::stitched:
+            if (active.locked_direction == 0) {
+                active.locked_direction = completion->direction;
+            }
+            active.consecutive_failures = 0;
+            break;
+        case ScrollFrameStatus::stitch_limit:
+            active.paused = true;
+            active.pause_text = L"已达上限";
+            break;
+        case ScrollFrameStatus::stitch_allocation_failed:
+            active.paused = true;
+            active.pause_text = L"内存不足";
+            break;
+        case ScrollFrameStatus::stitch_failed:
+            active.paused = true;
+            active.pause_text = L"拼接已暂停";
+            break;
+        case ScrollFrameStatus::cancelled:
+            break;
+    }
+    if (!active.paused &&
+        active.consecutive_failures >= 4) {
         active.paused = true;
         active.pause_text = L"匹配暂停";
     }
 
+    const HWND control = active.control_window;
     if (control && IsWindow(control)) {
         if (active.paused) {
             KillTimer(control, kScrollCaptureTimer);
         }
         const std::wstring progress =
-            active.paused ? active.pause_text : std::format(L"{} px", active.stitcher->height());
+            active.paused
+                ? active.pause_text
+                : std::format(
+                      L"{} px",
+                      completion->stitched_height);
         SetWindowTextW(control, progress.c_str());
+    }
+}
+
+void OverlaySession::stop_scroll_worker() {
+    if (!scroll_capture_) {
+        return;
+    }
+    ActiveScrollCapture& active = *scroll_capture_;
+    if (active.frame_worker.joinable()) {
+        active.frame_worker.request_stop();
+        active.frame_worker.join();
+    }
+    {
+        std::scoped_lock lock(active.frame_mutex);
+        active.frame_completion.reset();
     }
     active.processing = false;
 }
@@ -1584,17 +2308,36 @@ void OverlaySession::finish_scroll_capture(bool cancelled) {
     if (scroll_capture_->control_window && IsWindow(scroll_capture_->control_window)) {
         KillTimer(scroll_capture_->control_window, kScrollCaptureTimer);
     }
+    stop_scroll_worker();
     if (cancelled) {
         destroy_scroll_windows();
         finish({ExitCode::user_cancelled, L"长截图已取消。"});
         return;
     }
 
+    const auto rearm_output = [this](std::wstring_view status) {
+        if (!scroll_capture_) {
+            return;
+        }
+        scroll_capture_->paused = true;
+        scroll_capture_->pause_text = status;
+        scroll_capture_->control_state.finished = false;
+        scroll_capture_->control_state.cancelled = false;
+        if (scroll_capture_->control_window &&
+            IsWindow(scroll_capture_->control_window)) {
+            SetWindowTextW(
+                scroll_capture_->control_window,
+                scroll_capture_->pause_text.c_str());
+        }
+    };
+
     Bitmap stitched;
     const StitchStatus materialized = scroll_capture_->stitcher->materialize(stitched);
-    destroy_scroll_windows();
     if (materialized != StitchStatus::success || stitched.empty()) {
-        finish({ExitCode::operation_failed, L"长截图合并失败。"});
+        rearm_output(L"合并失败");
+        show_output_error(
+            scroll_capture_->control_window,
+            L"长截图合并失败。当前拼接内容仍会保留，您可以重试或取消。");
         return;
     }
     std::wstring error;
@@ -1602,7 +2345,7 @@ void OverlaySession::finish_scroll_capture(bool cancelled) {
         request_.action == RegionAction::file ||
         _wcsicmp(request_.config.default_output.c_str(), L"file") == 0;
     if (save_to_file) {
-        HWND owner = windows_.empty() ? nullptr : windows_.front()->hwnd();
+        HWND owner = scroll_capture_->control_window;
         std::optional<std::filesystem::path> path;
         if (request_.action == RegionAction::file && !request_.path.empty()) {
             path = resolve_output_path(request_.path);
@@ -1616,24 +2359,37 @@ void OverlaySession::finish_scroll_capture(bool cancelled) {
             leave_modal();
         }
         if (!path) {
-            finish({ExitCode::user_cancelled, L"已取消保存。"});
+            rearm_output(L"等待保存");
             return;
         }
         if (!save_png(stitched, *path, &error)) {
-            finish({ExitCode::operation_failed, std::move(error)});
+            rearm_output(L"保存失败");
+            show_output_error(
+                owner,
+                (error.empty() ? L"长截图保存失败。" : error) +
+                    std::wstring(
+                        L"\n\n当前拼接内容仍会保留，再次点击“完成”可重试。"));
             return;
         }
         RegionResult result{ExitCode::success, L"长截图已保存。"};
         result.path = path->wstring();
         result.bitmap = std::move(stitched);
+        destroy_scroll_windows();
         finish(std::move(result));
     } else {
         if (!copy_bitmap_to_clipboard(stitched, &error)) {
-            finish({ExitCode::operation_failed, std::move(error)});
+            const HWND owner = scroll_capture_->control_window;
+            rearm_output(L"复制失败");
+            show_output_error(
+                owner,
+                (error.empty() ? L"长截图复制失败。" : error) +
+                    std::wstring(
+                        L"\n\n当前拼接内容仍会保留，再次点击“完成”可重试。"));
             return;
         }
         RegionResult result{ExitCode::success, L"长截图已复制到剪贴板。"};
         result.bitmap = std::move(stitched);
+        destroy_scroll_windows();
         finish(std::move(result));
     }
 }
@@ -1642,6 +2398,7 @@ void OverlaySession::destroy_scroll_windows() {
     if (!scroll_capture_) {
         return;
     }
+    stop_scroll_worker();
     const HWND border = scroll_capture_->border_window;
     const HWND control = scroll_capture_->control_window;
     scroll_capture_->border_window = nullptr;
@@ -1656,6 +2413,36 @@ void OverlaySession::destroy_scroll_windows() {
     }
     if (border && IsWindow(border)) DestroyWindow(border);
     scroll_capture_.reset();
+}
+
+HWND OverlaySession::modal_owner(HWND preferred) const noexcept {
+    if (preferred && IsWindow(preferred)) {
+        return preferred;
+    }
+    for (const auto& window : windows_) {
+        if (window && window->hwnd() && IsWindow(window->hwnd())) {
+            return window->hwnd();
+        }
+    }
+    return nullptr;
+}
+
+void OverlaySession::show_output_error(
+    HWND owner,
+    std::wstring_view message) {
+    if (done_) {
+        return;
+    }
+    enter_modal();
+    MessageBoxW(
+        modal_owner(owner),
+        std::wstring(message).c_str(),
+        kAppName,
+        MB_OK | MB_ICONERROR);
+    leave_modal();
+    if (!done_) {
+        invalidate_all();
+    }
 }
 
 void OverlaySession::enter_modal() noexcept {
@@ -1684,6 +2471,7 @@ void OverlaySession::finish(RegionResult result) {
     if (done_) {
         return;
     }
+    stop_ocr_worker();
     result_ = std::move(result);
     if (result_.bounds.empty()) {
         result_.bounds = selection_;

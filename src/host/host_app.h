@@ -32,6 +32,9 @@ public:
     [[nodiscard]] bool is_transient() const noexcept {
         return transient_.load(std::memory_order_acquire);
     }
+    [[nodiscard]] bool update_helper_launched() const noexcept {
+        return update_helper_launched_;
+    }
 
 private:
     enum class UiMode {
@@ -45,6 +48,9 @@ private:
     struct RequestContext {
         std::uint64_t id{};
         std::wstring request;
+        std::optional<Command> command;
+        std::wstring parse_error;
+        bool waits_for_user_input{};
         std::promise<std::wstring> response;
         std::atomic_bool completed{false};
         std::atomic_bool cancelled{false};
@@ -83,9 +89,18 @@ private:
         std::wstring* error = nullptr);
     [[nodiscard]] bool commit_config(AppConfig next, std::wstring* error = nullptr);
     void prune_closed_pin_windows();
+    [[nodiscard]] std::optional<std::wstring> pin_capacity_error(
+        const Bitmap& bitmap) const;
+    void suspend_pins_for_capture();
+    void resume_pins_after_capture();
     void add_tray();
     void remove_tray();
-    void register_hotkeys();
+    [[nodiscard]] bool validate_hotkeys(
+        const AppConfig& config,
+        std::wstring* error = nullptr) const;
+    [[nodiscard]] bool register_hotkeys(
+        std::wstring* error = nullptr,
+        bool notify_failure = true);
     void unregister_hotkeys();
     void show_tray_menu();
     bool show_settings();
@@ -93,7 +108,14 @@ private:
     void notify(std::wstring_view title, std::wstring_view message);
     void capture_region(RegionAction action);
     [[nodiscard]] std::optional<std::wstring> sync_region_config(const RegionResult& result);
+    void schedule_update_check(DWORD fallback_delay_ms);
+    void toggle_automatic_updates();
+    [[nodiscard]] bool persist_update_config(
+        AppConfig next,
+        bool report_failure);
     void check_for_updates(bool user_triggered);
+    void activate_pending_update();
+    [[nodiscard]] bool can_restart_for_update();
     std::wstring handle_pipe_request(
         HWND dispatch_window,
         std::wstring_view request,
@@ -101,6 +123,7 @@ private:
     void dispatch_request(std::shared_ptr<RequestContext> request);
     void dispatch_command(const CaptureCommand& command, std::shared_ptr<RequestContext> request);
     void dispatch_command(const OcrCommand& command, std::shared_ptr<RequestContext> request);
+    void dispatch_command(const PinCommand& command, std::shared_ptr<RequestContext> request);
     void dispatch_command(const ModuleCommand& command, std::shared_ptr<RequestContext> request);
     void dispatch_command(const AppCommand& command, std::shared_ptr<RequestContext> request);
     void start_region_capture(RegionRequest region,
@@ -114,6 +137,8 @@ private:
     void maybe_shutdown_idle_transient();
     void promote_to_persistent();
     [[nodiscard]] CommandResponse busy_response() const;
+    [[nodiscard]] CommandResponse pin_clipboard();
+    int restore_pin_interaction();
     CommandResponse output_bitmap(
         Bitmap bitmap,
         CaptureOutput output,
@@ -127,6 +152,7 @@ private:
     HWND window_{};
     std::atomic_bool transient_{false};
     bool tray_added_{};
+    UINT taskbar_created_message_{};
     bool shutdown_complete_{};
     HANDLE mutex_{};
     UiMode mode_{UiMode::idle};
@@ -155,6 +181,9 @@ private:
     std::atomic_bool update_running_{false};
     std::mutex update_mutex_;
     std::optional<UpdateCompletion> update_completion_;
+    bool update_ready_{};
+    bool update_helper_launched_{};
+    bool pins_suspended_for_capture_{};
     std::vector<std::unique_ptr<PinWindow>> pin_windows_;
 };
 

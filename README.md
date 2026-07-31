@@ -5,12 +5,22 @@ Air Screenshot 是一个面向 Windows 10 2004+ x64 的轻量原生截图工具�
 ## 能力
 
 - 区域、活动窗口、显示器、全虚拟桌面截图和长截图
+- 优先使用 Windows 合成捕获，受限环境自动回退到 GDI
 - 剪贴板与 PNG 输出
-- 可关闭的轻量标注、贴图和可切换 OCR 引擎
-- 托盘、开机自启、全局快捷键与便携 CLI
-- 便携 EXE 静默下载更新，退出或下次启动时应用
+- 可二次选择编辑的轻量标注，以及截图、剪贴板图像、图片文件、颜色或文本贴图
+- 可独立隐藏的托盘图标、开机自启、全局快捷键与便携 CLI
+- 跟随浅色/深色及系统高对比度的原生 Direct2D 设置界面
+- 便携 EXE 定时静默下载更新，空闲时可立即重启应用
 
 常驻宿主只负责托盘、快捷键和命名管道；截图缓冲、Direct2D 资源和 OCR 引擎都在使用时创建。
+
+保存、复制或 OCR 失败时，当前选区和标注不会关闭，可以直接重试。OCR 在后台执行，识别过程中按 `Esc` 可取消。长截图会锁定开始时的目标窗口；切换到其他窗口时自动暂停，保存或复制失败时保留已拼接内容。
+
+标注完成后切到“选择”工具，可拖动对象；矩形、椭圆和路径类对象可用控制柄缩放，线段和箭头可直接拖动端点，按住 `Shift` 拖角点保持宽高比。`Ctrl + D` 或 `Ctrl + 拖动` 可克隆，方向键微调，`Shift + 方向键` 每次移动 10 像素，`Delete` 删除；这些操作均支持撤销/重做。为避免底图与标注错位，存在标注时截图选区会保持锁定，撤销或清空标注后可再次调整选区。
+
+托盘菜单的“贴出剪贴板”可将剪贴板图像、复制的本地图片文件、`#RRGGBB` / `rgb(...)` 颜色或普通文本直接变成桌面贴图；也可以在设置的“快捷键”页为它单独设置全局热键，默认留空以避免占用其他软件的粘贴快捷键。已有贴图在下一次截图时会临时隐藏，截图结束或取消后恢复。
+
+贴图支持滚轮缩放、`Ctrl + 滚轮` 调整透明度、`0` 适应屏幕、`1` 恢复 100%、`T` 切换置顶、`R` / `L` 旋转、`H` / `V` 翻转、`Ctrl + C` 复制和右键菜单。开启“鼠标穿透”后，可从托盘菜单选择“恢复所有贴图交互”，或运行 `AirScreenshot.exe pin restore`；隐藏托盘图标时会禁止进入不可恢复的穿透状态。显示器断开、分辨率或工作区变化时，跑到屏幕外的贴图会自动移回可操作范围。
 
 ## 下载与使用
 
@@ -42,13 +52,16 @@ Windows SmartScreen 可能提示未知发布者。这是因为当前使用自签
 
 ## 自动更新
 
-程序启动后会读取 GitHub Pages 上的 `latest.json`。发现新版本时：
+常驻程序启动 90 秒后进行首次自动检查，成功后最多每天检查一次，临时失败时 6 小时后重试。托盘菜单可以关闭自动检查，也可以随时手动检查；手动检查不受定时限制。
+
+检查前会先确认当前 EXE 所在目录可安全替换，再读取 GitHub Pages 上的 `latest.json`。发现新版本时：
 
 1. 静默下载新版 EXE 到 `%LOCALAPPDATA%\AirScreenshot\updates`。
 2. 校验文件大小、SHA256、Authenticode 完整性和内置发布证书指纹。
-3. 用户退出程序时完成替换；若程序仍在运行，则下次启动先更新再继续运行。
+3. 手动检查完成且程序空闲时，可从托盘选择“立即重启并更新”；有截图、设置、贴图或请求正在处理时保留当前工作。
+4. 未立即重启时，用户退出程序后完成替换；若替换需要等待，则下次启动先更新再继续运行。
 
-当前 EXE 所在目录不可写时不会请求提权，也不会覆盖原文件；程序会提示将 EXE 移到普通可写目录。
+当前 EXE 所在目录不可写时不会联网下载、请求提权或覆盖原文件；自动检查只对同一路径提示一次，手动检查始终给出结果，并建议将 EXE 移到普通可写目录。
 
 ## 发布
 
@@ -88,13 +101,15 @@ GitHub Release 包含 EXE、PDB、OCR manifest 及其签名、SHA256 校验和�
 ```powershell
 .\AirScreenshot.exe capture region
 .\AirScreenshot.exe capture screen --monitor all --output clipboard
+.\AirScreenshot.exe pin clipboard
+.\AirScreenshot.exe pin restore
 .\AirScreenshot.exe ocr region --copy
 .\AirScreenshot.exe module list
 .\AirScreenshot.exe app settings
 .\AirScreenshot.exe --help
 ```
 
-无参数双击时启动托盘宿主。CLI 主要面向 PowerShell 与 Windows Terminal；程序保持 GUI 子系统，因此双击不会弹出黑色控制台窗口。
+无参数双击时启动后台宿主。设置中的“显示系统托盘图标”可以只隐藏图标而保留截图快捷键；隐藏后可运行 `.\AirScreenshot.exe app settings` 重新打开设置并恢复。CLI 主要面向 PowerShell 与 Windows Terminal；程序保持 GUI 子系统，因此双击不会弹出黑色控制台窗口。
 
 ## OCR
 
@@ -104,13 +119,14 @@ OCR 使用本地 RapidOCR / PP-OCRv5 / ONNX Runtime CPU 推理，设置中可切
 - 高精度 OCR：使用 PP-OCRv5 server 模型，适合小字、大图和复杂背景。
 - 兼容 OCR：使用 PP-OCRv4 mobile 模型，作为稳定兼容档。
 
-首次使用前在设置中点击“下载依赖”。程序先用内置公钥验证版本化清单的 ECDSA 签名、有效期和防回滚序列，再校验每个文件的大小和 SHA256，最后安装到 `%LOCALAPPDATA%\AirScreenshot\ocr\rapidocr-onnx`。OCR 识别在独立的自身子进程中完成；模型和 ONNX Runtime 不会常驻托盘进程，单次识别超时会停止子进程。
+首次使用前在设置中点击“下载依赖”。程序先用内置公钥验证版本化清单的 ECDSA 签名、有效期和防回滚序列，再校验每个文件的大小和 SHA256，最后安装到 `%LOCALAPPDATA%\AirScreenshot\ocr\rapidocr-onnx`。OCR 识别由后台任务启动独立的自身子进程；模型和 ONNX Runtime 不会常驻托盘进程，单次识别超时或用户取消时会停止子进程。
 
 源码发布前可运行 `.\scripts\prepare-ocr-dependencies.ps1` 准备 `dist\ocr-dependencies\rapidocr-onnx`，再由 `.\scripts\package.ps1` 基于真实文件生成签名下载清单。普通本地构建如需走完整 OCR 入口，必须通过 `-OcrManifestKeyId` 和 `-OcrManifestPublicKeyHex` 嵌入与清单匹配的公钥。离线部署可以把 payload 放到程序同目录的 `ocr\rapidocr-onnx`，但目录内还必须包含同一发布的签名元数据：将 `ocr-dependencies.json` 保存为 `.airshot-manifest.json`，将其 `.sig` sidecar 保存为 `.airshot-manifest.sig`；裸依赖目录会被拒绝。
 
 ## 限制
 
-- GDI `BitBlt` 无法捕获受保护内容和部分硬件覆盖层。
+- 受 DRM 或系统保护的内容仍不能捕获。
+- Windows 合成捕获被系统策略、远程会话或图形设备限制时会回退到 GDI；回退路径仍可能遗漏部分硬件覆盖层，HDR 内容会按普通 BGRA 图像输出。
 - 不包含录屏、历史记录或通用第三方插件系统。
 - 本地 OCR 依赖需要单独下载；未安装依赖时会提示到设置中下载。
 - 旧 MSIX 版本不会自动迁移配置，需要用户自行卸载。

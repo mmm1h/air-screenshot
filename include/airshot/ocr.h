@@ -82,7 +82,10 @@ private:
     std::filesystem::path root_;
 };
 
-[[nodiscard]] OcrOutput recognize_text(const Bitmap& bitmap, const AppConfig& config);
+[[nodiscard]] OcrOutput recognize_text(
+    const Bitmap& bitmap,
+    const AppConfig& config,
+    std::stop_token stop_token = {});
 [[nodiscard]] std::wstring join_ocr_lines(std::span<const std::wstring> lines);
 [[nodiscard]] std::filesystem::path rapid_ocr_dependency_directory();
 [[nodiscard]] std::uint64_t ocr_minimum_sequence() noexcept;

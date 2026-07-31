@@ -1,4 +1,5 @@
 #include "airshot/ocr.h"
+#include "airshot/config.h"
 #include "ocr_test_support.h"
 
 #include <windows.h>
@@ -754,6 +755,23 @@ void test_manifest_verifier_cli_contract() {
         L"OCR manifest verifier fails closed for unreadable input");
 }
 
+void test_pre_requested_recognition_cancellation() {
+    airshot::Bitmap bitmap(1, 1);
+    airshot::AppConfig config;
+    std::stop_source cancellation;
+    cancellation.request_stop();
+    const airshot::OcrOutput output =
+        airshot::recognize_text(
+            bitmap,
+            config,
+            cancellation.get_token());
+    expect(
+        !output.ok &&
+            output.error.find(L"取消") !=
+                std::wstring::npos,
+        L"OCR recognition honors pre-requested cancellation");
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -793,6 +811,7 @@ int wmain(int argc, wchar_t** argv) {
     test_sequence_high_watermark();
     test_locked_path_share_contract();
     test_manifest_verifier_cli_contract();
+    test_pre_requested_recognition_cancellation();
     if (failures == 0) {
         std::wcout << L"All OCR tests passed.\n";
     }

@@ -83,7 +83,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     }
     airshot::HostApp app(instance, transient, std::move(transient_launch_nonce));
     const int result = app.run();
-    if (!app.is_transient()) {
+    if (!app.is_transient() && !app.update_helper_launched()) {
         std::wstring update_error;
         if (!airshot::launch_pending_update(false, &update_error) && !update_error.empty()) {
             MessageBoxW(nullptr, update_error.c_str(), airshot::kAppName, MB_OK | MB_ICONERROR);

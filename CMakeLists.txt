@@ -160,6 +160,8 @@ endfunction()
 add_library(airshot_core STATIC
     src/core/bitmap.cpp
     src/core/capture.cpp
+    src/core/capture_modern.cpp
+    src/core/clipboard.cpp
     src/core/command.cpp
     src/core/common.cpp
     src/core/config.cpp
@@ -174,7 +176,10 @@ add_library(airshot_core STATIC
     src/core/overlay_session_actions.cpp
     src/core/overlay_session_interaction.cpp
     src/core/overlay_window.cpp
+    src/core/pin_layout.cpp
     src/core/portable.cpp
+    src/core/ui_theme.cpp
+    src/core/update_policy.cpp
 )
 
 target_include_directories(airshot_core PUBLIC include)
@@ -202,8 +207,10 @@ target_link_libraries(airshot_core PUBLIC
     bcrypt
     crypt32
     d2d1
+    d3d11
     dwrite
     dwmapi
+    dxgi
     imm32
     ole32
     shell32
@@ -223,6 +230,11 @@ configure_file(
     src/host/AirScreenshot.exe.manifest.in
     "${AIRSHOT_GENERATED_DIRECTORY}/AirScreenshot.exe.manifest"
     @ONLY
+)
+set_property(
+    SOURCE src/host/resources.rc
+    APPEND PROPERTY OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/host/app.ico"
 )
 
 add_executable(AirScreenshot WIN32
@@ -251,6 +263,9 @@ if(BUILD_TESTING)
     airshot_add_test(airshot_tests tests/test_main.cpp)
     airshot_add_test(airshot_clipboard_tests tests/test_clipboard.cpp)
     set_tests_properties(airshot_clipboard_tests PROPERTIES SKIP_RETURN_CODE 77)
+    airshot_add_test(airshot_capture_tests tests/test_capture.cpp)
+    target_include_directories(airshot_capture_tests PRIVATE src/core)
+    set_tests_properties(airshot_capture_tests PROPERTIES SKIP_RETURN_CODE 77)
     airshot_add_test(airshot_command_config_tests tests/test_command_config.cpp)
     airshot_add_test(airshot_image_pipeline_tests tests/test_image_pipeline.cpp)
     target_include_directories(airshot_image_pipeline_tests PRIVATE src/core)
@@ -262,6 +277,7 @@ if(BUILD_TESTING)
     target_include_directories(airshot_portable_tests PRIVATE src/core)
     airshot_add_test(airshot_scroll_tests tests/test_scroll.cpp)
     target_link_libraries(airshot_scroll_tests PRIVATE comctl32)
+    airshot_add_test(airshot_update_policy_tests tests/test_update_policy.cpp)
 endif()
 
 install(TARGETS AirScreenshot RUNTIME DESTINATION .)

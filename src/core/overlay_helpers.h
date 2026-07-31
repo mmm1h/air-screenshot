@@ -22,7 +22,8 @@ void show_rgb_picker_popup(HWND parent_hwnd,
                            COLORREF initial_color,
                            const RectI& button_bounds,
                            const RectI& monitor_bounds,
-                           std::function<void(COLORREF)> on_color_changed);
+                           std::function<void(COLORREF)> on_color_changed,
+                           std::function<void()> on_closed = {});
 
 using TextPromptCompletion = std::function<void(std::optional<std::wstring>)>;
 
@@ -31,7 +32,8 @@ using TextPromptCompletion = std::function<void(std::optional<std::wstring>)>;
                                     COLORREF color,
                                     float text_size,
                                     bool is_light_theme,
-                                    TextPromptCompletion completion);
+                                    TextPromptCompletion completion,
+                                    std::wstring initial_text = {});
 [[nodiscard]] std::optional<std::wstring> prompt_text(HWND owner, POINT position, COLORREF color, float text_size, bool is_light_theme);
 
 struct ScrollControlState {

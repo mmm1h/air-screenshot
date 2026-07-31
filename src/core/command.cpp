@@ -302,6 +302,7 @@ std::wstring help_text() {
   AirScreenshot.exe capture window [--output clipboard|file] [--path <路径>] [--json]
   AirScreenshot.exe capture screen [--monitor all|primary|cursor|编号] [--output clipboard|file] [--path <路径>] [--json]
   AirScreenshot.exe ocr region [--copy] [--json]
+  AirScreenshot.exe pin clipboard|restore [--json]
   AirScreenshot.exe module list [--json]
   AirScreenshot.exe module enable|disable <annotation|ocr|shell> [--json]
   AirScreenshot.exe app start|stop|status|settings [--json]
@@ -454,6 +455,25 @@ ParsedCli parse_cli(std::span<const std::wstring> arguments) {
         return request_result(command, json_output);
     }
 
+    if (is_option(command_arguments[0], L"pin")) {
+        if (command_arguments.size() != 2) {
+            return error_result(
+                L"pin 需要且只接受 clipboard 或 restore。",
+                json_output);
+        }
+        PinCommand command;
+        if (is_option(command_arguments[1], L"clipboard")) {
+            command.action = PinAction::clipboard;
+        } else if (is_option(command_arguments[1], L"restore")) {
+            command.action = PinAction::restore_interaction;
+        } else {
+            return error_result(
+                L"未知 pin 操作；只支持 clipboard 或 restore。",
+                json_output);
+        }
+        return request_result(command, json_output);
+    }
+
     if (is_option(command_arguments[0], L"module")) {
         if (command_arguments.size() < 2) {
             return error_result(L"module 需要 list、enable 或 disable。", json_output);
@@ -549,6 +569,14 @@ std::wstring command_to_json(
                     request.SetNamedValue(L"command", JsonValue::CreateStringValue(L"ocr"));
                     request.SetNamedValue(L"mode", JsonValue::CreateStringValue(L"region"));
                     request.SetNamedValue(L"copy", JsonValue::CreateBooleanValue(value.copy));
+                } else if constexpr (std::is_same_v<Value, PinCommand>) {
+                    request.SetNamedValue(L"command", JsonValue::CreateStringValue(L"pin"));
+                    request.SetNamedValue(
+                        L"action",
+                        JsonValue::CreateStringValue(
+                            value.action == PinAction::clipboard
+                                ? L"clipboard"
+                                : L"restore"));
                 } else if constexpr (std::is_same_v<Value, ModuleCommand>) {
                     request.SetNamedValue(L"command", JsonValue::CreateStringValue(L"module"));
                     request.SetNamedValue(L"action", JsonValue::CreateStringValue(module_action_name(value.action)));
@@ -701,6 +729,31 @@ std::optional<Command> command_from_json(std::wstring_view json_text, std::wstri
             return Command{command};
         }
 
+        if (command_name == L"pin") {
+            if (!has_only_keys(
+                    request,
+                    {L"v", L"json", L"command", L"action", L"launchNonce"})) {
+                set_command_error(error, L"pin 请求包含未知字段。");
+                return std::nullopt;
+            }
+            std::wstring action;
+            if (!read_required_string(request, L"action", action, error)) {
+                return std::nullopt;
+            }
+            PinCommand command;
+            if (action == L"clipboard") {
+                command.action = PinAction::clipboard;
+            } else if (action == L"restore") {
+                command.action = PinAction::restore_interaction;
+            } else {
+                set_command_error(
+                    error,
+                    L"pin.action 不是受支持的枚举值。");
+                return std::nullopt;
+            }
+            return Command{command};
+        }
+
         if (command_name == L"module") {
             if (!has_only_keys(request, {L"v", L"json", L"command", L"action", L"module", L"launchNonce"})) {
                 set_command_error(error, L"module 请求包含未知字段。");
@@ -788,6 +841,13 @@ std::wstring_view default_error_type(ExitCode code) noexcept {
         case ExitCode::ipc_failed: return L"ipc_failed";
     }
     return L"internal";
+}
+
+bool command_waits_for_user_input(const Command& command) noexcept {
+    if (const auto* capture = std::get_if<CaptureCommand>(&command)) {
+        return capture->mode == CaptureMode::region;
+    }
+    return std::holds_alternative<OcrCommand>(command);
 }
 
 std::wstring response_to_json(const CommandResponse& response) {

@@ -153,6 +153,26 @@ try {
         throw "便携版版本命令失败：$($version.Output) $($version.Error)"
     }
 
+    # Exercise the updater rejection path before this fixture deliberately
+    # writes and repairs the user's Run entry. Combining rapid persistence,
+    # relocation, and updater-like launches on one unsigned test copy can
+    # trigger behavior-based antivirus heuristics even though no replacement
+    # is attempted in this negative test.
+    $replacementTarget = Join-Path $temporary "replacement.exe"
+    Set-Content -LiteralPath $replacementTarget -Value "old"
+    $replacementHash = (Get-FileHash $replacementTarget -Algorithm SHA256).Hash
+    $unusedProcessId = [int]::MaxValue
+    while (Get-Process -Id $unusedProcessId -ErrorAction SilentlyContinue) {
+        $unusedProcessId--
+    }
+    $updater = Start-Process -FilePath $firstExecutable `
+        -ArgumentList @("--apply-update", "`"$replacementTarget`"", "$unusedProcessId", "no-restart") `
+        -Wait -PassThru -WindowStyle Hidden
+    if ($updater.ExitCode -eq 0 -or
+        (Get-FileHash $replacementTarget -Algorithm SHA256).Hash -ne $replacementHash) {
+        throw "便携更新替换器未拒绝不存在的非零父进程。"
+    }
+
     $start = Invoke-AirScreenshot $firstExecutable @("app", "start")
     if ($start.ExitCode -ne 0) { throw "宿主启动失败：$($start.Error)" }
     Start-Sleep -Milliseconds 500
@@ -221,21 +241,6 @@ try {
     Set-ItemProperty -LiteralPath $movedExecutable -Name IsReadOnly -Value $false
     if ($readOnlyCheck.ExitCode -eq 0) {
         throw "便携更新未拒绝只读目标。"
-    }
-
-    $replacementTarget = Join-Path $temporary "replacement.exe"
-    Set-Content -LiteralPath $replacementTarget -Value "old"
-    $replacementHash = (Get-FileHash $replacementTarget -Algorithm SHA256).Hash
-    $unusedProcessId = [int]::MaxValue
-    while (Get-Process -Id $unusedProcessId -ErrorAction SilentlyContinue) {
-        $unusedProcessId--
-    }
-    $updater = Start-Process -FilePath $movedExecutable `
-        -ArgumentList @("--apply-update", "`"$replacementTarget`"", "$unusedProcessId", "no-restart") `
-        -Wait -PassThru -WindowStyle Hidden
-    if ($updater.ExitCode -eq 0 -or
-        (Get-FileHash $replacementTarget -Algorithm SHA256).Hash -ne $replacementHash) {
-        throw "便携更新替换器未拒绝不存在的非零父进程。"
     }
 
     Write-Host "便携版烟测通过。"

@@ -28,6 +28,9 @@ LRESULT CALLBACK edit_subclass_proc(HWND window, UINT message, WPARAM w_param, L
     (void)ref_data;
     if (message == WM_KEYDOWN) {
         if (w_param == VK_RETURN) {
+            if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+                return DefSubclassProc(window, message, w_param, l_param);
+            }
             bool composing = false;
             if (HIMC himc = ImmGetContext(window)) {
                 LONG size = ImmGetCompositionStringW(himc, GCS_COMPSTR, nullptr, 0);
@@ -62,13 +65,15 @@ LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPA
     }
     if (message == WM_CREATE) {
         int text_height = static_cast<int>(state->text_size);
-        int window_height = text_height + 14;
-        int window_width = 300;
+        int window_height = std::clamp(text_height * 3 + 28, 96, 220);
+        int window_width = 360;
 
         state->edit = CreateWindowExW(0,
                                       L"EDIT",
-                                      L"",
-                                      WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                                      state->text.c_str(),
+                                      WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+                                          ES_MULTILINE | ES_AUTOVSCROLL |
+                                          ES_WANTRETURN,
                                       6,
                                       6,
                                       window_width - 12,
@@ -79,6 +84,7 @@ LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPA
                                       nullptr);
 
         SetWindowSubclass(state->edit, edit_subclass_proc, 1, 0);
+        SendMessageW(state->edit, EM_SETLIMITTEXT, 4096, 0);
 
         state->font = CreateFontW(
             -text_height,
@@ -93,6 +99,7 @@ LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPA
             L"Microsoft YaHei"
         );
         SendMessageW(state->edit, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), TRUE);
+        SendMessageW(state->edit, EM_SETSEL, 0, -1);
 
         state->bg_brush = CreateSolidBrush(state->is_light_theme ? RGB(255, 255, 255) : RGB(0x1c, 0x1e, 0x22));
 
@@ -179,7 +186,8 @@ HWND show_text_prompt(HWND owner,
                       COLORREF color,
                       float text_size,
                       bool is_light_theme,
-                      TextPromptCompletion completion) {
+                      TextPromptCompletion completion,
+                      std::wstring initial_text) {
     static std::once_flag class_flag;
     std::call_once(class_flag, [] {
         WNDCLASSEXW window_class{sizeof(window_class)};
@@ -201,10 +209,11 @@ HWND show_text_prompt(HWND owner,
     state->text_size = text_size;
     state->is_light_theme = is_light_theme;
     state->completion = std::move(completion);
+    state->text = std::move(initial_text);
 
     int text_height = static_cast<int>(text_size);
-    int window_height = text_height + 14;
-    int window_width = 300;
+    int window_height = std::clamp(text_height * 3 + 28, 96, 220);
+    int window_width = 360;
 
     int x = position.x;
     int y = position.y;

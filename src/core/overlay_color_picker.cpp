@@ -32,6 +32,7 @@ struct RGBPickerState {
     HWND parent_window{};
     COLORREF current_color{};
     std::function<void(COLORREF)> on_color_changed;
+    std::function<void()> on_closed;
 
     HWND slider_r{};
     HWND slider_g{};
@@ -321,15 +322,24 @@ LRESULT CALLBACK RGBColorPickerProc(HWND hwnd, UINT msg, WPARAM w_param, LPARAM 
             break;
         }
         case WM_DESTROY: {
+            auto on_closed = std::move(state->on_closed);
             delete state;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            if (on_closed) {
+                on_closed();
+            }
             break;
         }
     }
     return DefWindowProcW(hwnd, msg, w_param, l_param);
 }
 
-void show_rgb_picker_popup(HWND parent_hwnd, COLORREF initial_color, const RectI& button_bounds, const RectI& monitor_bounds, std::function<void(COLORREF)> on_color_changed) {
+void show_rgb_picker_popup(HWND parent_hwnd,
+                           COLORREF initial_color,
+                           const RectI& button_bounds,
+                           const RectI& monitor_bounds,
+                           std::function<void(COLORREF)> on_color_changed,
+                           std::function<void()> on_closed) {
     static std::once_flag picker_class_flag;
     std::call_once(picker_class_flag, [] {
         INITCOMMONCONTROLSEX icex{sizeof(icex)};
@@ -366,6 +376,7 @@ void show_rgb_picker_popup(HWND parent_hwnd, COLORREF initial_color, const RectI
     state->parent_window = parent_hwnd;
     state->current_color = initial_color;
     state->on_color_changed = std::move(on_color_changed);
+    state->on_closed = std::move(on_closed);
     state->creation_time = GetTickCount();
 
     HWND picker_hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -382,7 +393,11 @@ void show_rgb_picker_popup(HWND parent_hwnd, COLORREF initial_color, const RectI
         UpdateWindow(picker_hwnd);
         SetFocus(picker_hwnd);
     } else {
+        auto failed_closed = std::move(state->on_closed);
         delete state;
+        if (failed_closed) {
+            failed_closed();
+        }
     }
 }
 

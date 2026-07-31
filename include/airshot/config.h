@@ -2,6 +2,8 @@
 
 #include "airshot/common.h"
 
+#include <cstdint>
+
 namespace airshot {
 
 inline constexpr std::wstring_view kOcrEngineRapidV5Fast = L"rapidocr-v5-fast";
@@ -19,12 +21,17 @@ struct AppConfig {
     bool annotation_locked_tool{true};
     bool ocr_enabled{true};
     bool shell_enabled{true};
+    bool tray_icon_visible{true};
     bool start_at_login{false};
     bool global_ocr_enabled{false};
     bool notifications_enabled{false};
+    bool automatic_updates_enabled{true};
+    std::int64_t last_update_check_unix{};
+    std::wstring warned_update_target;
     std::wstring ocr_engine{std::wstring(kDefaultOcrEngine)};
     std::wstring ocr_download_url{kDefaultOcrDependencyManifestUrl};
     std::wstring capture_hotkey{L"Ctrl+Alt+A"};
+    std::wstring pin_hotkey;
     std::wstring global_ocr_hotkey{L"Ctrl+Alt+O"};
     std::wstring capture_ocr_shortcut{L"Shift+C"};
     std::wstring default_output{L"clipboard"};
@@ -36,7 +43,6 @@ struct AppConfig {
     bool text_font_bold{false};
     bool text_font_italic{false};
     int annotation_highlight_alpha{96};
-    int annotation_next_serial{1};
     std::wstring tool_shortcut_select{L"S"};
     std::wstring tool_shortcut_rectangle{L"R"};
     std::wstring tool_shortcut_ellipse{L"E"};

@@ -4,6 +4,7 @@
 
 #include "airshot/common.h"
 #include "airshot/config.h"
+#include "airshot/ui_theme.h"
 
 #include <d2d1.h>
 #include <dwrite.h>
@@ -45,7 +46,10 @@ struct AboutState {
     std::function<void()> completion;
     POINT mouse_pos{};
     bool is_light_theme{};
+    bool high_contrast{};
     std::wstring theme{L"system"};
+    UiPalette palette{};
+    std::wstring ui_font_family{L"Segoe UI"};
     HWND details_edit{};
     HFONT details_font{};
     HBRUSH edit_bg_brush{};
@@ -61,6 +65,7 @@ struct AboutState {
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> text_grey_brush;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> blue_brush;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> hover_blue_brush;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> accent_text_brush;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> border_brush;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> control_bg_brush;
 
@@ -97,6 +102,14 @@ LRESULT CALLBACK about_details_proc(
 }
 
 void discard_resources(AboutState* state);
+
+COLORREF to_colorref(const D2D1_COLOR_F& color) noexcept {
+    const auto channel = [](float value) {
+        return static_cast<BYTE>(
+            std::lround(std::clamp(value, 0.0F, 1.0F) * 255.0F));
+    };
+    return RGB(channel(color.r), channel(color.g), channel(color.b));
+}
 
 float about_layout_scale(HWND window) noexcept {
     RECT client{};
@@ -189,7 +202,7 @@ void layout_about_children(AboutState* state) {
                              CLIP_DEFAULT_PRECIS,
                              CLEARTYPE_QUALITY,
                              DEFAULT_PITCH | FF_DONTCARE,
-                             L"Microsoft YaHei");
+                             state->ui_font_family.c_str());
     if (font) {
         SendMessageW(state->details_edit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
         if (state->details_font) {
@@ -205,7 +218,7 @@ bool ensure_resources(AboutState* state) {
     }
 
     if (state->window) {
-        BOOL use_dark = !state->is_light_theme;
+        BOOL use_dark = !state->is_light_theme && !state->high_contrast;
         DwmSetWindowAttribute(state->window, 20, &use_dark, sizeof(use_dark));
         DwmSetWindowAttribute(state->window, 19, &use_dark, sizeof(use_dark));
     }
@@ -237,34 +250,30 @@ bool ensure_resources(AboutState* state) {
     const float dpi = 96.0f * about_layout_scale(state->window);
     state->render_target->SetDpi(dpi, dpi);
 
-    // Create Brushes
-    if (state->is_light_theme) {
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xF5F6F7), state->bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x1F2329), state->text_white_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x646A73), state->text_grey_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x0066FF), state->blue_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0x3385FF), state->hover_blue_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xDEE0E3), state->border_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0xFFFFFF), state->control_bg_brush.GetAddressOf());
-    } else {
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(18.0f / 255.0f, 19.0f / 255.0f, 22.0f / 255.0f), state->bg_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(240.0f / 255.0f, 240.0f / 255.0f, 240.0f / 255.0f), state->text_white_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(150.0f / 255.0f, 160.0f / 255.0f, 175.0f / 255.0f), state->text_grey_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(0.0f / 255.0f, 102.0f / 255.0f, 255.0f / 255.0f), state->blue_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(51.0f / 255.0f, 136.0f / 255.0f, 255.0f / 255.0f), state->hover_blue_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(38.0f / 255.0f, 41.0f / 255.0f, 48.0f / 255.0f), state->border_brush.GetAddressOf());
-        state->render_target->CreateSolidColorBrush(D2D1::ColorF(28.0f / 255.0f, 30.0f / 255.0f, 34.0f / 255.0f), state->control_bg_brush.GetAddressOf());
-    }
+    const UiPalette& palette = state->palette;
+    state->render_target->CreateSolidColorBrush(palette.background, state->bg_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.text, state->text_white_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.muted, state->text_grey_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.accent, state->blue_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.accent_hover, state->hover_blue_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.accent_text, state->accent_text_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.border, state->border_brush.GetAddressOf());
+    state->render_target->CreateSolidColorBrush(palette.control, state->control_bg_brush.GetAddressOf());
     if (!state->bg_brush || !state->text_white_brush || !state->text_grey_brush ||
         !state->blue_brush || !state->hover_blue_brush || !state->border_brush ||
-        !state->control_bg_brush) {
+        !state->control_bg_brush || !state->accent_text_brush) {
         return fail();
     }
 
-    // Create Text Formats
-    state->dwrite_factory->CreateTextFormat(L"Microsoft YaHei", nullptr, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 18.0f, L"zh-CN", state->title_format.GetAddressOf());
-    state->dwrite_factory->CreateTextFormat(L"Microsoft YaHei", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"zh-CN", state->text_format.GetAddressOf());
-    state->dwrite_factory->CreateTextFormat(L"Microsoft YaHei", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"zh-CN", state->small_format.GetAddressOf());
+    const std::wstring ui_font_family =
+        preferred_ui_font_family(state->dwrite_factory.Get());
+    if (state->ui_font_family != ui_font_family) {
+        state->ui_font_family = ui_font_family;
+        layout_about_children(state);
+    }
+    state->dwrite_factory->CreateTextFormat(state->ui_font_family.c_str(), nullptr, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 18.0f, L"zh-CN", state->title_format.GetAddressOf());
+    state->dwrite_factory->CreateTextFormat(state->ui_font_family.c_str(), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"zh-CN", state->text_format.GetAddressOf());
+    state->dwrite_factory->CreateTextFormat(state->ui_font_family.c_str(), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"zh-CN", state->small_format.GetAddressOf());
     if (!state->title_format || !state->text_format || !state->small_format) {
         return fail();
     }
@@ -303,6 +312,7 @@ void discard_resources(AboutState* state) {
     state->text_grey_brush.Reset();
     state->blue_brush.Reset();
     state->hover_blue_brush.Reset();
+    state->accent_text_brush.Reset();
     state->border_brush.Reset();
     state->control_bg_brush.Reset();
     state->title_format.Reset();
@@ -315,13 +325,11 @@ void discard_resources(AboutState* state) {
 }
 
 void refresh_about_theme(AboutState* state) {
-    const bool light = should_use_light_theme(state->theme);
-    if (state->is_light_theme == light) {
-        return;
-    }
-    state->is_light_theme = light;
+    state->palette = resolve_ui_palette(state->theme);
+    state->is_light_theme = state->palette.light;
+    state->high_contrast = state->palette.high_contrast;
     discard_resources(state);
-    BOOL use_dark = !light;
+    BOOL use_dark = !state->is_light_theme && !state->high_contrast;
     DwmSetWindowAttribute(state->window, 20, &use_dark, sizeof(use_dark));
     DwmSetWindowAttribute(state->window, 19, &use_dark, sizeof(use_dark));
     InvalidateRect(state->window, nullptr, TRUE);
@@ -342,14 +350,12 @@ void draw_button(AboutState* state, int x1, int y1, int x2, int y2, const wchar_
         state->render_target->DrawRoundedRectangle(rounded, state->border_brush.Get(), 1.0f);
     }
 
-    ID2D1SolidColorBrush* text_brush =
-        state->is_light_theme ? state->control_bg_brush.Get() : state->text_white_brush.Get();
     state->render_target->DrawTextW(
         label,
         static_cast<UINT32>(wcslen(label)),
         state->text_format.Get(),
         rect,
-        text_brush);
+        state->accent_text_brush.Get());
 }
 
 LRESULT CALLBACK about_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_param) {
@@ -408,18 +414,12 @@ LRESULT CALLBACK about_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_
 
         case WM_CTLCOLORSTATIC: {
             HDC hdc = reinterpret_cast<HDC>(w_param);
-            if (state->is_light_theme) {
-                SetTextColor(hdc, RGB(0x1F, 0x23, 0x29));
-                SetBkColor(hdc, RGB(0xFF, 0xFF, 0xFF));
-                if (!state->edit_bg_brush) {
-                    state->edit_bg_brush = CreateSolidBrush(RGB(0xFF, 0xFF, 0xFF));
-                }
-            } else {
-                SetTextColor(hdc, RGB(220, 225, 235));
-                SetBkColor(hdc, RGB(28, 30, 34));
-                if (!state->edit_bg_brush) {
-                    state->edit_bg_brush = CreateSolidBrush(RGB(28, 30, 34));
-                }
+            const COLORREF text_color = to_colorref(state->palette.text);
+            const COLORREF background_color = to_colorref(state->palette.control);
+            SetTextColor(hdc, text_color);
+            SetBkColor(hdc, background_color);
+            if (!state->edit_bg_brush) {
+                state->edit_bg_brush = CreateSolidBrush(background_color);
             }
             return state->edit_bg_brush
                        ? reinterpret_cast<INT_PTR>(state->edit_bg_brush)
@@ -427,10 +427,9 @@ LRESULT CALLBACK about_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_
         }
 
         case WM_SETTINGCHANGE:
+        case WM_SYSCOLORCHANGE:
         case WM_THEMECHANGED: {
-            if (state->theme == L"system") {
-                refresh_about_theme(state);
-            }
+            refresh_about_theme(state);
             return 0;
         }
 
@@ -439,12 +438,7 @@ LRESULT CALLBACK about_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_
             BeginPaint(window, &ps);
             if (ensure_resources(state)) {
                 state->render_target->BeginDraw();
-                // Clear background
-                if (state->is_light_theme) {
-                    state->render_target->Clear(D2D1::ColorF(0xF5F6F7));
-                } else {
-                    state->render_target->Clear(D2D1::ColorF(18.0f / 255.0f, 19.0f / 255.0f, 22.0f / 255.0f));
-                }
+                state->render_target->Clear(state->palette.background);
 
                 // Draw logo
                 if (state->logo_bitmap) {
@@ -589,7 +583,7 @@ HWND show_about_window_async(HWND owner, std::function<void()> completion) {
         window_class.hInstance = GetModuleHandleW(nullptr);
         window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         window_class.hIcon = LoadIconW(window_class.hInstance, MAKEINTRESOURCEW(IDI_APP_ICON));
-        window_class.hbrBackground = CreateSolidBrush(RGB(18, 19, 22));
+        window_class.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
         window_class.lpszClassName = L"AirScreenshot.About";
         RegisterClassExW(&window_class);
     });
@@ -604,7 +598,9 @@ HWND show_about_window_async(HWND owner, std::function<void()> completion) {
     state->owner = owner;
     state->completion = std::move(completion);
     state->theme = config.theme;
-    state->is_light_theme = should_use_light_theme(config.theme);
+    state->palette = resolve_ui_palette(config.theme);
+    state->is_light_theme = state->palette.light;
+    state->high_contrast = state->palette.high_contrast;
     UINT dpi = owner ? GetDpiForWindow(owner) : GetDpiForSystem();
     if (dpi == 0) dpi = 96;
 
@@ -658,7 +654,7 @@ HWND show_about_window_async(HWND owner, std::function<void()> completion) {
         return nullptr;
     }
 
-    BOOL use_dark = !state->is_light_theme;
+    BOOL use_dark = !state->is_light_theme && !state->high_contrast;
     DwmSetWindowAttribute(window, 20, &use_dark, sizeof(use_dark));
     DwmSetWindowAttribute(window, 19, &use_dark, sizeof(use_dark));
     DWORD corner_preference = 2; // DWMWCP_ROUND

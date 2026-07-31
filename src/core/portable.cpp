@@ -4073,6 +4073,16 @@ bool verify_portable_executable(
     }
 }
 
+bool update_target_is_replaceable(std::wstring* error) {
+    clear_error(error);
+    try {
+        return target_directory_is_writable(error);
+    } catch (const std::exception& exception) {
+        set_error(error, from_utf8(exception.what()));
+        return false;
+    }
+}
+
 UpdateStageResult stage_latest_update(std::wstring* message) {
     return stage_latest_update(message, {});
 }

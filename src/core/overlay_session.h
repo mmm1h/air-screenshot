@@ -1,5 +1,6 @@
 #pragma once
 
+#include "overlay_annotation_history.h"
 #include "overlay_types.h"
 #include "overlay_window.h"
 
@@ -12,17 +13,24 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace airshot::overlay_detail {
+
+inline constexpr UINT kOverlayOcrCompletedMessage = WM_APP + 0x131;
+inline constexpr UINT kOverlayScrollFrameCompletedMessage = WM_APP + 0x132;
 
 class OverlaySession {
 public:
@@ -39,6 +47,7 @@ public:
     void on_mouse_up(HWND source, POINT point);
     void on_double_click(POINT point);
     void on_key_down(HWND source, WPARAM key);
+    void on_capture_lost();
     void on_mouse_wheel(short delta);
     void show_quick_menu(HWND hwnd, POINT pt);
     void invalidate_all() const;
@@ -71,9 +80,21 @@ public:
     [[nodiscard]] POINT cursor_pos() const noexcept { return cursor_pos_; }
     [[nodiscard]] bool color_format_hex() const noexcept { return color_format_hex_; }
     [[nodiscard]] bool is_over_toolbar(POINT point) const noexcept;
+    [[nodiscard]] bool is_over_toolbar_drag_handle(POINT point) const noexcept;
+    [[nodiscard]] bool toolbar_dragging() const noexcept { return dragging_toolbar_; }
+    [[nodiscard]] std::uint64_t annotation_revision() const noexcept {
+        return annotation_revision_;
+    }
+    [[nodiscard]] bool annotation_transaction_active() const noexcept {
+        return annotation_transaction_before_.has_value();
+    }
     [[nodiscard]] COLORREF get_pixel_color(int x, int y) const noexcept;
     [[nodiscard]] int snap_coordinate(int value, bool is_x, int threshold = 8) const noexcept;
     [[nodiscard]] bool hit_test_annotation(POINT relative) const;
+    [[nodiscard]] bool ocr_running() const noexcept { return ocr_running_; }
+    [[nodiscard]] std::wstring_view ocr_status_text() const noexcept {
+        return ocr_cancelling_ ? L"正在取消文字识别…" : L"正在识别文字…  按 Esc 取消";
+    }
 
 private:
     void build_toolbar();
@@ -83,21 +104,43 @@ private:
     void apply_watermark();
     void finish_annotation();
     bool erase_annotation_at(POINT relative);
+    void record_annotation_change();
+    void mark_annotation_visual_changed() noexcept;
+    void begin_annotation_transaction();
+    void mark_annotation_transaction_changed() noexcept;
+    void commit_annotation_transaction();
+    void cancel_annotation_transaction();
+    [[nodiscard]] AnnotationHandle selected_annotation_handle_at(
+        POINT point) const noexcept;
+    void reset_annotation_drag_state() noexcept;
+    void duplicate_selected_annotation();
+    void sync_active_style_from_selected();
+    void apply_active_style_to_selected();
+    void edit_selected_text(HWND source);
+    [[nodiscard]] bool cancel_active_interaction(HWND source);
+    void release_capture_if_owned(HWND source) noexcept;
     void undo();
     void redo();
-    void discard_redo();
     Bitmap original_selection() const;
+    [[nodiscard]] const Bitmap& cached_rendered_selection() const;
     Bitmap rendered_selection() const;
     void complete_default(HWND owner);
     void complete_clipboard();
     void complete_file(std::wstring_view requested_path, HWND owner);
     void complete_ocr();
+    void cancel_ocr();
+    void handle_ocr_completion();
+    void stop_ocr_worker();
     void complete_pin();
     void complete_scroll(HWND source);
     void run_scroll_capture(HWND source);
     void capture_scroll_frame();
+    void handle_scroll_frame_completion();
+    void stop_scroll_worker();
     void finish_scroll_capture(bool cancelled);
     void destroy_scroll_windows();
+    [[nodiscard]] HWND modal_owner(HWND preferred = nullptr) const noexcept;
+    void show_output_error(HWND owner, std::wstring_view message);
     void enter_modal() noexcept;
     void leave_modal();
     void deliver_completion();
@@ -115,6 +158,7 @@ private:
     RectI hover_;
     RectI clicked_window_;
     POINT drag_start_{};
+    POINT annotation_anchor_{};
     bool dragging_selection_{};
     bool selection_complete_{};
     bool drawing_annotation_{};
@@ -125,8 +169,22 @@ private:
     Tool active_tool_{Tool::none};
     Annotation preview_;
     std::vector<Annotation> annotations_;
-    std::vector<Annotation> redo_;
+    AnnotationHistory annotation_history_;
+    std::optional<std::vector<Annotation>> annotation_transaction_before_;
+    bool annotation_transaction_changed_{};
+    std::uint64_t annotation_revision_{1};
+    mutable Bitmap rendered_selection_cache_;
+    mutable std::uint64_t rendered_selection_cache_revision_{};
+    mutable RectI rendered_selection_cache_bounds_;
     std::vector<ToolbarButton> toolbar_;
+    bool dragging_toolbar_{};
+    bool dragging_slider_{};
+    std::wstring dragging_slider_id_;
+    int dragging_slider_start_value_{};
+    bool releasing_capture_{};
+    POINT toolbar_drag_start_{};
+    POINT toolbar_drag_origin_{};
+    std::optional<POINT> toolbar_custom_origin_;
 
     DragMode current_drag_mode_{DragMode::none};
     RectI original_selection_;
@@ -145,11 +203,34 @@ private:
     bool color_format_hex_{true};
     int selected_annotation_idx_{-1};
     Annotation original_annotation_;
+    AnnotationHandle active_annotation_handle_{AnnotationHandle::none};
+    int annotation_drag_source_idx_{-1};
+    bool clone_annotation_on_drag_{};
+    bool annotation_drag_clone_created_{};
     bool mosaic_is_blur_{};
     bool mosaic_is_rect_{};
     bool text_size_dropdown_open_{};
     int text_size_hovered_idx_{-1};
     HWND prompt_window_{};
+
+    enum class ScrollFrameStatus {
+        cancelled,
+        capture_failed,
+        target_changed,
+        unchanged,
+        mismatch,
+        reverse_direction,
+        stitched,
+        stitch_limit,
+        stitch_allocation_failed,
+        stitch_failed,
+    };
+
+    struct ScrollFrameCompletion {
+        ScrollFrameStatus status{ScrollFrameStatus::capture_failed};
+        int direction{};
+        int stitched_height{};
+    };
 
     struct ActiveScrollCapture {
         std::unique_ptr<ScrollStitcher> stitcher;
@@ -162,8 +243,24 @@ private:
         bool paused{};
         bool processing{};
         std::wstring pause_text;
+        HWND target_window{};
+        DWORD target_process_id{};
+        std::mutex frame_mutex;
+        std::optional<ScrollFrameCompletion> frame_completion;
+        std::jthread frame_worker;
     };
     std::unique_ptr<ActiveScrollCapture> scroll_capture_;
+
+    struct OcrCompletion {
+        OcrOutput output;
+        bool cancelled{};
+    };
+    std::mutex ocr_mutex_;
+    std::optional<OcrCompletion> ocr_completion_;
+    std::jthread ocr_thread_;
+    std::wstring pending_ocr_text_;
+    bool ocr_running_{};
+    bool ocr_cancelling_{};
 
     friend class OverlayWindow;
 };

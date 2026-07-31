@@ -115,7 +115,7 @@ HWND create_scroll_control_window(HINSTANCE instance, HWND parent, const RectI& 
         );
         if (hwnd) {
             SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
-            ShowWindow(hwnd, SW_SHOW);
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             UpdateWindow(hwnd);
         }
         return hwnd;
@@ -137,9 +137,6 @@ LRESULT CALLBACK scroll_control_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             state->finished = !cancelled;
             state->cancelled = cancelled;
             auto callback = cancelled ? state->on_cancel : state->on_finish;
-            state->on_tick = {};
-            state->on_finish = {};
-            state->on_cancel = {};
             if (callback) {
                 callback();
             }

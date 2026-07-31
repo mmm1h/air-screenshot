@@ -43,6 +43,27 @@ bool has_corrupt_backup(const std::filesystem::path& directory) {
 }
 
 void test_command_contract() {
+    airshot::CaptureCommand interactive_capture;
+    interactive_capture.mode = airshot::CaptureMode::region;
+    expect(
+        airshot::command_waits_for_user_input(interactive_capture),
+        L"region capture is not constrained by the transport operation timeout");
+    airshot::CaptureCommand immediate_capture;
+    immediate_capture.mode = airshot::CaptureMode::screen;
+    expect(
+        !airshot::command_waits_for_user_input(immediate_capture),
+        L"screen capture retains the bounded operation timeout");
+    expect(
+        airshot::command_waits_for_user_input(airshot::OcrCommand{}),
+        L"OCR selection is not constrained by the transport operation timeout");
+    expect(
+        !airshot::command_waits_for_user_input(airshot::PinCommand{}),
+        L"clipboard pinning remains a bounded immediate command");
+    expect(
+        !airshot::command_waits_for_user_input(
+            airshot::AppCommand{airshot::AppAction::settings}),
+        L"settings command completes after opening its window");
+
     const auto normalized = airshot::parse_cli(
         std::vector<std::wstring>{L"MoDuLe", L"EnAbLe", L"ShElL", L"--JsOn"});
     expect(normalized.code == airshot::ExitCode::success && normalized.json,
@@ -62,6 +83,36 @@ void test_command_contract() {
     expect(app.code == airshot::ExitCode::success && app.json &&
                app.request_json.find(LR"("action":"status")") != std::wstring::npos,
            L"app accepts --json and normalizes its action");
+
+    const auto pin = airshot::parse_cli(
+        std::vector<std::wstring>{L"PIN", L"CLIPBOARD", L"--JSON"});
+    const auto* pin_command =
+        pin.command
+            ? std::get_if<airshot::PinCommand>(&*pin.command)
+            : nullptr;
+    expect(
+        pin.code == airshot::ExitCode::success && pin.json &&
+            pin_command &&
+            pin_command->action == airshot::PinAction::clipboard &&
+            pin.request_json.find(LR"("action":"clipboard")") !=
+                std::wstring::npos,
+        L"clipboard pin command has a typed canonical protocol");
+    const auto restore_pin = airshot::parse_cli(
+        std::vector<std::wstring>{L"pin", L"restore"});
+    const auto* restore_pin_command =
+        restore_pin.command
+            ? std::get_if<airshot::PinCommand>(&*restore_pin.command)
+            : nullptr;
+    expect(
+        restore_pin_command &&
+            restore_pin_command->action ==
+                airshot::PinAction::restore_interaction,
+        L"pin interaction can be restored even without a tray icon");
+    expect(
+        airshot::parse_cli(
+            std::vector<std::wstring>{L"pin", L"unknown"})
+                .code == airshot::ExitCode::invalid_arguments,
+        L"pin rejects unknown actions");
 
     const auto help = airshot::parse_cli(std::vector<std::wstring>{L"--help", L"--json"});
     expect(help.local_only && help.json && help.local_text.find(LR"("v":1)") != std::wstring::npos &&
@@ -234,8 +285,10 @@ void test_command_contract() {
 
 void test_config_contract() {
     const airshot::AppConfig fresh;
-    expect(fresh.schema_version == airshot::kCurrentConfigSchemaVersion && !fresh.start_at_login,
-           L"fresh config uses schema 2 with startup disabled");
+    expect(fresh.schema_version == airshot::kCurrentConfigSchemaVersion &&
+               !fresh.start_at_login &&
+               fresh.pin_hotkey.empty(),
+           L"fresh config does not steal an existing system-wide paste shortcut");
 
     const auto legacy = airshot::config_from_json(LR"({"shell":{"enabled":true}})");
     expect(legacy && legacy->schema_version == 1 && legacy->start_at_login,
@@ -258,10 +311,26 @@ void test_config_contract() {
     if (current) {
         airshot::AppConfig edited = *current;
         edited.shell_enabled = false;
+        edited.tray_icon_visible = false;
+        edited.automatic_updates_enabled = false;
+        edited.last_update_check_unix = 1'725'000'000;
+        edited.warned_update_target = LR"(c:\readonly\airscreenshot.exe)";
         const auto serialized = airshot::config_to_json(edited);
         expect(serialized.find(LR"("extension":{"mode":"future"})") != std::wstring::npos &&
-                   serialized.find(LR"("futureFlag":7)") != std::wstring::npos,
-               L"same-schema unknown keys survive a save");
+                   serialized.find(LR"("futureFlag":7)") != std::wstring::npos &&
+                   serialized.find(LR"("trayIconVisible":false)") != std::wstring::npos &&
+                   serialized.find(LR"("automatic":false)") != std::wstring::npos &&
+                   serialized.find(LR"("lastCheckUnix":1725000000)") != std::wstring::npos &&
+                   serialized.find(LR"("warnedTarget":"c:\\readonly\\airscreenshot.exe")") !=
+                       std::wstring::npos,
+                L"same-schema unknown keys survive a save");
+        const auto round_trip = airshot::config_from_json(serialized);
+        expect(round_trip && !round_trip->tray_icon_visible &&
+                   !round_trip->automatic_updates_enabled &&
+                   round_trip->last_update_check_unix == 1'725'000'000 &&
+                   round_trip->warned_update_target ==
+                       LR"(c:\readonly\airscreenshot.exe)",
+               L"update scheduling state round trips through schema 2");
     }
 
     const auto precise_unknown_numbers = airshot::config_from_json(
@@ -315,11 +384,23 @@ void test_config_contract() {
                LR"({"schemaVersion":2,"shell":{"enabled":"false"}})"),
            L"schema 2 rejects a known boolean with the wrong type");
     expect(!airshot::config_from_json(
+               LR"({"schemaVersion":2,"shell":{"trayIconVisible":"false"}})"),
+           L"schema 2 rejects a malformed tray icon visibility flag");
+    expect(!airshot::config_from_json(
                LR"({"schemaVersion":2,"capture":{"theme":"sepia"}})"),
            L"schema 2 rejects an invalid known enum");
     expect(!airshot::config_from_json(
                LR"({"schemaVersion":2,"annotation":{"hiddenTools":["pen",7]}})"),
            L"schema 2 rejects a malformed known string array");
+    expect(!airshot::config_from_json(
+               LR"({"schemaVersion":2,"update":{"automatic":"true"}})"),
+           L"schema 2 rejects a malformed automatic update flag");
+    expect(!airshot::config_from_json(
+               LR"({"schemaVersion":2,"update":{"lastCheckUnix":-1}})"),
+           L"schema 2 rejects a negative update check timestamp");
+    expect(!airshot::config_from_json(
+               LR"({"schemaVersion":2,"update":{"lastCheckUnix":9223372036854775808}})"),
+           L"schema 2 rejects an overflowing update check timestamp");
 
     const auto strict_hotkey = airshot::parse_hotkey(L"Ctrl+Shift+F24");
     expect(strict_hotkey &&
@@ -353,6 +434,18 @@ void test_config_contract() {
            L"config rejects a global capture hotkey without Ctrl, Alt, or Win");
     hotkey_error.clear();
     expect(!airshot::config_from_json(
+               LR"({"schemaVersion":2,"hotkey":{"pin":"F3"}})",
+               &hotkey_error) &&
+               !hotkey_error.empty(),
+           L"config rejects a global pin hotkey without Ctrl, Alt, or Win");
+    hotkey_error.clear();
+    expect(!airshot::config_from_json(
+               LR"({"schemaVersion":2,"hotkey":{"capture":"Ctrl+Alt+A","pin":"Alt+Control+A"}})",
+               &hotkey_error) &&
+               !hotkey_error.empty(),
+           L"config rejects equivalent capture and pin hotkeys");
+    hotkey_error.clear();
+    expect(!airshot::config_from_json(
                LR"({"schemaVersion":2,"hotkey":{"globalOcr":"F2"}})",
                &hotkey_error) &&
                 !hotkey_error.empty(),
@@ -369,6 +462,12 @@ void test_config_contract() {
                &hotkey_error) &&
                !hotkey_error.empty(),
            L"schema 2 rejects equivalent capture and enabled global OCR hotkeys");
+    hotkey_error.clear();
+    expect(!airshot::config_from_json(
+               LR"({"schemaVersion":2,"hotkey":{"pin":"Ctrl+Alt+O","globalOcrEnabled":true,"globalOcr":"Alt+Control+O"}})",
+               &hotkey_error) &&
+               !hotkey_error.empty(),
+           L"schema 2 rejects equivalent pin and enabled global OCR hotkeys");
     hotkey_error.clear();
     expect(!airshot::config_from_json(
                LR"({"schemaVersion":2,"hotkey":{"globalOcrEnabled":false,"globalOcr":"Ctrl+F2junk"}})",

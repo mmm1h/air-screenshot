@@ -1,5 +1,7 @@
 #include "airshot/capture.h"
 
+#include "capture_modern.h"
+
 #include <dwmapi.h>
 
 #include <cstring>
@@ -58,6 +60,14 @@ struct CheckedRect {
         return std::nullopt;
     }
     return static_cast<int>(value);
+}
+
+[[nodiscard]] bool bitmap_matches_rect(
+    const Bitmap& bitmap,
+    const RectI& rect) noexcept {
+    return bitmap.valid() &&
+           bitmap.width == rect.width() &&
+           bitmap.height == rect.height();
 }
 
 class ScreenDc {
@@ -309,7 +319,13 @@ BOOL CALLBACK collect_windows(HWND window, LPARAM context) {
 std::vector<MonitorSnapshot> capture_monitors() {
     auto result = enumerate_monitors();
     for (auto& monitor : result) {
-        monitor.bitmap = capture_with_gdi(monitor.bounds);
+        monitor.bitmap =
+            capture_detail::capture_monitor_modern(monitor.handle);
+        if (!bitmap_matches_rect(
+                monitor.bitmap,
+                monitor.bounds)) {
+            monitor.bitmap = capture_with_gdi(monitor.bounds);
+        }
     }
     return result;
 }
@@ -329,20 +345,41 @@ Bitmap capture_rect(const RectI& rect) {
 
 Bitmap capture_virtual_desktop() {
     const auto bounds = virtual_desktop_bounds();
-    const auto monitors = enumerate_monitors();
+    auto monitors = enumerate_monitors();
     if (!bounds || monitors.empty()) {
         return {};
     }
-    return capture_from_monitors(monitors, *bounds);
+    for (auto& monitor : monitors) {
+        monitor.bitmap =
+            capture_detail::capture_monitor_modern(monitor.handle);
+        if (!bitmap_matches_rect(
+                monitor.bitmap,
+                monitor.bounds)) {
+            monitor.bitmap = capture_with_gdi(monitor.bounds);
+        }
+    }
+    return compose_selection(monitors, *bounds);
 }
 
 std::optional<std::pair<Bitmap, RectI>> capture_active_window() {
     const HWND window = GetForegroundWindow();
-    const auto bounds = window_bounds(window);
+    auto bounds = window_bounds(window);
     if (!bounds) {
         return std::nullopt;
     }
-    Bitmap bitmap = capture_rect(*bounds);
+    Bitmap bitmap = capture_detail::capture_window_modern(window);
+    if (!bitmap.empty() &&
+        (bitmap.width != bounds->width() ||
+         bitmap.height != bounds->height())) {
+        // WGC follows the compositor's capture item size, which can differ
+        // from DWM's extended-frame rectangle by invisible resize borders.
+        // Keep the returned coordinate space aligned with the pixels.
+        bounds->right = bounds->left + bitmap.width;
+        bounds->bottom = bounds->top + bitmap.height;
+    }
+    if (bitmap.empty()) {
+        bitmap = capture_rect(*bounds);
+    }
     if (bitmap.empty()) {
         return std::nullopt;
     }
@@ -394,7 +431,13 @@ std::optional<std::pair<Bitmap, RectI>> capture_monitor(std::wstring_view select
         }
     }
 
-    Bitmap bitmap = capture_with_gdi(monitors[index].bounds);
+    Bitmap bitmap =
+        capture_detail::capture_monitor_modern(monitors[index].handle);
+    if (!bitmap_matches_rect(
+            bitmap,
+            monitors[index].bounds)) {
+        bitmap = capture_with_gdi(monitors[index].bounds);
+    }
     return bitmap.empty() ? std::nullopt
                           : std::optional(std::pair{std::move(bitmap), monitors[index].bounds});
 }

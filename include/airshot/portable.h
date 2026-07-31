@@ -31,6 +31,8 @@ bool sync_portable_startup(bool enabled, std::wstring* error = nullptr);
 [[nodiscard]] std::wstring sha256_file(const std::filesystem::path& path, std::wstring* error = nullptr);
 [[nodiscard]] bool verify_portable_executable(
     const std::filesystem::path& path, const UpdateManifest& manifest, std::wstring* error = nullptr);
+[[nodiscard]] bool update_target_is_replaceable(
+    std::wstring* error = nullptr);
 
 UpdateStageResult stage_latest_update(std::wstring* message = nullptr);
 UpdateStageResult stage_latest_update(

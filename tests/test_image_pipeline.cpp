@@ -42,6 +42,21 @@ void expect(bool condition, std::wstring_view message) {
     return bitmap;
 }
 
+[[nodiscard]] airshot::Bitmap patterned_bitmap(int width, int height) {
+    airshot::Bitmap bitmap(width, height);
+    for (int y = 0; y < height; ++y) {
+        auto row = bitmap.row(y);
+        for (int x = 0; x < width; ++x) {
+            const std::size_t offset = static_cast<std::size_t>(x) * 4;
+            row[offset] = static_cast<std::uint8_t>((x * 31 + y * 7) & 0xFF);
+            row[offset + 1] = static_cast<std::uint8_t>((x * 11 + y * 23) & 0xFF);
+            row[offset + 2] = static_cast<std::uint8_t>((x * 3 + y * 37) & 0xFF);
+            row[offset + 3] = 255;
+        }
+    }
+    return bitmap;
+}
+
 void test_bitmap_invariants() {
     airshot::Bitmap bitmap(7, 5);
     expect(bitmap.valid() && !bitmap.empty(), L"valid bitmap construction");
@@ -245,6 +260,122 @@ void test_highlight_alpha_is_sampling_independent() {
            L"highlight output remains opaque");
 }
 
+void test_effect_strokes_are_sampling_independent() {
+    using airshot::overlay_detail::Annotation;
+    using airshot::overlay_detail::Tool;
+    using airshot::overlay_detail::resample_polyline;
+
+    const std::vector<POINT> sparse{{8, 24}, {87, 24}};
+    std::vector<POINT> dense;
+    for (int x = 8; x <= 87; ++x) {
+        dense.push_back({x, 24});
+    }
+
+    const auto normalized_sparse = resample_polyline(sparse, 7.0);
+    const auto normalized_dense = resample_polyline(dense, 7.0);
+    const auto points_equal = [](const std::vector<POINT>& left,
+                                 const std::vector<POINT>& right) {
+        return left.size() == right.size() &&
+               std::equal(
+                   left.begin(),
+                   left.end(),
+                   right.begin(),
+                   [](POINT first, POINT second) {
+                       return first.x == second.x && first.y == second.y;
+                   });
+    };
+    expect(points_equal(normalized_sparse, normalized_dense),
+           L"stroke resampling is independent of pointer event density");
+    expect(!normalized_sparse.empty() &&
+               normalized_sparse.front().x == sparse.front().x &&
+               normalized_sparse.front().y == sparse.front().y &&
+               normalized_sparse.back().x == sparse.back().x &&
+               normalized_sparse.back().y == sparse.back().y,
+           L"stroke resampling preserves both endpoints");
+
+    const airshot::AppConfig config;
+    for (const Tool tool : {Tool::mosaic, Tool::blur}) {
+        Annotation normalized;
+        normalized.tool = tool;
+        normalized.points = normalized_sparse;
+        normalized.width = 4.0F;
+        normalized.alpha = 60;
+
+        Annotation from_dense = normalized;
+        from_dense.points = normalized_dense;
+
+        const auto sparse_result = airshot::overlay_detail::render_annotations(
+            patterned_bitmap(96, 48),
+            {normalized},
+            config);
+        const auto dense_result = airshot::overlay_detail::render_annotations(
+            patterned_bitmap(96, 48),
+            {from_dense},
+            config);
+        expect(sparse_result.valid() && dense_result.valid(),
+               L"effect renderer accepts normalized brush strokes");
+        expect(sparse_result.pixels == dense_result.pixels,
+               tool == Tool::mosaic
+                   ? L"mosaic output does not depend on pointer event density"
+                   : L"blur output does not depend on pointer event density");
+    }
+}
+
+void test_single_click_pen_draws_dot() {
+    using airshot::overlay_detail::Annotation;
+    using airshot::overlay_detail::Tool;
+
+    Annotation pen;
+    pen.tool = Tool::pen;
+    pen.points = {{12, 12}};
+    pen.color = RGB(255, 0, 0);
+    pen.width = 6.0F;
+
+    const auto result = airshot::overlay_detail::render_annotations(
+        solid_bitmap(24, 24, RGB(255, 255, 255)),
+        {pen},
+        airshot::AppConfig{});
+    expect(result.valid(), L"single-click pen rendering succeeds");
+    expect(channel(result, 12, 12, 2) > 240 &&
+               channel(result, 12, 12, 1) < 32 &&
+               channel(result, 12, 12, 0) < 32,
+           L"single-click pen produces a visible dot");
+}
+
+void test_shape_tools_are_outline_only() {
+    using airshot::overlay_detail::Annotation;
+    using airshot::overlay_detail::Tool;
+
+    Annotation rectangle;
+    rectangle.tool = Tool::rectangle;
+    rectangle.start = {4, 4};
+    rectangle.end = {28, 28};
+    rectangle.color = RGB(255, 0, 0);
+    rectangle.width = 4.0F;
+
+    Annotation ellipse = rectangle;
+    ellipse.tool = Tool::ellipse;
+    ellipse.start = {36, 4};
+    ellipse.end = {60, 28};
+
+    const auto result = airshot::overlay_detail::render_annotations(
+        solid_bitmap(64, 32, RGB(255, 255, 255)),
+        {rectangle, ellipse},
+        airshot::AppConfig{});
+    expect(result.valid(), L"shape outline rendering succeeds");
+    expect(channel(result, 4, 16, 2) > 240 &&
+               channel(result, 4, 16, 1) < 32,
+           L"rectangle border uses the selected color");
+    expect(channel(result, 16, 16, 0) == 255 &&
+               channel(result, 16, 16, 1) == 255 &&
+               channel(result, 16, 16, 2) == 255,
+           L"rectangle interior remains transparent");
+    expect(channel(result, 48, 16, 0) == 255 &&
+               channel(result, 48, 16, 1) == 255 &&
+               channel(result, 48, 16, 2) == 255,
+           L"ellipse interior remains transparent");
+}
+
 void test_overlay_close_lifecycle() {
     bool completed = false;
     airshot::RegionResult completion_result;
@@ -312,6 +443,48 @@ void test_text_prompt_deactivation_cancels_draft() {
     }
     expect(completed && !result.has_value() && !IsWindow(prompt),
            L"deactivating a text prompt cancels instead of committing its draft");
+    if (IsWindow(prompt)) {
+        DestroyWindow(prompt);
+    }
+}
+
+void test_text_prompt_supports_editing_existing_text() {
+    bool completed = false;
+    std::optional<std::wstring> result;
+    const HWND prompt = airshot::overlay_detail::show_text_prompt(
+        nullptr,
+        POINT{20, 20},
+        RGB(255, 255, 255),
+        16.0F,
+        false,
+        [&](std::optional<std::wstring> text) {
+            result = std::move(text);
+            completed = true;
+        },
+        L"first line\nsecond line");
+    expect(prompt != nullptr, L"text prompt is created for editing testing");
+    if (!prompt) {
+        return;
+    }
+
+    const HWND edit = GetDlgItem(prompt, 100);
+    wchar_t initial[64]{};
+    if (edit) {
+        GetWindowTextW(edit, initial, static_cast<int>(std::size(initial)));
+    }
+    std::wstring normalized_initial = initial;
+    std::erase(normalized_initial, L'\r');
+    expect(
+        edit != nullptr && normalized_initial == L"first line\nsecond line",
+        L"text prompt restores existing multiline text");
+    if (edit) {
+        SetWindowTextW(edit, L"updated\r\ncontent");
+    }
+    SendMessageW(prompt, WM_COMMAND, MAKEWPARAM(IDOK, 0), 0);
+    expect(
+        completed && result && *result == L"updated\r\ncontent" &&
+            !IsWindow(prompt),
+        L"text prompt commits edited multiline text");
     if (IsWindow(prompt)) {
         DestroyWindow(prompt);
     }
@@ -455,8 +628,12 @@ int wmain() {
     test_linear_blur();
     test_ordered_annotation_rendering();
     test_highlight_alpha_is_sampling_independent();
+    test_effect_strokes_are_sampling_independent();
+    test_single_click_pen_draws_dot();
+    test_shape_tools_are_outline_only();
     test_overlay_close_lifecycle();
     test_text_prompt_deactivation_cancels_draft();
+    test_text_prompt_supports_editing_existing_text();
     test_watermark_alpha();
     test_atomic_png_output();
     if (failures == 0) {

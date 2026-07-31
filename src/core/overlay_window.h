@@ -7,6 +7,8 @@
 #include <d2d1.h>
 #include <wrl/client.h>
 
+#include <cstdint>
+
 namespace airshot::overlay_detail {
 
 class OverlaySession;
@@ -31,6 +33,7 @@ private:
     bool create_render_target();
     void discard_device_resources() noexcept;
     D2D1_RECT_F local_rect(const RectI& rect) const;
+    bool draw_rendered_annotations();
     void draw_annotation(const Annotation& annotation, bool preview);
     void draw_arrow(POINT start, POINT end, ID2D1Brush* brush, float width);
 
@@ -39,6 +42,9 @@ private:
     HWND hwnd_{};
     Microsoft::WRL::ComPtr<ID2D1HwndRenderTarget> render_target_;
     Microsoft::WRL::ComPtr<ID2D1Bitmap> background_;
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> rendered_annotations_;
+    std::uint64_t rendered_annotation_revision_{};
+    RectI rendered_annotation_selection_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> dim_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> blue_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> white_brush_;
@@ -48,6 +54,9 @@ private:
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> toolbar_border_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> hover_bg_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> active_bg_brush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> disabled_brush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> toolbar_shadow_brush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> danger_hover_bg_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> true_white_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> green_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> red_brush_;

@@ -9,25 +9,88 @@ if (-not (Test-Path -LiteralPath $PngPath)) {
     throw "Source PNG not found at $PngPath"
 }
 
-Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# Resize to standard icon size (e.g. 256x256) using System.Drawing to ensure compatibility
-$srcImage = [System.Drawing.Image]::FromFile($PngPath)
-$bitmap = New-Object System.Drawing.Bitmap(256, 256)
-$g = [System.Drawing.Graphics]::FromImage($bitmap)
-$g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-$g.DrawImage($srcImage, 0, 0, 256, 256)
+$sizes = @(16, 20, 24, 32, 40, 48, 64, 96, 128, 256)
+$source = [System.Drawing.Image]::FromFile($PngPath)
+$entries = [System.Collections.Generic.List[object]]::new()
 
-$icon = [System.Drawing.Icon]::FromHandle($bitmap.GetHicon())
-$fileStream = New-Object System.IO.FileStream($IcoPath, [System.IO.FileMode]::Create)
-$icon.Save($fileStream)
+try {
+    foreach ($size in $sizes) {
+        $bitmap = [System.Drawing.Bitmap]::new(
+            $size,
+            $size,
+            [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $memory = [System.IO.MemoryStream]::new()
+        try {
+            $graphics.Clear([System.Drawing.Color]::Transparent)
+            $graphics.CompositingMode =
+                [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+            $graphics.CompositingQuality =
+                [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+            $graphics.InterpolationMode =
+                [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $graphics.SmoothingMode =
+                [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+            $graphics.PixelOffsetMode =
+                [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+            $graphics.DrawImage(
+                $source,
+                [System.Drawing.Rectangle]::new(0, 0, $size, $size))
+            $bitmap.Save($memory, [System.Drawing.Imaging.ImageFormat]::Png)
+            $entries.Add([pscustomobject]@{
+                Size = $size
+                Bytes = $memory.ToArray()
+            })
+        }
+        finally {
+            $memory.Dispose()
+            $graphics.Dispose()
+            $bitmap.Dispose()
+        }
+    }
+}
+finally {
+    $source.Dispose()
+}
 
-$fileStream.Close()
-$fileStream.Dispose()
-$icon.Dispose()
-$g.Dispose()
-$bitmap.Dispose()
-$srcImage.Dispose()
+$outputDirectory = Split-Path -Parent $IcoPath
+if ($outputDirectory) {
+    [System.IO.Directory]::CreateDirectory($outputDirectory) | Out-Null
+}
 
-Write-Host "Icon created successfully via System.Drawing at $IcoPath"
+$stream = [System.IO.FileStream]::new(
+    $IcoPath,
+    [System.IO.FileMode]::Create,
+    [System.IO.FileAccess]::Write,
+    [System.IO.FileShare]::None)
+$writer = [System.IO.BinaryWriter]::new($stream)
+try {
+    $writer.Write([uint16]0)
+    $writer.Write([uint16]1)
+    $writer.Write([uint16]$entries.Count)
+
+    [uint32]$offset = 6 + (16 * $entries.Count)
+    foreach ($entry in $entries) {
+        $writer.Write([byte]$(if ($entry.Size -eq 256) { 0 } else { $entry.Size }))
+        $writer.Write([byte]$(if ($entry.Size -eq 256) { 0 } else { $entry.Size }))
+        $writer.Write([byte]0)
+        $writer.Write([byte]0)
+        $writer.Write([uint16]1)
+        $writer.Write([uint16]32)
+        $writer.Write([uint32]$entry.Bytes.Length)
+        $writer.Write($offset)
+        $offset += [uint32]$entry.Bytes.Length
+    }
+
+    foreach ($entry in $entries) {
+        $writer.Write([byte[]]$entry.Bytes)
+    }
+}
+finally {
+    $writer.Dispose()
+    $stream.Dispose()
+}
+
+Write-Host "Created $($entries.Count)-size icon at $IcoPath"

@@ -41,6 +41,15 @@ struct OcrCommand {
     bool copy{};
 };
 
+enum class PinAction {
+    clipboard,
+    restore_interaction,
+};
+
+struct PinCommand {
+    PinAction action{PinAction::clipboard};
+};
+
 enum class ModuleAction {
     list,
     enable,
@@ -69,7 +78,12 @@ struct AppCommand {
     AppAction action{AppAction::status};
 };
 
-using Command = std::variant<CaptureCommand, OcrCommand, ModuleCommand, AppCommand>;
+using Command = std::variant<
+    CaptureCommand,
+    OcrCommand,
+    PinCommand,
+    ModuleCommand,
+    AppCommand>;
 
 struct ParsedCli {
     ExitCode code{ExitCode::success};
@@ -96,6 +110,7 @@ struct CommandResponse {
     std::wstring_view launch_nonce = {});
 [[nodiscard]] std::optional<Command> command_from_json(
     std::wstring_view json, std::wstring* error = nullptr);
+[[nodiscard]] bool command_waits_for_user_input(const Command& command) noexcept;
 [[nodiscard]] std::wstring response_to_json(const CommandResponse& response);
 [[nodiscard]] CommandResponse response_from_json(std::wstring_view json);
 [[nodiscard]] std::wstring_view default_error_type(ExitCode code) noexcept;

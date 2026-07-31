@@ -1,12 +1,17 @@
 #include "airshot/bitmap.h"
+#include "airshot/pin_layout.h"
 #include "airshot/command.h"
 #include "airshot/config.h"
 #include "airshot/ocr.h"
 #include "airshot/portable.h"
 #include "airshot/output.h"
 
+#include "../src/core/overlay_types.h"
+#include "../src/core/overlay_annotation_history.h"
+
 #include <winrt/base.h>
 
+#include <cmath>
 #include <iostream>
 #include <fstream>
 
@@ -88,6 +93,281 @@ void test_rect_and_bitmap() {
     std::filesystem::remove(temp_png, ignored);
 }
 
+void test_pin_recovery_layout() {
+    const airshot::RectI work{0, 0, 1920, 1080};
+    const auto recovered =
+        airshot::recover_pin_bounds(
+            {2000, 1100, 2300, 1300},
+            work);
+    expect(
+        recovered.left == 1620 &&
+            recovered.top == 880 &&
+            recovered.right == 1920 &&
+            recovered.bottom == 1080,
+        L"off-screen pin is restored fully inside the work area");
+
+    const auto oversized =
+        airshot::recover_pin_bounds(
+            {2000, 2000, 5000, 4000},
+            work);
+    expect(
+        oversized.left == 1872 &&
+            oversized.top == 1032 &&
+            oversized.width() == 3000 &&
+            oversized.height() == 2000,
+        L"oversized pin keeps a draggable edge visible");
+
+    const auto negative_monitor =
+        airshot::recover_pin_bounds(
+            {-2500, -100, -2200, 100},
+            {-1920, 0, 0, 1080});
+    expect(
+        negative_monitor.left == -1920 &&
+            negative_monitor.top == 0 &&
+            negative_monitor.right == -1620 &&
+            negative_monitor.bottom == 200,
+        L"pin recovery supports negative monitor coordinates");
+
+    expect(
+        airshot::fit_pin_scale(640, 480, work) == 1.0,
+        L"small pins keep their original scale");
+    expect(
+        std::abs(
+            airshot::fit_pin_scale(4000, 2000, work) -
+            0.3936) < 0.0001,
+        L"large pins fit within the configured work-area coverage");
+    expect(
+        airshot::fit_pin_scale(0, 2000, work) == 1.0,
+        L"invalid pin dimensions keep a safe default scale");
+}
+
+void test_serial_counter_is_scoped_to_capture_session() {
+    using airshot::overlay_detail::Annotation;
+    using airshot::overlay_detail::Tool;
+
+    std::vector<Annotation> first_capture;
+    expect(
+        airshot::overlay_detail::next_serial_number(first_capture) == 1,
+           L"first serial in a capture session starts at one");
+    Annotation first;
+    first.tool = Tool::serial;
+    first.serial = 1;
+    first_capture.push_back(first);
+    expect(
+        airshot::overlay_detail::next_serial_number(first_capture) == 2,
+           L"serials increment within one capture session");
+
+    Annotation third = first;
+    third.serial = 3;
+    first_capture.push_back(third);
+    airshot::overlay_detail::renumber_serial_annotations(first_capture);
+    expect(
+        first_capture[0].serial == 1 &&
+            first_capture[1].serial == 2 &&
+            airshot::overlay_detail::next_serial_number(first_capture) == 3,
+        L"deleting a middle serial keeps numbering continuous");
+
+    std::vector<Annotation> next_capture;
+    expect(
+        airshot::overlay_detail::next_serial_number(next_capture) == 1,
+           L"a new capture session resets serial numbering to one");
+}
+
+void test_annotation_geometry_and_history() {
+    using airshot::overlay_detail::Annotation;
+    using airshot::overlay_detail::AnnotationHistory;
+    using airshot::overlay_detail::Tool;
+
+    expect(
+        airshot::overlay_detail::tool_cursor_radius(
+            Tool::pen,
+            12.0F) == 6.0F &&
+            airshot::overlay_detail::tool_cursor_radius(
+                Tool::mosaic,
+                12.0F) == 42.0F &&
+            airshot::overlay_detail::tool_cursor_radius(
+                Tool::highlight,
+                12.0F) == 19.0F &&
+            airshot::overlay_detail::tool_cursor_radius(
+                Tool::eraser,
+                3.0F) == 8.0F,
+        L"brush cursor matches each tool's real editing footprint");
+
+    const auto square =
+        airshot::overlay_detail::constrained_annotation_geometry(
+            Tool::rectangle,
+            POINT{10, 10},
+            POINT{14, 20},
+            true,
+            false);
+    expect(
+        square.start.x == 10 && square.start.y == 10 &&
+            square.end.x == 20 && square.end.y == 20,
+        L"Shift constrains rectangles to a square");
+
+    const auto centered =
+        airshot::overlay_detail::constrained_annotation_geometry(
+            Tool::ellipse,
+            POINT{20, 20},
+            POINT{24, 26},
+            true,
+            true);
+    expect(
+        centered.start.x == 14 && centered.start.y == 14 &&
+            centered.end.x == 26 && centered.end.y == 26,
+        L"Alt draws constrained shapes from their center");
+
+    const auto horizontal =
+        airshot::overlay_detail::constrained_annotation_geometry(
+            Tool::arrow,
+            POINT{0, 0},
+            POINT{10, 3},
+            true,
+            false);
+    expect(
+        horizontal.end.y == 0,
+        L"Shift snaps lines and arrows to 45 degree increments");
+
+    const auto centered_near_edge =
+        airshot::overlay_detail::fit_annotation_geometry_to_canvas(
+            airshot::overlay_detail::constrained_annotation_geometry(
+                Tool::rectangle,
+                POINT{10, 50},
+                POINT{60, 80},
+                false,
+                true),
+            POINT{10, 50},
+            100,
+            100,
+            true,
+            false);
+    expect(
+        centered_near_edge.start.x == 0 &&
+            centered_near_edge.end.x == 20 &&
+            centered_near_edge.start.y == 20 &&
+            centered_near_edge.end.y == 80,
+        L"Alt-centered shapes clamp each axis without distorting the other");
+
+    const std::vector<POINT> long_stroke{{0, 0}, {100, 0}};
+    const auto capped_stroke =
+        airshot::overlay_detail::resample_polyline(long_stroke, 1.0, 2);
+    expect(
+        capped_stroke.size() == 2 &&
+            capped_stroke.front().x == 0 &&
+            capped_stroke.back().x == 100,
+        L"bounded stroke resampling always preserves the final endpoint");
+
+    Annotation rectangle;
+    rectangle.tool = Tool::rectangle;
+    rectangle.start = {10, 10};
+    rectangle.end = {30, 30};
+    std::vector<Annotation> annotations;
+    AnnotationHistory history;
+    history.record(annotations);
+    annotations.push_back(rectangle);
+    expect(
+        history.can_undo() && history.undo(annotations) &&
+            annotations.empty() && history.can_redo(),
+        L"annotation creation participates in undo");
+    expect(
+        history.redo(annotations) && annotations.size() == 1,
+        L"annotation creation participates in redo");
+
+    history.record(annotations);
+    airshot::overlay_detail::translate_annotation(
+        annotations.front(),
+        15,
+        5);
+    expect(
+        history.undo(annotations) &&
+            annotations.front().start.x == 10 &&
+            annotations.front().start.y == 10,
+        L"annotation movement is restored atomically");
+
+    const POINT clamped =
+        airshot::overlay_detail::clamp_annotation_translation(
+            rectangle,
+            -100,
+            100,
+            100,
+            100);
+    expect(
+        clamped.x == -8 && clamped.y == 68,
+        L"annotation movement keeps the full stroke inside the capture");
+
+    const auto handles =
+        airshot::overlay_detail::annotation_control_handles(
+            rectangle);
+    expect(
+        handles.count == 8 &&
+            airshot::overlay_detail::
+                hit_test_annotation_control_handle(
+                    rectangle,
+                    POINT{30, 30},
+                    4) ==
+                airshot::overlay_detail::AnnotationHandle::
+                    bottom_right,
+        L"selected shapes expose reliable resize handles");
+
+    const Annotation resized =
+        airshot::overlay_detail::resize_annotation_from_handle(
+            rectangle,
+            airshot::overlay_detail::AnnotationHandle::
+                bottom_right,
+            POINT{50, 40},
+            100,
+            100);
+    expect(
+        resized.start.x == 10 &&
+            resized.start.y == 10 &&
+            resized.end.x == 50 &&
+            resized.end.y == 40,
+        L"shape handles resize the selected annotation");
+
+    const Annotation aspect_resized =
+        airshot::overlay_detail::resize_annotation_from_handle(
+            rectangle,
+            airshot::overlay_detail::AnnotationHandle::
+                bottom_right,
+            POINT{50, 30},
+            100,
+            100,
+            true);
+    expect(
+        aspect_resized.end.x == 50 &&
+            aspect_resized.end.y == 50,
+        L"Shift preserves aspect ratio while resizing annotations");
+
+    Annotation arrow = rectangle;
+    arrow.tool = Tool::arrow;
+    arrow.start = {30, 30};
+    arrow.end = {50, 50};
+    const Annotation endpoint_resized =
+        airshot::overlay_detail::resize_annotation_from_handle(
+            arrow,
+            airshot::overlay_detail::AnnotationHandle::
+                end_point,
+            POINT{75, 62},
+            100,
+            100);
+    expect(
+        endpoint_resized.start.x == 30 &&
+            endpoint_resized.start.y == 30 &&
+            endpoint_resized.end.x == 75 &&
+            endpoint_resized.end.y == 62,
+        L"line and arrow endpoints can be re-edited");
+
+    const POINT clone_offset =
+        airshot::overlay_detail::preferred_clone_translation(
+            rectangle,
+            12,
+            100,
+            100);
+    expect(
+        clone_offset.x == 12 && clone_offset.y == 12,
+        L"annotation duplication uses a visible in-bounds offset");
+}
+
 void test_config() {
     expect(airshot::AppConfig{}.ocr_engine == airshot::kDefaultOcrEngine &&
                airshot::kDefaultOcrEngine == airshot::kOcrEngineRapidV5Fast,
@@ -98,7 +378,6 @@ void test_config() {
     config.annotation_locked_tool = false;
     config.annotation_hidden_tools = L"pen,banana,rect,pen,close";
     config.annotation_highlight_alpha = 300;
-    config.annotation_next_serial = 12;
     config.global_ocr_enabled = true;
     config.capture_hotkey = L"Ctrl+Shift+F9";
     config.global_ocr_hotkey = L"Ctrl+Alt+O";
@@ -115,7 +394,7 @@ void test_config() {
     expect(parsed.has_value(), L"config JSON round trip parses");
     expect(parsed && !parsed->annotation_enabled && parsed->global_ocr_enabled &&
                !parsed->annotation_locked_tool && parsed->annotation_hidden_tools == L"rect,pen,close" &&
-               parsed->annotation_highlight_alpha == 192 && parsed->annotation_next_serial == 12 &&
+               parsed->annotation_highlight_alpha == 192 &&
                parsed->capture_hotkey == L"Ctrl+Shift+F9" && parsed->global_ocr_hotkey == L"Ctrl+Alt+O" &&
                parsed->custom_color == L"#123456" &&
                parsed->tool_shortcut_select == L"Shift+S" &&
@@ -132,10 +411,20 @@ void test_config() {
         LR"({"schemaVersion":2,"annotation":{"enabled":false},"future":[null,true,{"name":"\u4E2D"}]})");
     expect(future && future->schema_version == 2 && !future->annotation_enabled &&
                future->annotation_locked_tool && future->annotation_hidden_tools.empty() &&
-               future->annotation_highlight_alpha == 96 && future->annotation_next_serial == 1 &&
+               future->annotation_highlight_alpha == 96 &&
                future->text_font_family == L"Microsoft YaHei" && !future->text_font_bold && !future->text_font_italic &&
                future->ocr_engine == airshot::kDefaultOcrEngine,
            L"config accepts unknown future fields and keeps annotation defaults");
+    const auto legacy_serial = airshot::config_from_json(
+        LR"({"annotation":{"nextSerial":37}})");
+    expect(
+        legacy_serial.has_value(),
+        L"legacy persisted serial counters remain readable");
+    expect(
+        legacy_serial &&
+            airshot::config_to_json(*legacy_serial).find(L"nextSerial") ==
+                std::wstring::npos,
+        L"legacy persisted serial counters are removed on save");
     expect(!airshot::config_from_json(L"{\"annotation\":[}"), L"config rejects malformed JSON");
     const auto old_numeric_ocr = airshot::config_from_json(LR"({"ocr":{"engine":1}})");
     expect(old_numeric_ocr && old_numeric_ocr->ocr_engine == airshot::kDefaultOcrEngine,
@@ -282,6 +571,9 @@ void test_portable_runtime() {
 int wmain() {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     test_rect_and_bitmap();
+    test_pin_recovery_layout();
+    test_serial_counter_is_scoped_to_capture_session();
+    test_annotation_geometry_and_history();
     test_config();
     test_cli();
     test_ocr_join();

@@ -2597,7 +2597,11 @@ bool append_available_output(
 OcrOutput run_ocr_process(
     const std::filesystem::path& executable,
     std::wstring command_line,
-    const OcrDependencyLease& dependency_lease) {
+    const OcrDependencyLease& dependency_lease,
+    std::stop_token stop_token) {
+    if (stop_token.stop_requested()) {
+        return {false, {}, L"OCR 已取消。"};
+    }
     if (!dependency_lease.valid()) {
         return {
             false,
@@ -2789,9 +2793,16 @@ OcrOutput run_ocr_process(
     output.reserve(4096);
     const ULONGLONG deadline = GetTickCount64() + kOcrProcessTimeoutMs;
     bool timed_out = false;
+    bool cancelled = false;
     bool output_limit_exceeded = false;
     bool wait_failed = false;
     for (;;) {
+        if (stop_token.stop_requested()) {
+            cancelled = true;
+            TerminateJobObject(job.get(), 122);
+            WaitForSingleObject(process_handle.get(), 5'000);
+            break;
+        }
         if (!append_available_output(
                 stdout_read.get(),
                 output,
@@ -2829,6 +2840,9 @@ OcrOutput run_ocr_process(
     GetExitCodeProcess(process_handle.get(), &exit_code);
     job.reset();
 
+    if (cancelled) {
+        return {false, {}, L"OCR 已取消。"};
+    }
     if (timed_out) {
         return {
             false,
@@ -3923,7 +3937,13 @@ std::wstring join_ocr_lines(std::span<const std::wstring> lines) {
     return result;
 }
 
-OcrOutput recognize_text(const Bitmap& bitmap, const AppConfig& config) {
+OcrOutput recognize_text(
+    const Bitmap& bitmap,
+    const AppConfig& config,
+    std::stop_token stop_token) {
+    if (stop_token.stop_requested()) {
+        return {false, {}, L"OCR 已取消。"};
+    }
     if (bitmap.empty()) {
         return {false, {}, L"OCR 图像为空。"};
     }
@@ -3936,6 +3956,9 @@ OcrOutput recognize_text(const Bitmap& bitmap, const AppConfig& config) {
         dependency_lease;
     for (const auto& root :
          ocr_dependency_roots()) {
+        if (stop_token.stop_requested()) {
+            return {false, {}, L"OCR 已取消。"};
+        }
         std::wstring candidate_problem;
         auto candidate =
             acquire_ocr_dependency_lease(
@@ -3968,6 +3991,9 @@ OcrOutput recognize_text(const Bitmap& bitmap, const AppConfig& config) {
         };
     }
 
+    if (stop_token.stop_requested()) {
+        return {false, {}, L"OCR 已取消。"};
+    }
     std::wstring temporary_error;
     const auto temporary_directory = create_private_directory(
         config_directory(),
@@ -4005,6 +4031,9 @@ OcrOutput recognize_text(const Bitmap& bitmap, const AppConfig& config) {
             L"OCR 图像缩放内存分配失败。",
         };
     }
+    if (stop_token.stop_requested()) {
+        return {false, {}, L"OCR 已取消。"};
+    }
     const std::filesystem::path temporary_png =
         *temporary_directory / L"selection.png";
     std::wstring save_error;
@@ -4019,6 +4048,9 @@ OcrOutput recognize_text(const Bitmap& bitmap, const AppConfig& config) {
         temporary_png.c_str(),
         FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_ATTRIBUTE_TEMPORARY);
 
+    if (stop_token.stop_requested()) {
+        return {false, {}, L"OCR 已取消。"};
+    }
     const std::filesystem::path executable = portable_executable_path();
     if (!is_regular_non_reparse_file(executable)) {
         return {
@@ -4049,7 +4081,8 @@ OcrOutput recognize_text(const Bitmap& bitmap, const AppConfig& config) {
     return run_ocr_process(
         executable,
         std::move(command_line),
-        *dependency_lease);
+        *dependency_lease,
+        stop_token);
 }
 
 }  // namespace airshot
