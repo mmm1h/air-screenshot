@@ -1,7 +1,7 @@
 #include "host_app.h"
 
 #include "about_window.h"
-#include "resource.h"
+#include "app_icon.h"
 #include "settings_window.h"
 
 #include "airshot/capture.h"
@@ -72,16 +72,6 @@ std::int64_t now_unix_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
-}
-
-HICON load_app_icon(HINSTANCE instance, int width, int height) {
-    return reinterpret_cast<HICON>(LoadImageW(
-        instance,
-        MAKEINTRESOURCEW(IDI_APP_ICON),
-        IMAGE_ICON,
-        width,
-        height,
-        LR_DEFAULTCOLOR | LR_SHARED));
 }
 
 std::wstring monitor_selector(const MonitorTarget& monitor) {
@@ -205,10 +195,12 @@ bool HostApp::initialize() {
     window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     window_class.hIcon = load_app_icon(
         instance_,
+        kDefaultAppIcon,
         GetSystemMetrics(SM_CXICON),
         GetSystemMetrics(SM_CYICON));
     window_class.hIconSm = load_app_icon(
         instance_,
+        kDefaultAppIcon,
         GetSystemMetrics(SM_CXSMICON),
         GetSystemMetrics(SM_CYSMICON));
     window_class.lpszClassName = kAppWindowClass;
@@ -256,6 +248,7 @@ bool HostApp::initialize() {
         return false;
     }
     config_ = std::move(*loaded_config);
+    apply_app_icon_to_window(window_, config_.app_icon);
     const HWND dispatch_window = window_;
     const DWORD dispatch_thread = GetCurrentThreadId();
     accepting_requests_.store(true, std::memory_order_release);
@@ -623,6 +616,7 @@ bool HostApp::commit_config(AppConfig next, std::wstring* error) {
     }
 
     config_ = std::move(next);
+    apply_app_icon_to_window(window_, config_.app_icon);
     return true;
 }
 
@@ -696,10 +690,8 @@ void HostApp::add_tray() {
     tray_.uID = 1;
     tray_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     tray_.uCallbackMessage = kTrayMessage;
-    tray_.hIcon = load_app_icon(
-        instance_,
-        GetSystemMetrics(SM_CXSMICON),
-        GetSystemMetrics(SM_CYSMICON));
+    const int icon_size = std::max(16, GetSystemMetrics(SM_CXSMICON));
+    tray_.hIcon = load_app_icon(instance_, config_.app_icon, icon_size, icon_size);
     wcscpy_s(tray_.szTip, kAppName);
     tray_added_ = Shell_NotifyIconW(NIM_ADD, &tray_) == TRUE;
     if (tray_added_) {

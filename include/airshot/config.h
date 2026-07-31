@@ -10,6 +10,10 @@ inline constexpr std::wstring_view kOcrEngineRapidV5Fast = L"rapidocr-v5-fast";
 inline constexpr std::wstring_view kOcrEngineRapidV5Accurate = L"rapidocr-v5-accurate";
 inline constexpr std::wstring_view kOcrEngineRapidV4Compat = L"rapidocr-v4-compat";
 inline constexpr std::wstring_view kDefaultOcrEngine = kOcrEngineRapidV5Fast;
+inline constexpr std::wstring_view kAppIconFocusFrame = L"focus-frame";
+inline constexpr std::wstring_view kAppIconFlowLens = L"flow-lens";
+inline constexpr std::wstring_view kAppIconPixelConsole = L"pixel-console";
+inline constexpr std::wstring_view kDefaultAppIcon = kAppIconFocusFrame;
 inline constexpr wchar_t kRapidOcrOnnxPackageId[] = L"rapidocr-onnx";
 inline constexpr wchar_t kDefaultOcrDependencyManifestUrl[] =
     L"https://mmm1h.github.io/air-screenshot/ocr-dependencies.json";
@@ -23,6 +27,7 @@ struct AppConfig {
     bool shell_enabled{true};
     bool tray_icon_visible{true};
     bool start_at_login{false};
+    std::wstring app_icon{std::wstring(kDefaultAppIcon)};
     bool global_ocr_enabled{false};
     bool notifications_enabled{false};
     bool automatic_updates_enabled{true};
@@ -73,6 +78,7 @@ struct Hotkey {
     const AppConfig& config,
     std::wstring* error = nullptr);
 [[nodiscard]] std::wstring normalize_ocr_engine(std::wstring_view value);
+[[nodiscard]] std::wstring normalize_app_icon(std::wstring_view value);
 [[nodiscard]] std::wstring normalize_annotation_hidden_tools(std::wstring_view value);
 [[nodiscard]] bool annotation_tool_hidden(std::wstring_view hidden_tools, std::wstring_view tool_id);
 [[nodiscard]] std::wstring config_to_json(const AppConfig& config);

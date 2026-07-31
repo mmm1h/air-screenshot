@@ -4,6 +4,8 @@
 #include <winver.h>
 
 IDI_APP_ICON ICON "app.ico"
+IDI_APP_ICON_FLOW ICON "app-flow.ico"
+IDI_APP_ICON_PIXEL ICON "app-pixel.ico"
 IDR_LICENSE_TEXT RCDATA "../../LICENSE"
 IDR_THIRD_PARTY_TEXT RCDATA "../../THIRD_PARTY_NOTICES.md"
 

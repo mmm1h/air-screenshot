@@ -1,5 +1,6 @@
 #include "about_window.h"
 
+#include "app_icon.h"
 #include "resource.h"
 
 #include "airshot/common.h"
@@ -50,6 +51,7 @@ struct AboutState {
     std::wstring theme{L"system"};
     UiPalette palette{};
     std::wstring ui_font_family{L"Segoe UI"};
+    std::wstring app_icon{std::wstring(kDefaultAppIcon)};
     HWND details_edit{};
     HFONT details_font{};
     HBRUSH edit_bg_brush{};
@@ -286,7 +288,8 @@ bool ensure_resources(AboutState* state) {
     state->small_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
 
     // Load logo HICON and convert to D2D bitmap
-    HICON hIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON, 96, 96, LR_SHARED);
+    HICON hIcon = load_app_icon(
+        GetModuleHandleW(nullptr), state->app_icon, 96, 96);
     if (hIcon) {
         Microsoft::WRL::ComPtr<IWICImagingFactory> wic_factory;
         hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(wic_factory.GetAddressOf()));
@@ -582,7 +585,8 @@ HWND show_about_window_async(HWND owner, std::function<void()> completion) {
         window_class.lpfnWndProc = about_proc;
         window_class.hInstance = GetModuleHandleW(nullptr);
         window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        window_class.hIcon = LoadIconW(window_class.hInstance, MAKEINTRESOURCEW(IDI_APP_ICON));
+        window_class.hIcon = load_app_icon(
+            window_class.hInstance, kDefaultAppIcon, 32, 32);
         window_class.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
         window_class.lpszClassName = L"AirScreenshot.About";
         RegisterClassExW(&window_class);
@@ -601,6 +605,7 @@ HWND show_about_window_async(HWND owner, std::function<void()> completion) {
     state->palette = resolve_ui_palette(config.theme);
     state->is_light_theme = state->palette.light;
     state->high_contrast = state->palette.high_contrast;
+    state->app_icon = config.app_icon;
     UINT dpi = owner ? GetDpiForWindow(owner) : GetDpiForSystem();
     if (dpi == 0) dpi = 96;
 
@@ -653,6 +658,8 @@ HWND show_about_window_async(HWND owner, std::function<void()> completion) {
         }
         return nullptr;
     }
+
+    apply_app_icon_to_window(window, state->app_icon);
 
     BOOL use_dark = !state->is_light_theme && !state->high_contrast;
     DwmSetWindowAttribute(window, 20, &use_dark, sizeof(use_dark));

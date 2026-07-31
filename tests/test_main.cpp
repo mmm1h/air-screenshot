@@ -388,6 +388,7 @@ void test_config() {
     config.text_font_family = L"Consolas";
     config.text_font_bold = true;
     config.text_font_italic = true;
+    config.app_icon = std::wstring(airshot::kAppIconFlowLens);
     config.ocr_engine = std::wstring(airshot::kOcrEngineRapidV5Accurate);
     config.ocr_download_url = L"https://example.com/ocr-dependencies.json";
     const auto parsed = airshot::config_from_json(airshot::config_to_json(config));
@@ -403,6 +404,7 @@ void test_config() {
                parsed->text_font_family == L"Consolas" &&
                parsed->text_font_bold == true &&
                parsed->text_font_italic == true &&
+               parsed->app_icon == airshot::kAppIconFlowLens &&
                parsed->ocr_engine == airshot::kOcrEngineRapidV5Accurate &&
                parsed->ocr_download_url == L"https://example.com/ocr-dependencies.json",
            L"config JSON round trip values");
@@ -413,6 +415,7 @@ void test_config() {
                future->annotation_locked_tool && future->annotation_hidden_tools.empty() &&
                future->annotation_highlight_alpha == 96 &&
                future->text_font_family == L"Microsoft YaHei" && !future->text_font_bold && !future->text_font_italic &&
+               future->app_icon == airshot::kDefaultAppIcon &&
                future->ocr_engine == airshot::kDefaultOcrEngine,
            L"config accepts unknown future fields and keeps annotation defaults");
     const auto legacy_serial = airshot::config_from_json(
@@ -434,6 +437,12 @@ void test_config() {
            L"config clamps invalid OCR engine");
     expect(airshot::normalize_ocr_engine(L"wechat") == airshot::kOcrEngineRapidV5Fast,
            L"config migrates legacy WeChat OCR engine");
+    expect(airshot::normalize_app_icon(L"pixel-console") == airshot::kAppIconPixelConsole &&
+               airshot::normalize_app_icon(L"banana") == airshot::kDefaultAppIcon,
+           L"config normalizes supported and unknown application icons");
+    expect(!airshot::config_from_json(
+               LR"({"schemaVersion":2,"shell":{"appIcon":"banana"}})"),
+           L"current config rejects an unsupported application icon");
 
     expect(airshot::normalize_annotation_hidden_tools(L"pen,unknown,RECT;pen close") == L"rect,pen,close",
            L"hidden annotation tools normalize, dedupe, and skip unknown values");

@@ -544,6 +544,11 @@ bool is_supported_ocr_engine(std::wstring_view value) {
            normalized == L"system";
 }
 
+bool is_supported_app_icon(std::wstring_view value) {
+    return value == kAppIconFocusFrame || value == kAppIconFlowLens ||
+           value == kAppIconPixelConsole;
+}
+
 bool validate_current_config(const JsonNode& root, std::wstring* error) {
     bool valid = true;
     const auto* annotation = validate_optional_section(root, L"annotation", error, valid);
@@ -598,13 +603,21 @@ bool validate_current_config(const JsonNode& root, std::wstring* error) {
     if (!valid) {
         return false;
     }
-    if (shell &&
-        (!validate_optional_kind(*shell, L"shell", L"enabled", JsonKind::boolean, error) ||
-         !validate_optional_kind(*shell, L"shell", L"trayIconVisible", JsonKind::boolean, error) ||
-         !validate_optional_kind(*shell, L"shell", L"startAtLogin", JsonKind::boolean, error) ||
-         !validate_optional_kind(
-             *shell, L"shell", L"notificationsEnabled", JsonKind::boolean, error))) {
-        return false;
+    if (shell) {
+        if (!validate_optional_kind(*shell, L"shell", L"enabled", JsonKind::boolean, error) ||
+            !validate_optional_kind(
+                *shell, L"shell", L"trayIconVisible", JsonKind::boolean, error) ||
+            !validate_optional_kind(*shell, L"shell", L"startAtLogin", JsonKind::boolean, error) ||
+            !validate_optional_kind(
+                *shell, L"shell", L"notificationsEnabled", JsonKind::boolean, error) ||
+            !validate_optional_kind(*shell, L"shell", L"appIcon", JsonKind::string, error)) {
+            return false;
+        }
+        if (const auto* icon = member(*shell, L"appIcon");
+            icon && !is_supported_app_icon(icon->string)) {
+            set_config_error(error, L"配置字段 shell.appIcon 不是受支持的枚举值。");
+            return false;
+        }
     }
 
     const auto* update = validate_optional_section(root, L"update", error, valid);
@@ -1430,6 +1443,13 @@ std::wstring normalize_ocr_engine(std::wstring_view value) {
     return std::wstring(kDefaultOcrEngine);
 }
 
+std::wstring normalize_app_icon(std::wstring_view value) {
+    if (is_supported_app_icon(value)) {
+        return std::wstring(value);
+    }
+    return std::wstring(kDefaultAppIcon);
+}
+
 std::wstring normalize_annotation_hidden_tools(std::wstring_view value) {
     std::wstring result;
     for (const auto tool_id : kAnnotationToolbarTools) {
@@ -1474,7 +1494,8 @@ std::wstring known_config_to_json(const AppConfig& config) {
     result += L",\"shell\":{\"enabled\":" + std::wstring(json_boolean(config.shell_enabled));
     result += L",\"trayIconVisible\":" + std::wstring(json_boolean(config.tray_icon_visible));
     result += L",\"startAtLogin\":" + std::wstring(json_boolean(config.start_at_login));
-    result += L",\"notificationsEnabled\":" + std::wstring(json_boolean(config.notifications_enabled)) + L"}";
+    result += L",\"notificationsEnabled\":" + std::wstring(json_boolean(config.notifications_enabled));
+    result += L",\"appIcon\":" + quote_json(normalize_app_icon(config.app_icon)) + L"}";
     result += L",\"update\":{\"automatic\":" +
               std::wstring(json_boolean(config.automatic_updates_enabled));
     result += L",\"lastCheckUnix\":" +
@@ -1584,6 +1605,8 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text, std::wstr
         config.start_at_login =
             named_boolean(*shell, L"startAtLogin", config.schema_version <= 1);
         config.notifications_enabled = named_boolean(*shell, L"notificationsEnabled", false);
+        config.app_icon = normalize_app_icon(
+            named_string(*shell, L"appIcon", kDefaultAppIcon));
     }
     if (const auto* update = member(*root, L"update")) {
         config.automatic_updates_enabled =
