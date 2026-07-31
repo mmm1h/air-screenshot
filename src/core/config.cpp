@@ -518,6 +518,11 @@ bool is_supported_ocr_engine(std::wstring_view value) {
            normalized == L"system";
 }
 
+bool is_supported_app_icon(std::wstring_view value) {
+    return value == kAppIconFocusFrame || value == kAppIconFlowLens ||
+           value == kAppIconPixelConsole;
+}
+
 bool validate_current_config(const JsonNode& root, std::wstring* error) {
     bool valid = true;
     const auto* annotation = validate_optional_section(root, L"annotation", error, valid);
@@ -572,12 +577,19 @@ bool validate_current_config(const JsonNode& root, std::wstring* error) {
     if (!valid) {
         return false;
     }
-    if (shell &&
-        (!validate_optional_kind(*shell, L"shell", L"enabled", JsonKind::boolean, error) ||
-         !validate_optional_kind(*shell, L"shell", L"startAtLogin", JsonKind::boolean, error) ||
-         !validate_optional_kind(
-             *shell, L"shell", L"notificationsEnabled", JsonKind::boolean, error))) {
-        return false;
+    if (shell) {
+        if (!validate_optional_kind(*shell, L"shell", L"enabled", JsonKind::boolean, error) ||
+            !validate_optional_kind(*shell, L"shell", L"startAtLogin", JsonKind::boolean, error) ||
+            !validate_optional_kind(
+                *shell, L"shell", L"notificationsEnabled", JsonKind::boolean, error) ||
+            !validate_optional_kind(*shell, L"shell", L"appIcon", JsonKind::string, error)) {
+            return false;
+        }
+        if (const auto* icon = member(*shell, L"appIcon");
+            icon && !is_supported_app_icon(icon->string)) {
+            set_config_error(error, L"配置字段 shell.appIcon 不是受支持的枚举值。");
+            return false;
+        }
     }
 
     const auto* hotkey = validate_optional_section(root, L"hotkey", error, valid);
@@ -1348,6 +1360,13 @@ std::wstring normalize_ocr_engine(std::wstring_view value) {
     return std::wstring(kDefaultOcrEngine);
 }
 
+std::wstring normalize_app_icon(std::wstring_view value) {
+    if (is_supported_app_icon(value)) {
+        return std::wstring(value);
+    }
+    return std::wstring(kDefaultAppIcon);
+}
+
 std::wstring normalize_annotation_hidden_tools(std::wstring_view value) {
     std::wstring result;
     for (const auto tool_id : kAnnotationToolbarTools) {
@@ -1392,7 +1411,8 @@ std::wstring known_config_to_json(const AppConfig& config) {
     result += L",\"downloadUrl\":" + quote_json(config.ocr_download_url) + L"}";
     result += L",\"shell\":{\"enabled\":" + std::wstring(json_boolean(config.shell_enabled));
     result += L",\"startAtLogin\":" + std::wstring(json_boolean(config.start_at_login));
-    result += L",\"notificationsEnabled\":" + std::wstring(json_boolean(config.notifications_enabled)) + L"}";
+    result += L",\"notificationsEnabled\":" + std::wstring(json_boolean(config.notifications_enabled));
+    result += L",\"appIcon\":" + quote_json(normalize_app_icon(config.app_icon)) + L"}";
     result += L",\"hotkey\":{\"capture\":" + quote_json(config.capture_hotkey);
     result += L",\"globalOcrEnabled\":" + std::wstring(json_boolean(config.global_ocr_enabled));
     result += L",\"globalOcr\":" + quote_json(config.global_ocr_hotkey) + L"}";
@@ -1491,6 +1511,8 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text, std::wstr
         config.start_at_login =
             named_boolean(*shell, L"startAtLogin", config.schema_version <= 1);
         config.notifications_enabled = named_boolean(*shell, L"notificationsEnabled", false);
+        config.app_icon = normalize_app_icon(
+            named_string(*shell, L"appIcon", kDefaultAppIcon));
     }
     if (const auto* hotkey = member(*root, L"hotkey")) {
         config.capture_hotkey = named_string(*hotkey, L"capture", L"Ctrl+Alt+A");

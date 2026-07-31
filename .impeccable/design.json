@@ -162,21 +162,30 @@
       "description": "A dense tool row with drag affordance, visibility control, label, and explicit state.",
       "html": "<button class=\"ds-toolbar-row ds-toolbar-row-selected\"><span class=\"ds-grip\" aria-hidden=\"true\"><i class=\"ds-grip-dot\"></i><i class=\"ds-grip-dot\"></i><i class=\"ds-grip-dot\"></i><i class=\"ds-grip-dot\"></i><i class=\"ds-grip-dot\"></i><i class=\"ds-grip-dot\"></i></span><span class=\"ds-toolbar-check\" aria-hidden=\"true\">✓</span><span class=\"ds-toolbar-name\">矩形</span><span class=\"ds-toolbar-state\">显示</span></button>",
       "css": ".ds-toolbar-row { width: min(100%, 382px); height: 36px; padding: 0 16px 0 10px; border: 0; border-radius: 6px; background: #FFFFFF; color: #152033; display: grid; grid-template-columns: 18px 18px 1fr auto; align-items: center; gap: 10px; font: 600 13px \"Segoe UI\", sans-serif; text-align: left; } .ds-toolbar-row:hover { background: #EFF4FD; } .ds-toolbar-row:focus-visible { outline: 2px solid #2764E7; outline-offset: 2px; } .ds-toolbar-row:active, .ds-toolbar-row-selected { background: #E8F0FF; } .ds-grip { width: 12px; display: grid; grid-template-columns: repeat(2, 3px); gap: 3px; } .ds-grip-dot { width: 3px; height: 3px; border-radius: 50%; background: #2764E7; } .ds-toolbar-check { width: 18px; height: 18px; border-radius: 4px; background: #2764E7; color: #FFFFFF; display: grid; place-items: center; font: 600 12px \"Segoe UI\", sans-serif; } .ds-toolbar-name { min-width: 0; } .ds-toolbar-state { color: #2764E7; font: 400 11px \"Segoe UI\", sans-serif; }"
+    },
+    {
+      "name": "Application Icon Choice Group — Light",
+      "kind": "custom",
+      "refersTo": "appIconChoiceSelectedLight",
+      "description": "Three distinct built-in icon silhouettes in one open keyboard choice group; selection remains draft until Save.",
+      "html": "<div class=\"ds-icon-group\" role=\"radiogroup\" aria-label=\"应用图标\"><label class=\"ds-icon-choice\"><input class=\"ds-icon-radio\" type=\"radio\" name=\"ds-app-icon\" value=\"focus-frame\" checked><span class=\"ds-icon-card\"><svg class=\"ds-icon-art\" viewBox=\"0 0 40 40\" aria-hidden=\"true\"><rect class=\"ds-icon-ink\" x=\"5\" y=\"5\" width=\"30\" height=\"30\" rx=\"6.25\"/><path class=\"ds-icon-cobalt-stroke\" d=\"M11.25 17.5v-6.25h6.25M22.5 11.25h6.25v6.25M11.25 22.5v6.25h6.25M22.5 28.75h6.25V22.5\"/><rect class=\"ds-icon-cyan\" x=\"18.6\" y=\"18.6\" width=\"2.8\" height=\"2.8\"/></svg><span class=\"ds-icon-copy\"><strong class=\"ds-icon-name\">精准取景</strong><small class=\"ds-icon-helper\">角框定位 · 默认</small></span><span class=\"ds-icon-check\" aria-hidden=\"true\">✓</span></span></label><label class=\"ds-icon-choice\"><input class=\"ds-icon-radio\" type=\"radio\" name=\"ds-app-icon\" value=\"flow-lens\"><span class=\"ds-icon-card\"><svg class=\"ds-icon-art\" viewBox=\"0 0 40 40\" aria-hidden=\"true\"><circle class=\"ds-icon-ink\" cx=\"20\" cy=\"20\" r=\"15\"/><path class=\"ds-icon-cobalt-fill\" d=\"M20 5A15 15 0 1 0 35 20h-5A10 10 0 1 1 20 10z\"/><rect class=\"ds-icon-cobalt-fill\" x=\"20\" y=\"18.9\" width=\"10\" height=\"2.2\"/><rect class=\"ds-icon-cyan\" x=\"28.75\" y=\"19.4\" width=\"2.5\" height=\"2.5\"/></svg><span class=\"ds-icon-copy\"><strong class=\"ds-icon-name\">流光镜</strong><small class=\"ds-icon-helper\">连续捕捉 · 动态</small></span><span class=\"ds-icon-check\" aria-hidden=\"true\">✓</span></span></label><label class=\"ds-icon-choice\"><input class=\"ds-icon-radio\" type=\"radio\" name=\"ds-app-icon\" value=\"pixel-console\"><span class=\"ds-icon-card\"><svg class=\"ds-icon-art\" viewBox=\"0 0 40 40\" aria-hidden=\"true\"><path class=\"ds-icon-ink\" d=\"M7.5 7.5h7.8v7.8H7.5zm17.2 0h7.8v7.8h-7.8zM7.5 24.7h7.8v7.8H7.5zm17.2 0h7.8v7.8h-7.8z\"/><path class=\"ds-icon-cobalt-fill\" d=\"M16.1 7.5h7.8v7.8h-7.8zM7.5 16.1h7.8v7.8H7.5zm17.2 0h7.8v7.8h-7.8zM16.1 24.7h7.8v7.8h-7.8z\"/><rect class=\"ds-icon-cyan\" x=\"16.1\" y=\"16.1\" width=\"7.8\" height=\"7.8\"/></svg><span class=\"ds-icon-copy\"><strong class=\"ds-icon-name\">像素舱</strong><small class=\"ds-icon-helper\">模块输出 · 技术</small></span><span class=\"ds-icon-check\" aria-hidden=\"true\">✓</span></span></label></div>",
+      "css": ".ds-icon-group { width: min(100%, 632px); padding: 13px 20px; border: 1px solid #DCE3EE; border-radius: 10px; background: #FFFFFF; display: flex; gap: 8px; box-sizing: border-box; } .ds-icon-choice { position: relative; width: 192px; height: 82px; flex: 0 0 192px; } .ds-icon-radio { position: absolute; width: 1px; height: 1px; opacity: 0; } .ds-icon-card { width: 192px; height: 82px; padding: 13px 12px 13px 14px; border: 1px solid #DCE3EE; border-radius: 8px; background: #FFFFFF; color: #152033; display: grid; grid-template-columns: 40px 1fr; align-items: center; gap: 12px; box-sizing: border-box; font-family: \"Segoe UI\", sans-serif; } .ds-icon-choice:hover .ds-icon-card { background: #EFF4FD; } .ds-icon-radio:focus-visible + .ds-icon-card { outline: 2px solid #2764E7; outline-offset: 2px; } .ds-icon-radio:checked + .ds-icon-card, .ds-icon-choice:active .ds-icon-card { border: 1.5px solid #1E55C8; background: #E8F0FF; } .ds-icon-art { width: 40px; height: 40px; } .ds-icon-ink { fill: #091426; } .ds-icon-cobalt-fill { fill: #2764E7; } .ds-icon-cobalt-stroke { fill: none; stroke: #2764E7; stroke-width: 2.1; stroke-linecap: square; stroke-linejoin: miter; } .ds-icon-cyan { fill: #1AAFB5; } .ds-icon-copy { display: grid; gap: 3px; min-width: 0; } .ds-icon-name { font-size: 13px; font-weight: 600; } .ds-icon-helper { color: #63708A; font-size: 12px; font-weight: 400; white-space: nowrap; } .ds-icon-check { display: none; position: absolute; top: 8px; right: 8px; width: 12px; height: 12px; border-radius: 50%; background: #2764E7; color: #FFFFFF; place-items: center; font-size: 9px; font-weight: 600; } .ds-icon-radio:checked + .ds-icon-card .ds-icon-check { display: grid; }"
     }
   ],
   "narrative": {
     "northStar": "The Capture Console",
-    "overview": "The Capture Console treats settings as a native instrument panel for the real screenshot pipeline. A persistent near-black command rail sits beside a cool neutral work canvas; related decisions share open row groups, while individual settings never become a wall of detached cards.\n\nThe compact `截图 → 标注 → OCR → 输出` strip keeps cause and result visible before users commit changes. Light, dark, and Windows High Contrast modes preserve the same semantic hierarchy: cobalt operates controls, cyan confirms healthy or synchronized state, and red identifies a problem that needs recovery.",
+    "overview": "The Capture Console treats settings as a native instrument panel for the real screenshot pipeline. A persistent near-black command rail sits beside a cool neutral work canvas; related decisions share open row groups, while individual settings never become a wall of detached cards.\n\nThe compact `截图 → 标注 → OCR → 输出` strip keeps cause and result visible before users commit changes. The application-icon family extends the same console identity with three genuinely different silhouettes, and its selection remains part of the draft until Save. Light, dark, and Windows High Contrast modes preserve the same semantic hierarchy: cobalt operates controls, cyan confirms healthy or synchronized state or marks a precise locator, and red identifies a problem that needs recovery.",
     "keyCharacteristics": [
       "Five stable destinations in a 224-DIP precision rail.",
       "Open 56-DIP settings rows and compact 40-DIP tool rows.",
       "Cobalt interaction, cyan health, and red recovery semantics.",
-      "A 64-DIP footer that keeps save validity and draft state visible."
+      "A 64-DIP footer that keeps save validity and draft state visible.",
+      "Three built-in icon silhouettes sharing one palette and centered safe-area discipline."
     ],
     "rules": [
       {
         "name": "The Cobalt/Cyan Separation Rule",
-        "body": "Cobalt always means interaction or draft state; cyan only means healthy, ready, or synchronized state.",
+        "body": "Cobalt always means interaction or draft state; cyan only means healthy, ready, synchronized, or a precise locator point.",
         "section": "colors"
       },
       {
@@ -208,6 +217,16 @@
         "name": "The Nested Radius Rule",
         "body": "Inner controls must remain equal to or tighter than the 10-DIP group that contains them.",
         "section": "shapes"
+      },
+      {
+        "name": "The Shared Palette, Distinct Silhouette Rule",
+        "body": "Keep the icon palette and safe-area discipline constant, but never reduce the three icon directions to recolors of one outline.",
+        "section": "shapes"
+      },
+      {
+        "name": "The Saved Runtime Icon Rule",
+        "body": "Treat the selected icon as draft state until Save; update runtime shell surfaces after Save while leaving the Explorer program-file icon on Focus Frame.",
+        "section": "components"
       }
     ],
     "dos": [
@@ -215,13 +234,17 @@
       "Do keep navigation order, visual order, and keyboard focus order aligned.",
       "Do pair health, draft, and error colors with explicit text.",
       "Do include cause and recovery in shortcut conflicts and OCR dependency failures.",
-      "Do test light, dark, Windows High Contrast, keyboard-only use, per-monitor DPI, and the 820 × 640 minimum work area."
+      "Do test light, dark, Windows High Contrast, keyboard-only use, per-monitor DPI, and the 820 × 640 minimum work area.",
+      "Do preserve all three icon silhouettes, their shared three-color palette, centered safe-area discipline, and visible selected checkmark.",
+      "Do generate every ICO frame at its target size with optical correction for small pixels."
     ],
     "donts": [
       "Don't invent destinations, cloud OCR, account state, commercial capabilities, or unsupported output formats.",
       "Don't use gradients, glass, glow, decorative shadows, decorative animation, oversized headlines, or card grids.",
       "Don't reuse cyan as a decorative accent or use rail text as the foreground on bright dark-mode cobalt.",
-      "Don't hide critical actions behind hover, drag-only interaction, or disabled hit targets."
+      "Don't hide critical actions behind hover, drag-only interaction, or disabled hit targets.",
+      "Don't describe icon selection as dynamically rewriting the executable or changing its Explorer program-file icon.",
+      "Don't create icon variants by recoloring one silhouette or by blindly scaling only the 256 px master."
     ]
   }
 }

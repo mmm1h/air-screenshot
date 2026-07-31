@@ -1,7 +1,7 @@
 #include "host_app.h"
 
 #include "about_window.h"
-#include "resource.h"
+#include "app_icon.h"
 #include "settings_window.h"
 
 #include "airshot/capture.h"
@@ -164,8 +164,8 @@ bool HostApp::initialize() {
     window_class.lpfnWndProc = window_proc;
     window_class.hInstance = instance_;
     window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    window_class.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APP_ICON));
-    window_class.hIconSm = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APP_ICON));
+    window_class.hIcon = load_app_icon(instance_, kDefaultAppIcon, 32, 32);
+    window_class.hIconSm = load_app_icon(instance_, kDefaultAppIcon, 16, 16);
     window_class.lpszClassName = kAppWindowClass;
     if (!RegisterClassExW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         return false;
@@ -210,6 +210,7 @@ bool HostApp::initialize() {
         return false;
     }
     config_ = std::move(*loaded_config);
+    apply_app_icon_to_window(window_, config_.app_icon);
     const HWND dispatch_window = window_;
     const DWORD dispatch_thread = GetCurrentThreadId();
     accepting_requests_.store(true, std::memory_order_release);
@@ -573,6 +574,7 @@ bool HostApp::commit_config(AppConfig next, std::wstring* error) {
     }
 
     config_ = std::move(next);
+    apply_app_icon_to_window(window_, config_.app_icon);
     return true;
 }
 
@@ -590,7 +592,8 @@ void HostApp::add_tray() {
     tray_.uID = 1;
     tray_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     tray_.uCallbackMessage = kTrayMessage;
-    tray_.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APP_ICON));
+    const int icon_size = std::max(16, GetSystemMetrics(SM_CXSMICON));
+    tray_.hIcon = load_app_icon(instance_, config_.app_icon, icon_size, icon_size);
     wcscpy_s(tray_.szTip, kAppName);
     tray_added_ = Shell_NotifyIconW(NIM_ADD, &tray_) == TRUE;
     if (tray_added_) {

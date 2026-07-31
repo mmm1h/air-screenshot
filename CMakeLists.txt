@@ -227,6 +227,7 @@ configure_file(
 
 add_executable(AirScreenshot WIN32
     src/host/about_window.cpp
+    src/host/app_icon.cpp
     src/host/host_app.cpp
     src/host/cli_app.cpp
     src/host/main.cpp
@@ -262,6 +263,16 @@ if(BUILD_TESTING)
     target_include_directories(airshot_portable_tests PRIVATE src/core)
     airshot_add_test(airshot_scroll_tests tests/test_scroll.cpp)
     target_link_libraries(airshot_scroll_tests PRIVATE comctl32)
+
+    add_executable(airshot_settings_preview WIN32
+        tests/settings_preview.cpp
+        src/host/app_icon.cpp
+        src/host/settings_window_v2.cpp
+        src/host/resources.rc
+    )
+    target_include_directories(airshot_settings_preview PRIVATE src/host)
+    airshot_apply_executable_policy(airshot_settings_preview)
+    target_link_libraries(airshot_settings_preview PRIVATE airshot_core comctl32)
 endif()
 
 install(TARGETS AirScreenshot RUNTIME DESTINATION .)

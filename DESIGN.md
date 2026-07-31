@@ -213,6 +213,34 @@ components:
     typography: "{typography.body}"
     rounded: "{rounded.field}"
     height: "36px"
+  appIconChoiceLight:
+    backgroundColor: "{colors.surfaceLight}"
+    textColor: "{colors.textLight}"
+    typography: "{typography.body}"
+    rounded: "{rounded.md}"
+    width: "192px"
+    height: "82px"
+  appIconChoiceDark:
+    backgroundColor: "{colors.surfaceDark}"
+    textColor: "{colors.textDark}"
+    typography: "{typography.body}"
+    rounded: "{rounded.md}"
+    width: "192px"
+    height: "82px"
+  appIconChoiceSelectedLight:
+    backgroundColor: "{colors.accentSoftLight}"
+    textColor: "{colors.primaryHover}"
+    typography: "{typography.body}"
+    rounded: "{rounded.md}"
+    width: "192px"
+    height: "82px"
+  appIconChoiceSelectedDark:
+    backgroundColor: "{colors.accentSoftDark}"
+    textColor: "{colors.primaryDarkHover}"
+    typography: "{typography.body}"
+    rounded: "{rounded.md}"
+    width: "192px"
+    height: "82px"
   switchOnLight:
     backgroundColor: "{colors.primary}"
     rounded: "{rounded.switch}"
@@ -267,7 +295,7 @@ components:
 
 The Capture Console treats settings as a native instrument panel for the real screenshot pipeline. A persistent near-black command rail sits beside a cool neutral work canvas; related decisions share open row groups, while individual settings never become a wall of detached cards.
 
-The compact `截图 → 标注 → OCR → 输出` strip keeps cause and result visible before users commit changes. Light, dark, and Windows High Contrast modes preserve the same semantic hierarchy: cobalt operates controls, cyan confirms healthy or synchronized state, and red identifies a problem that needs recovery.
+The compact `截图 → 标注 → OCR → 输出` strip keeps cause and result visible before users commit changes. The application-icon family extends the same console identity with three genuinely different silhouettes, and its selection remains part of the draft until Save. Light, dark, and Windows High Contrast modes preserve the same semantic hierarchy: cobalt operates controls, cyan confirms healthy or synchronized state or marks a precise locator, and red identifies a problem that needs recovery.
 
 **Key Characteristics:**
 
@@ -275,6 +303,7 @@ The compact `截图 → 标注 → OCR → 输出` strip keeps cause and result 
 - Open 56-DIP settings rows and compact 40-DIP tool rows.
 - Cobalt interaction, cyan health, and red recovery semantics.
 - A 64-DIP footer that keeps save validity and draft state visible.
+- Three built-in icon silhouettes sharing one palette and centered safe-area discipline.
 
 ## Colors
 
@@ -287,7 +316,7 @@ The palette is a semantic light/dark pair rather than a mechanical inversion, wi
 
 ### Semantic Status
 
-- **Healthy Cyan:** The cyan pair appears only when a workflow result, shortcut set, or saved state is healthy or synchronized.
+- **Healthy / Locator Cyan:** The cyan pair appears when a workflow result, shortcut set, or saved state is healthy or synchronized, and as the single locator point inside application-icon artwork.
 - **Recovery Red:** The danger pair marks shortcut conflicts, download failures, and close-hover risk; the soft danger pair supplies the corresponding hover surface.
 
 ### Neutral
@@ -299,7 +328,9 @@ The palette is a semantic light/dark pair rather than a mechanical inversion, wi
 
 ### Named Rules
 
-**The Cobalt/Cyan Separation Rule.** Cobalt always means interaction or draft state; cyan only means healthy, ready, or synchronized state.
+Application icons reuse Precision Rail ink, Operational Cobalt, and Healthy / Locator Cyan without introducing another palette. Their identity comes from silhouette and geometry, not recoloring.
+
+**The Cobalt/Cyan Separation Rule.** Cobalt always means interaction or draft state; cyan only means healthy, ready, synchronized, or a precise locator point.
 
 **The Semantic Pairing Rule.** Choose the named light or dark role directly; never generate one theme by inverting the other.
 
@@ -331,6 +362,8 @@ The 224-DIP rail and 48-DIP title bar stay fixed in the coordinate system. Main 
 
 The bottom 64 DIPs form a persistent footer for status, Cancel, and the one primary Save action. Spacing follows a 4/8-DIP rhythm, with 12-, 16-, 24-, 32-, and 48-DIP steps used for nested gaps and section separation.
 
+Within `应用与外观`, the application-icon section sits below the theme group and above the footer. One open group contains three 192 × 82-DIP choice targets with 8-DIP gaps; each target pairs a 40-DIP icon preview with a name and short descriptor while preserving the shared control column and footer boundary.
+
 ### Named Rules
 
 **The Open Row Rule.** Place related settings inside one bounded group with internal separators; never wrap every setting in its own card.
@@ -351,9 +384,13 @@ Geometry follows role rather than one universal radius. Progress tracks and chec
 
 Circular geometry is functional: switch thumbs, health/error dots, drag-grip dots, and icon details. No other control becomes pill-shaped.
 
+The application-icon family shares a centered safe-area system and the same three colors while keeping truly different contours: Focus Frame uses a rounded tile with four targeting corners, Flow Lens uses a circular orbit and horizontal scan axis, and Pixel Console uses a square 3 × 3 module grid. Optical insets may vary at small sizes to preserve apparent weight.
+
 ### Named Rules
 
 **The Nested Radius Rule.** Inner controls must remain equal to or tighter than the 10-DIP group that contains them.
+
+**The Shared Palette, Distinct Silhouette Rule.** Keep the icon palette and safe-area discipline constant, but never reduce the three icon directions to recolors of one outline.
 
 ## Components
 
@@ -380,6 +417,17 @@ Circular geometry is functional: switch thumbs, health/error dots, drag-grip dot
 
 - Standard choice controls are 36 DIPs tall with a 7-DIP radius and 1-DIP border.
 - Selected choices use soft cobalt with cobalt-hover text and border; unselected choices use the surface, muted text, and neutral border.
+
+### Application Icon Choices
+
+- The open group contains three 192 × 82-DIP targets: **精准取景 / Focus Frame** (default targeting corners), **流光镜 / Flow Lens** (orbiting lens with scan axis), and **像素舱 / Pixel Console** (modular 3 × 3 grid).
+- Every preview uses the same Precision Rail, Operational Cobalt, and Healthy / Locator Cyan palette and a centered safe-area discipline, while its outer contour and internal construction remain unmistakably different.
+- Hover uses the normal hover surface. Selection uses soft cobalt, a 1.5-DIP cobalt-hover border, and a visible checked mark so state never depends on color alone; keyboard focus retains the 2-DIP expanded cobalt outline.
+- The three targets form one keyboard choice group. Left/Right and Up/Down arrows wrap across choices, and pointer or keyboard selection changes only the settings draft.
+- Saving applies the chosen resource to the tray and running window/taskbar HICON. The program file remains associated with the default Focus Frame icon in Explorer; the product does not rewrite its executable.
+- Each ICO contains dedicated 16, 20, 24, 32, 40, 48, 64, 128, and 256 px images. Small frames are pixel-fitted and optically corrected rather than produced by simple downscaling.
+
+**The Saved Runtime Icon Rule.** Treat the selected icon as draft state until Save; update runtime shell surfaces after Save while leaving the Explorer program-file icon on Focus Frame.
 
 ### Shortcut Fields
 
@@ -416,6 +464,8 @@ Circular geometry is functional: switch thumbs, health/error dots, drag-grip dot
 - **Do** pair health, draft, and error colors with explicit text.
 - **Do** include cause and recovery in shortcut conflicts and OCR dependency failures.
 - **Do** test light, dark, Windows High Contrast, keyboard-only use, per-monitor DPI, and the 820 × 640 minimum work area.
+- **Do** preserve all three icon silhouettes, their shared three-color palette, centered safe-area discipline, and visible selected checkmark.
+- **Do** generate every ICO frame at its target size with optical correction for small pixels.
 
 ### Don't:
 
@@ -423,3 +473,5 @@ Circular geometry is functional: switch thumbs, health/error dots, drag-grip dot
 - **Don't** use gradients, glass, glow, decorative shadows, decorative animation, oversized headlines, or card grids.
 - **Don't** reuse cyan as a decorative accent or use rail text as the foreground on bright dark-mode cobalt.
 - **Don't** hide critical actions behind hover, drag-only interaction, or disabled hit targets.
+- **Don't** describe icon selection as dynamically rewriting the executable or changing its Explorer program-file icon.
+- **Don't** create icon variants by recoloring one silhouette or by blindly scaling only the 256 px master.

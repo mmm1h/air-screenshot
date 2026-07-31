@@ -1,5 +1,7 @@
 #include "settings_window.h"
 
+#include "app_icon.h"
+
 #include "airshot/ocr.h"
 #include "airshot/strings.h"
 #include <d2d1.h>
@@ -71,6 +73,7 @@ enum class SettingsFocusKind {
     app_shell,
     app_startup,
     theme,
+    app_icon,
     save,
     cancel,
     close,
@@ -1335,6 +1338,9 @@ std::vector<SettingsFocusTarget> settings_focus_targets(const SettingsState* sta
         for (int index = 0; index < 3; ++index) {
             targets.push_back({SettingsFocusKind::theme, index});
         }
+        for (int index = 0; index < 3; ++index) {
+            targets.push_back({SettingsFocusKind::app_icon, index});
+        }
     }
     if (settings_are_dirty(state) && !state->shortcut_error) {
         targets.push_back({SettingsFocusKind::save});
@@ -1461,6 +1467,20 @@ std::optional<D2D1_ROUNDED_RECT> settings_focus_bounds(
             const auto [left, right] = bounds[static_cast<std::size_t>(target.index)];
             rect = D2D1::RectF(
                 static_cast<float>(left), 344.0f, static_cast<float>(right), 382.0f);
+            break;
+        }
+        case SettingsFocusKind::app_icon: {
+            constexpr std::array<std::pair<int, int>, 3> bounds{{
+                {276, 468},
+                {476, 668},
+                {676, 868},
+            }};
+            if (target.index < 0 || target.index >= static_cast<int>(bounds.size())) {
+                return std::nullopt;
+            }
+            const auto [left, right] = bounds[static_cast<std::size_t>(target.index)];
+            rect = D2D1::RectF(
+                static_cast<float>(left), 470.0f, static_cast<float>(right), 552.0f);
             break;
         }
         case SettingsFocusKind::save:
@@ -1726,6 +1746,18 @@ bool activate_settings_focus(
                 state->config.theme =
                     std::wstring(themes[static_cast<std::size_t>(target.index)]);
                 refresh_settings_theme(state);
+            }
+            break;
+        }
+        case SettingsFocusKind::app_icon: {
+            constexpr std::array<std::wstring_view, 3> icons{
+                kAppIconFocusFrame,
+                kAppIconFlowLens,
+                kAppIconPixelConsole,
+            };
+            if (target.index >= 0 && target.index < static_cast<int>(icons.size())) {
+                state->config.app_icon =
+                    std::wstring(icons[static_cast<std::size_t>(target.index)]);
             }
             break;
         }
@@ -2583,7 +2615,7 @@ void draw_shortcuts_page(SettingsState* state) {
 
 void draw_app_page(SettingsState* state) {
     draw_page_header(
-        state, L"应用与外观", L"控制后台运行方式与窗口主题。");
+        state, L"应用与外观", L"控制后台运行方式、窗口主题与应用图标。");
     draw_section_title(state, L"后台运行", 126.0f);
     draw_row_group(state, 152.0f, 264.0f);
     const bool shell_hovered =
@@ -2657,6 +2689,207 @@ void draw_app_page(SettingsState* state) {
                 static_cast<float>(choice.right),
                 382.0f));
     }
+
+    draw_section_title(state, L"应用图标", 430.0f);
+    draw_row_group(state, 456.0f, 612.0f);
+    struct AppIconChoice {
+        std::wstring_view value;
+        const wchar_t* label;
+        const wchar_t* helper;
+        int left;
+        int right;
+    };
+    constexpr std::array<AppIconChoice, 3> icon_choices{{
+        {kAppIconFocusFrame, L"精准取景", L"角框定位 · 默认", 276, 468},
+        {kAppIconFlowLens, L"流光镜", L"连续捕捉 · 动态", 476, 668},
+        {kAppIconPixelConsole, L"像素舱", L"模块输出 · 技术", 676, 868},
+    }};
+    for (int index = 0; index < static_cast<int>(icon_choices.size()); ++index) {
+        const auto& choice = icon_choices[static_cast<std::size_t>(index)];
+        const bool selected = state->config.app_icon == choice.value;
+        const bool hovered = point_in_rect(
+            state->mouse_pos,
+            static_cast<float>(choice.left),
+            470.0f,
+            static_cast<float>(choice.right),
+            552.0f);
+        const auto rect = D2D1::RoundedRect(
+            D2D1::RectF(
+                static_cast<float>(choice.left),
+                470.0f,
+                static_cast<float>(choice.right),
+                552.0f),
+            8.0f,
+            8.0f);
+        state->render_target->FillRoundedRectangle(
+            rect,
+            selected ? state->accent_soft_brush.Get()
+                     : (hovered ? state->hover_bg_brush.Get()
+                                : state->control_bg_brush.Get()));
+        state->render_target->DrawRoundedRectangle(
+            rect,
+            selected ? state->hover_blue_brush.Get()
+                     : state->card_border_brush.Get(),
+            selected ? 1.5f : 1.0f);
+
+        const float icon_x = static_cast<float>(choice.left + 14);
+        constexpr float icon_y = 489.0f;
+        constexpr float icon_size = 40.0f;
+        auto* target = state->render_target.Get();
+        if (index == 0) {
+            const float margin = icon_size * 0.125f;
+            target->FillRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(
+                        icon_x + margin,
+                        icon_y + margin,
+                        icon_x + icon_size - margin,
+                        icon_y + icon_size - margin),
+                    icon_size * 0.15625f,
+                    icon_size * 0.15625f),
+                state->sidebar_bg_brush.Get());
+            const float p0 = icon_size * 0.28125f;
+            const float p1 = icon_size * 0.4375f;
+            const float p2 = icon_size * 0.5625f;
+            const float p3 = icon_size * 0.71875f;
+            const float stroke = 2.1f;
+            target->DrawLine(D2D1::Point2F(icon_x + p0, icon_y + p1), D2D1::Point2F(icon_x + p0, icon_y + p0), state->blue_brush.Get(), stroke);
+            target->DrawLine(D2D1::Point2F(icon_x + p0, icon_y + p0), D2D1::Point2F(icon_x + p1, icon_y + p0), state->blue_brush.Get(), stroke);
+            target->DrawLine(D2D1::Point2F(icon_x + p2, icon_y + p0), D2D1::Point2F(icon_x + p3, icon_y + p0), state->blue_brush.Get(), stroke);
+            target->DrawLine(D2D1::Point2F(icon_x + p3, icon_y + p0), D2D1::Point2F(icon_x + p3, icon_y + p1), state->blue_brush.Get(), stroke);
+            target->DrawLine(D2D1::Point2F(icon_x + p0, icon_y + p2), D2D1::Point2F(icon_x + p0, icon_y + p3), state->blue_brush.Get(), stroke);
+            target->DrawLine(D2D1::Point2F(icon_x + p0, icon_y + p3), D2D1::Point2F(icon_x + p1, icon_y + p3), state->blue_brush.Get(), stroke);
+            target->DrawLine(D2D1::Point2F(icon_x + p2, icon_y + p3), D2D1::Point2F(icon_x + p3, icon_y + p3), state->blue_brush.Get(), stroke);
+            target->DrawLine(D2D1::Point2F(icon_x + p3, icon_y + p2), D2D1::Point2F(icon_x + p3, icon_y + p3), state->blue_brush.Get(), stroke);
+            const float focus = icon_size * 0.0703125f;
+            target->FillRectangle(
+                D2D1::RectF(
+                    icon_x + (icon_size - focus) * 0.5f,
+                    icon_y + (icon_size - focus) * 0.5f,
+                    icon_x + (icon_size + focus) * 0.5f,
+                    icon_y + (icon_size + focus) * 0.5f),
+                state->cyan_brush.Get());
+        } else if (index == 1) {
+            const float margin = icon_size * 0.125f;
+            target->FillEllipse(
+                D2D1::Ellipse(
+                    D2D1::Point2F(icon_x + icon_size * 0.5f, icon_y + icon_size * 0.5f),
+                    icon_size * 0.375f,
+                    icon_size * 0.375f),
+                state->sidebar_bg_brush.Get());
+            Microsoft::WRL::ComPtr<ID2D1PathGeometry> geometry;
+            if (SUCCEEDED(state->d2d_factory->CreatePathGeometry(geometry.GetAddressOf()))) {
+                Microsoft::WRL::ComPtr<ID2D1GeometrySink> sink;
+                if (SUCCEEDED(geometry->Open(sink.GetAddressOf()))) {
+                    sink->BeginFigure(
+                        D2D1::Point2F(icon_x + icon_size * 0.5f, icon_y + margin),
+                        D2D1_FIGURE_BEGIN_FILLED);
+                    sink->AddArc(D2D1::ArcSegment(
+                        D2D1::Point2F(
+                            icon_x + icon_size * 0.875f,
+                            icon_y + icon_size * 0.5f),
+                        D2D1::SizeF(icon_size * 0.375f, icon_size * 0.375f),
+                        0.0f,
+                        D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                        D2D1_ARC_SIZE_LARGE));
+                    sink->AddLine(D2D1::Point2F(
+                        icon_x + icon_size * 0.75f,
+                        icon_y + icon_size * 0.5f));
+                    sink->AddArc(D2D1::ArcSegment(
+                        D2D1::Point2F(
+                            icon_x + icon_size * 0.5f,
+                            icon_y + icon_size * 0.25f),
+                        D2D1::SizeF(icon_size * 0.25f, icon_size * 0.25f),
+                        0.0f,
+                        D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                        D2D1_ARC_SIZE_LARGE));
+                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                    if (SUCCEEDED(sink->Close())) {
+                        target->FillGeometry(geometry.Get(), state->blue_brush.Get());
+                    }
+                }
+            }
+            target->FillRectangle(
+                D2D1::RectF(
+                    icon_x + icon_size * 0.5f,
+                    icon_y + icon_size * 0.47265625f,
+                    icon_x + icon_size * 0.75f,
+                    icon_y + icon_size * 0.52734375f),
+                state->blue_brush.Get());
+            const float locator = std::max(2.0f, icon_size * 0.0625f);
+            target->FillRectangle(
+                D2D1::RectF(
+                    icon_x + icon_size * 0.71875f,
+                    icon_y + icon_size * 0.484375f,
+                    icon_x + icon_size * 0.71875f + locator,
+                    icon_y + icon_size * 0.484375f + locator),
+                state->cyan_brush.Get());
+        } else {
+            const float cell = icon_size * 0.1953125f;
+            const float gap = icon_size * 0.01953125f;
+            const float origin = icon_size * 0.1875f;
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    ID2D1SolidColorBrush* brush =
+                        row == 1 && column == 1
+                            ? state->cyan_brush.Get()
+                            : ((row + column) % 2 == 1
+                                   ? state->blue_brush.Get()
+                                   : state->sidebar_bg_brush.Get());
+                    const float left = icon_x + origin + column * (cell + gap);
+                    const float top = icon_y + origin + row * (cell + gap);
+                    target->FillRectangle(
+                        D2D1::RectF(left, top, left + cell, top + cell), brush);
+                }
+            }
+        }
+
+        state->render_target->DrawTextW(
+            choice.label,
+            static_cast<UINT32>(wcslen(choice.label)),
+            state->text_format.Get(),
+            D2D1::RectF(
+                static_cast<float>(choice.left + 66),
+                481.0f,
+                static_cast<float>(choice.right - 22),
+                507.0f),
+            selected ? state->hover_blue_brush.Get()
+                     : state->text_white_brush.Get());
+        state->render_target->DrawTextW(
+            choice.helper,
+            static_cast<UINT32>(wcslen(choice.helper)),
+            state->small_format.Get(),
+            D2D1::RectF(
+                static_cast<float>(choice.left + 66),
+                509.0f,
+                static_cast<float>(choice.right - 12),
+                536.0f),
+            state->text_grey_brush.Get());
+        if (selected) {
+            const D2D1_POINT_2F center = D2D1::Point2F(
+                static_cast<float>(choice.right - 14), 484.0f);
+            state->render_target->FillEllipse(
+                D2D1::Ellipse(center, 6.0f, 6.0f), state->blue_brush.Get());
+            state->render_target->DrawLine(
+                D2D1::Point2F(center.x - 2.5f, center.y),
+                D2D1::Point2F(center.x - 0.5f, center.y + 2.0f),
+                state->accent_text_brush.Get(),
+                1.3f);
+            state->render_target->DrawLine(
+                D2D1::Point2F(center.x - 0.5f, center.y + 2.0f),
+                D2D1::Point2F(center.x + 3.0f, center.y - 2.5f),
+                state->accent_text_brush.Get(),
+                1.3f);
+        }
+    }
+    constexpr std::wstring_view icon_helper =
+        L"同步托盘、任务栏与运行中的窗口；程序文件图标保持默认款。";
+    state->render_target->DrawTextW(
+        icon_helper.data(),
+        static_cast<UINT32>(icon_helper.size()),
+        state->small_format.Get(),
+        D2D1::RectF(276.0f, 568.0f, 868.0f, 598.0f),
+        state->text_grey_brush.Get());
 }
 
 void draw_footer(SettingsState* state) {
@@ -2903,6 +3136,22 @@ std::optional<SettingsFocusTarget> hit_test_settings(
                     static_cast<float>(right),
                     382.0f)) {
                 return SettingsFocusTarget{SettingsFocusKind::theme, index};
+            }
+        }
+        constexpr std::array<std::pair<int, int>, 3> icon_bounds{{
+            {276, 468},
+            {476, 668},
+            {676, 868},
+        }};
+        for (int index = 0; index < static_cast<int>(icon_bounds.size()); ++index) {
+            const auto [left, right] = icon_bounds[static_cast<std::size_t>(index)];
+            if (point_in_rect(
+                    point,
+                    static_cast<float>(left),
+                    470.0f,
+                    static_cast<float>(right),
+                    552.0f)) {
+                return SettingsFocusTarget{SettingsFocusKind::app_icon, index};
             }
         }
     }
@@ -3240,7 +3489,8 @@ LRESULT CALLBACK settings_proc(
                 } else if (target.kind == SettingsFocusKind::capture_output) {
                     count = 2;
                 } else if (target.kind == SettingsFocusKind::ocr_engine ||
-                           target.kind == SettingsFocusKind::theme) {
+                           target.kind == SettingsFocusKind::theme ||
+                           target.kind == SettingsFocusKind::app_icon) {
                     count = 3;
                 }
                 if (count > 0) {
@@ -3439,6 +3689,8 @@ HWND show_settings_window_async(HWND owner, AppConfig config, SettingsWindowComp
         }
         return nullptr;
     }
+
+    apply_app_icon_to_window(window, state->config.app_icon);
 
     MARGINS margins = { 1, 1, 1, 1 };
     DwmExtendFrameIntoClientArea(window, &margins);
