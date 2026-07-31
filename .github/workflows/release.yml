@@ -383,9 +383,13 @@ jobs:
 
           read_git_object \
             "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME"
-          for ((depth = 0; depth < 16 && object_type == "tag"; depth++)); do
+          depth=0
+          # object_type is text; an arithmetic loop treats "tag" as an
+          # unset variable when nounset is enabled.
+          while [[ "$depth" -lt 16 && "$object_type" == "tag" ]]; do
             read_git_object \
               "repos/$GITHUB_REPOSITORY/git/tags/$object_sha"
+            depth=$((depth + 1))
           done
           if [[ "$object_type" != "commit" ]]; then
             echo "Tag did not resolve to a commit within 16 annotated tag objects." >&2

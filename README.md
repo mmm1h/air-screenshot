@@ -86,8 +86,8 @@ Windows SmartScreen 可能提示未知发布者。这是因为当前使用自签
 推送格式为 `vX.Y.Z` 的 tag 会自动运行 [release.yml](.github/workflows/release.yml)：
 
 ```powershell
-git tag v0.3.4
-git push origin v0.3.4
+git tag v0.3.5
+git push origin v0.3.5
 ```
 
 工作流将职责分为四个 job：无 secrets 的构建与 Debug/Release 测试、只有签名权限的打包验证、无 PFX 的产物证明与 Pages 暂存、最终部署和 Release 发布。签名证书只写入签名 runner 的临时目录，并在打包步骤结束时删除。所有版本共享同一个发布并发组；发布前会将 lightweight/annotated tag 解引用到 commit，核对 `GITHUB_SHA`，并拒绝不高于现有最高正式版本的发布。失败重跑遇到同名正式 Release 时，会逐个比对不可变资产；内容完全一致才继续验证，绝不覆盖或悄悄替换资产。
