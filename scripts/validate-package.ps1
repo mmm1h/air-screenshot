@@ -281,8 +281,17 @@ if ($LASTEXITCODE -ne 0) {
 if ($headers -notmatch "(?im)8664 machine \(x64\)") {
     throw "AirScreenshot.exe 不是 x64 二进制。"
 }
-if ($headers -notmatch "(?im)Guard CF") {
+if ($headers -notmatch
+        "(?im)^\s*(?:Control Flow Guard|Guard CF)\s*$") {
     throw "AirScreenshot.exe 未启用 Control Flow Guard。"
+}
+$loadConfig = (& $dumpbin /nologo /loadconfig $executable | Out-String)
+if ($LASTEXITCODE -ne 0) {
+    throw "DumpBin Load Config 检查失败，退出码：$LASTEXITCODE"
+}
+if ($loadConfig -notmatch "(?im)^\s*CF instrumented\s*$" -or
+    $loadConfig -notmatch "(?im)^\s*FID table present\s*$") {
+    throw "AirScreenshot.exe 缺少 CFG 插桩或有效函数表。"
 }
 $codeViewPattern = "Format:\s*RSDS,\s*\{(?<guid>[A-Fa-f0-9-]{36})\},\s*(?<age>\d+)"
 $codeViewMatches = [regex]::Matches($headers, $codeViewPattern)
