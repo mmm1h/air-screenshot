@@ -11,6 +11,7 @@ param(
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $true
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "ocr-runner-payload.ps1")
 if ([string]::IsNullOrWhiteSpace($OcrRoot)) {
     $OcrRoot = Join-Path $root "dist\ocr-dependencies\rapidocr-onnx"
 }
@@ -116,32 +117,6 @@ function Copy-PreparedFile {
     Copy-Item -LiteralPath $Source -Destination $destination -Force
 }
 
-function Get-RunnerOutputFingerprint {
-    param([Parameter(Mandatory = $true)][string]$Root)
-
-    $runner = Join-Path $Root "rapidocr_runner.exe"
-    $internal = Join-Path $Root "_internal"
-    if (-not (Test-Path -LiteralPath $runner -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $internal -PathType Container)) {
-        return ""
-    }
-
-    $files = @(
-        Get-Item -LiteralPath $runner
-        Get-ChildItem -LiteralPath $internal -File -Recurse
-    ) | Sort-Object FullName
-    $inventory = foreach ($file in $files) {
-        $relative = [IO.Path]::GetRelativePath($Root, $file.FullName).Replace("\", "/")
-        "$relative|$($file.Length)|$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash)"
-    }
-    $inventoryText = $inventory -join "`n"
-    return [Convert]::ToHexString(
-        [Security.Cryptography.SHA256]::HashData(
-            [Text.Encoding]::UTF8.GetBytes($inventoryText)
-        )
-    )
-}
-
 $inlineRequirementsLock = @'
 altgraph==0.17.5 --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
 certifi==2026.7.22 --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775
@@ -214,6 +189,11 @@ foreach ($retiredFile in @("rapidocr_api.dll", "onnxruntime.dll")) {
     Remove-Item -LiteralPath (Join-Path $OcrRoot $retiredFile) -Force -ErrorAction SilentlyContinue
 }
 
+# Remove only reviewed non-runtime PyInstaller artifacts. Unknown empty files
+# remain during this repair pass so a damaged cached runner/model can be rebuilt
+# or downloaded; fresh output and the final prepared tree are fail-closed.
+Remove-NonRuntimeRunnerFiles -Root $OcrRoot -AllowUnexpectedEmpty
+
 $runnerExe = Join-Path $OcrRoot "rapidocr_runner.exe"
 $runnerInternal = Join-Path $OcrRoot "_internal"
 $runnerStamp = Join-Path $cache "rapidocr-runner-output.sha256"
@@ -283,6 +263,8 @@ if ($needsRunnerBuild) {
         throw "PyInstaller output unexpectedly contains bundled OCR models: $($embeddedModels.FullName -join ', ')"
     }
 
+    Remove-NonRuntimeRunnerFiles -Root $runnerOutput
+
     Remove-Item -LiteralPath $runnerExe -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $runnerInternal -Recurse -Force -ErrorAction SilentlyContinue
     Copy-Item -Path (Join-Path $runnerOutput "*") -Destination $OcrRoot -Recurse -Force
@@ -349,6 +331,30 @@ foreach ($relative in $required) {
         (Get-Item -LiteralPath $path).Length -le 0) {
         throw "Prepared OCR dependency is missing or empty: $relative"
     }
+}
+
+$emptyPreparedFiles = @(
+    Get-ChildItem -LiteralPath $OcrRoot -File -Recurse |
+        Where-Object Length -EQ 0
+)
+if ($emptyPreparedFiles.Count -gt 0) {
+    $relative = @(
+        $emptyPreparedFiles | ForEach-Object {
+            [IO.Path]::GetRelativePath($OcrRoot, $_.FullName).Replace("\", "/")
+        }
+    )
+    throw "Prepared OCR dependencies contain empty files: $($relative -join ', ')"
+}
+
+$invalidPreparedPaths = @(
+    Get-ChildItem -LiteralPath $OcrRoot -File -Recurse |
+        ForEach-Object {
+            [IO.Path]::GetRelativePath($OcrRoot, $_.FullName).Replace("\", "/")
+        } |
+        Where-Object { -not (Test-OcrManifestRelativePath -Path $_) }
+)
+if ($invalidPreparedPaths.Count -gt 0) {
+    throw "Prepared OCR dependencies contain paths outside the signed manifest policy: $($invalidPreparedPaths -join ', ')"
 }
 
 Write-Host "OCR dependencies ready: $OcrRoot"

@@ -80,6 +80,7 @@ def build_params(profile: str, model_dir: Path, thread_count: int) -> dict:
     settings = PROFILE_SETTINGS[profile]
     return {
         "Global.log_level": "critical",
+        "Global.model_root_dir": str(model_dir),
         "Global.text_score": settings["text_score"],
         "Global.max_side_len": settings["max_side_len"],
         "Global.min_side_len": 30,
@@ -718,6 +719,7 @@ def main() -> int:
     os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["NO_PROXY"] = "*"
+    os.environ["OC_DISABLE_DOT_ACCESS_WARNING"] = "1"
 
     try:
         with redirect_process_stdout_to_stderr():

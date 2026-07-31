@@ -266,5 +266,6 @@ bool download_ocr_dependencies(
 
 int run_ocr_manifest_verifier(std::span<const std::wstring> arguments);
 int run_ocr_cli(std::span<const std::wstring> arguments);
+int run_ocr_warm_smoke(std::span<const std::wstring> arguments);
 
 }  // namespace airshot

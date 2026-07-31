@@ -2,7 +2,9 @@ import importlib.util
 import io
 from pathlib import Path
 import struct
+import sys
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -59,6 +61,18 @@ class RunnerGeometryTests(unittest.TestCase):
             runner.PROFILE_SETTINGS["rapidocr-v5-accurate"]["max_side_len"],
             runner.PROFILE_SETTINGS["rapidocr-v5-fast"]["max_side_len"],
         )
+
+    def test_rapidocr_params_use_only_omegaconf_safe_primitive_paths(self):
+        fake_rapidocr = types.SimpleNamespace(
+            EngineType=types.SimpleNamespace(ONNXRUNTIME="onnxruntime"),
+            OCRVersion=types.SimpleNamespace(PPOCRV4="v4", PPOCRV5="v5"),
+        )
+        model_dir = Path("C:/airshot/models/rapidocr-v5-fast")
+        with mock.patch.dict(sys.modules, {"rapidocr": fake_rapidocr}):
+            params = runner.build_params("rapidocr-v5-fast", model_dir, 2)
+        self.assertEqual(params["Global.model_root_dir"], str(model_dir))
+        self.assertEqual(params["Det.model_path"], str(model_dir / "det.onnx"))
+        self.assertFalse(any(isinstance(value, Path) for value in params.values()))
 
     def test_protocol_schema_is_exact_and_json_safe(self):
         timings = {

@@ -1,4 +1,5 @@
 #include "airshot/common.h"
+#include "airshot/clipboard.h"
 #include "airshot/config.h"
 #include "airshot/ocr.h"
 #include "airshot/portable.h"
@@ -861,6 +862,72 @@ int run_ocr_cli(std::span<const std::wstring> arguments) {
         write_utf8(stderr, diagnostic);
     }
     if (!write_bytes(stdout, protocol)) {
+        return 2;
+    }
+    return 0;
+}
+
+int run_ocr_warm_smoke(std::span<const std::wstring> arguments) {
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+
+    if (arguments.size() != 5 || arguments[0] != L"--ocr-warm-smoke" ||
+        arguments[1] != L"--image" || arguments[3] != L"--ocr-profile" ||
+        arguments[2].empty() || !valid_profile(arguments[4])) {
+        write_utf8(stderr, L"错误: OCR 热进程烟测参数无效。\n");
+        return 2;
+    }
+
+    std::wstring decode_error;
+    const auto bitmap = decode_local_image_file(
+        std::filesystem::path(arguments[2]),
+        &decode_error);
+    if (!bitmap) {
+        write_utf8(
+            stderr,
+            L"OCR 热进程烟测无法解码图片：" + decode_error + L"\n");
+        return 2;
+    }
+
+    AppConfig config;
+    config.ocr_engine = arguments[4];
+    const OcrOutput first = recognize_text(*bitmap, config);
+    if (!first.ok) {
+        write_utf8(
+            stderr,
+            L"OCR 热进程首次识别失败：" + first.error + L"\n");
+        return 2;
+    }
+    const OcrOutput second = recognize_text(*bitmap, config);
+    if (!second.ok) {
+        write_utf8(
+            stderr,
+            L"OCR 热进程复用识别失败：" + second.error + L"\n");
+        return 2;
+    }
+
+    const bool valid_outputs =
+        !first.text.empty() && first.text == second.text &&
+        !first.blocks.empty() && !second.blocks.empty() &&
+        first.profile == arguments[4] && second.profile == arguments[4] &&
+        first.preprocess.source_width == bitmap->width &&
+        first.preprocess.source_height == bitmap->height &&
+        second.preprocess.source_width == bitmap->width &&
+        second.preprocess.source_height == bitmap->height &&
+        first.timings.model_init_ms > 0.0 &&
+        second.timings.model_init_ms == 0.0 &&
+        first.timings.total_ms > 0.0 && second.timings.total_ms > 0.0;
+    if (!valid_outputs) {
+        write_utf8(
+            stderr,
+            std::format(
+                L"OCR 热进程未复用生产识别链路（初始化耗时：{:.3f} / {:.3f} ms）。\n",
+                first.timings.model_init_ms,
+                second.timings.model_init_ms));
+        return 2;
+    }
+
+    if (!write_utf8(stdout, second.text + L"\n")) {
         return 2;
     }
     return 0;

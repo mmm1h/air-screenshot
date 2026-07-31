@@ -15,6 +15,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 
 & (Join-Path $PSScriptRoot "test-version-contract.ps1")
+& (Join-Path $PSScriptRoot "test-ocr-payload-policy.ps1")
 
 $python = (Get-Command python -ErrorAction Stop).Source
 $pythonVersion = (& $python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')").Trim()

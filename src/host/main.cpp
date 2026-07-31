@@ -39,6 +39,9 @@ bool valid_launch_nonce(std::wstring_view value) {
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const auto arguments = command_arguments();
+    if (!arguments.empty() && arguments[0] == L"--ocr-warm-smoke") {
+        return airshot::run_ocr_warm_smoke(arguments);
+    }
     if (!arguments.empty() && arguments[0] == L"--ocr-internal") {
         return airshot::run_ocr_cli(arguments);
     }

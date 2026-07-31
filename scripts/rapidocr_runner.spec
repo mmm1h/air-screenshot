@@ -33,6 +33,14 @@ a = Analysis(
     noarchive=False,
     optimize=1,
 )
+# This jaraco.text sample is unrelated to OCR and its space is deliberately
+# outside Air Screenshot's signed dependency path grammar.
+a.datas = [
+    entry
+    for entry in a.datas
+    if entry[0].replace("\\", "/")
+    != "setuptools/_vendor/jaraco/text/Lorem ipsum.txt"
+]
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz,

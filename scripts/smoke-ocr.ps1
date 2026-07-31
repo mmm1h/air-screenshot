@@ -37,7 +37,11 @@ $profiles = @(
     "rapidocr-v5-accurate",
     "rapidocr-v4-compat"
 )
-$required = @("rapidocr_runner.exe")
+$required = @(
+    "rapidocr_runner.exe",
+    ".airshot-manifest.json",
+    ".airshot-manifest.sig"
+)
 foreach ($profile in $profiles) {
     foreach ($file in @("det.onnx", "rec.onnx", "cls.onnx", "dict.txt")) {
         $required += "models\$profile\$file"
@@ -64,13 +68,136 @@ $temporaryDirectory = Join-Path (
 New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
 $image = Join-Path $temporaryDirectory "input.png"
 $expectedText = "AirOCR123中文测试"
+$imageWidth = 1000
+$imageHeight = 240
+
+function Assert-OcrProtocol {
+    param(
+        [Parameter(Mandatory = $true)]$Protocol,
+        [Parameter(Mandatory = $true)][string]$Profile,
+        [Parameter(Mandatory = $true)][string]$RawText
+    )
+
+    $blocks = @($Protocol.blocks)
+    if ($Protocol.schemaVersion -ne 1 -or
+        $Protocol.profile -cne $Profile -or
+        $Protocol.preprocess.sourceWidth -ne $imageWidth -or
+        $Protocol.preprocess.sourceHeight -ne $imageHeight -or
+        $Protocol.preprocess.inputWidth -ne $imageWidth -or
+        $Protocol.preprocess.inputHeight -ne $imageHeight -or
+        $Protocol.preprocess.scaleX -ne 1.0 -or
+        $Protocol.preprocess.scaleY -ne 1.0 -or
+        $Protocol.preprocess.resample -cne "none" -or
+        $Protocol.preprocess.coordinateSpace -cne "input-pixels" -or
+        $Protocol.preprocess.tileCount -lt 1 -or
+        $Protocol.timings.totalMs -lt 0 -or
+        $blocks.Count -lt 1 -or
+        $blocks.Count -gt 16384) {
+        throw "$Profile OCR 协议元数据无效：$RawText"
+    }
+    foreach ($block in $blocks) {
+        if ([string]::IsNullOrWhiteSpace([string]$block.text) -or
+            $block.score -lt 0.0 -or $block.score -gt 1.0 -or
+            @($block.quad).Count -ne 4) {
+            throw "$Profile OCR 文本块无效：$($block | ConvertTo-Json -Compress -Depth 4)"
+        }
+    }
+
+    $recognizedText = (@($blocks | ForEach-Object text) -join " ")
+    $normalized = [Regex]::Replace($recognizedText, "[^\p{L}\p{Nd}]", "")
+    if ($normalized -cne $expectedText) {
+        throw "$Profile OCR 输出不匹配。期望：$expectedText；实际：$normalized；原始：$RawText"
+    }
+    return $recognizedText
+}
+
+function Invoke-OcrSmokeProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$ArgumentList,
+        [Parameter(Mandatory = $true)][string]$StandardOutputPath,
+        [Parameter(Mandatory = $true)][string]$StandardErrorPath,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [int]$TimeoutMilliseconds = 120000
+    )
+
+    $process = $null
+    $timedOut = $false
+    $exitCode = $null
+    $cleanupError = ""
+    try {
+        $process = Start-Process `
+            -FilePath $FilePath `
+            -ArgumentList $ArgumentList `
+            -PassThru `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $StandardOutputPath `
+            -RedirectStandardError $StandardErrorPath
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            $timedOut = $true
+        }
+        else {
+            # Ensure redirected output has been fully flushed after process exit.
+            $process.WaitForExit()
+            $exitCode = $process.ExitCode
+        }
+    }
+    finally {
+        if ($process) {
+            try {
+                if (-not $process.HasExited) {
+                    $process.Kill($true)
+                    if (-not $process.WaitForExit(5000)) {
+                        $cleanupError = "process remained alive after termination"
+                    }
+                }
+            }
+            catch [InvalidOperationException] {
+                # The process exited between HasExited and Kill.
+            }
+            catch {
+                $cleanupError = $_.Exception.Message
+            }
+            finally {
+                $process.Dispose()
+            }
+        }
+    }
+
+    if ($timedOut) {
+        $cleanupDetail = if ([string]::IsNullOrWhiteSpace($cleanupError)) {
+            ""
+        } else {
+            " Cleanup: $cleanupError"
+        }
+        throw "$Label timed out after $TimeoutMilliseconds ms.$cleanupDetail"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($cleanupError)) {
+        throw "$Label process cleanup failed: $cleanupError"
+    }
+    $outText = if (Test-Path -LiteralPath $StandardOutputPath) {
+        Get-Content -LiteralPath $StandardOutputPath -Raw -Encoding utf8
+    } else {
+        ""
+    }
+    $errText = if (Test-Path -LiteralPath $StandardErrorPath) {
+        Get-Content -LiteralPath $StandardErrorPath -Raw -Encoding utf8
+    } else {
+        ""
+    }
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = $outText
+        Error = $errText
+    }
+}
 
 try {
     $isolatedDataDirectory = Join-Path $temporaryDirectory "data"
     New-Item -ItemType Directory -Path $isolatedDataDirectory | Out-Null
     $env:AIRSHOT_DATA_DIR = $isolatedDataDirectory
 
-    $bitmap = [Drawing.Bitmap]::new(1000, 240)
+    $bitmap = [Drawing.Bitmap]::new($imageWidth, $imageHeight)
     $graphics = [Drawing.Graphics]::FromImage($bitmap)
     $font = [Drawing.Font]::new(
         "Microsoft YaHei",
@@ -108,42 +235,79 @@ try {
             "--dependency-dir", "`"$OcrRoot`"",
             "--model-dir", "`"$modelDir`"",
             "--ocr-profile", $profile,
-            "--ort-threads", "2"
+            "--ort-threads", "2",
+            "--source-width", "$imageWidth",
+            "--source-height", "$imageHeight",
+            "--input-width", "$imageWidth",
+            "--input-height", "$imageHeight",
+            "--scale-x", "1",
+            "--scale-y", "1",
+            "--preprocess-mode", "none"
         )
-        $process = Start-Process `
+        $result = Invoke-OcrSmokeProcess `
             -FilePath $helper `
             -ArgumentList $arguments `
-            -PassThru `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput $stdout `
-            -RedirectStandardError $stderr
-        if (-not $process.WaitForExit(120000)) {
-            $process.Kill($true)
-            throw "$profile OCR smoke timed out after 120 seconds."
-        }
-        # Ensure redirected output has been fully flushed after process exit.
-        $process.WaitForExit()
-
-        $outText = if (Test-Path -LiteralPath $stdout) {
-            Get-Content -LiteralPath $stdout -Raw -Encoding utf8
-        } else {
-            ""
-        }
-        $errText = if (Test-Path -LiteralPath $stderr) {
-            Get-Content -LiteralPath $stderr -Raw -Encoding utf8
-        } else {
-            ""
-        }
-        if ($process.ExitCode -ne 0) {
-            throw "$profile OCR 失败：$errText"
+            -StandardOutputPath $stdout `
+            -StandardErrorPath $stderr `
+            -Label "$profile OCR smoke"
+        $outText = $result.Output
+        if ($result.ExitCode -ne 0) {
+            throw "$profile OCR 失败：$($result.Error)"
         }
 
-        $normalized = [Regex]::Replace($outText, "[^\p{L}\p{Nd}]", "")
-        if ($normalized -cne $expectedText) {
-            throw "$profile OCR 输出不匹配。期望：$expectedText；实际：$normalized；原始：$outText"
+        try {
+            $protocol = $outText | ConvertFrom-Json -Depth 16
         }
-        Write-Host "$profile OCR smoke passed: $($outText.Trim())"
+        catch {
+            throw "$profile OCR 返回了无效 JSON：$($_.Exception.Message)；原始：$outText"
+        }
+        $recognizedText = Assert-OcrProtocol `
+            -Protocol $protocol `
+            -Profile $profile `
+            -RawText $outText
+        Write-Host (
+            "$profile OCR smoke passed: $recognizedText " +
+            "($($protocol.timings.totalMs) ms, $(@($protocol.blocks).Count) blocks)"
+        )
     }
+
+    $workerProfile = "rapidocr-v5-fast"
+    $packagedOcrRoot = [IO.Path]::GetFullPath(
+        (Join-Path (Split-Path -Parent $helper) "ocr\rapidocr-onnx")
+    )
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals(
+            $OcrRoot,
+            $packagedOcrRoot
+        )) {
+        throw (
+            "Production warm OCR smoke requires the selected dependency root " +
+            "to be packaged beside the helper: $packagedOcrRoot"
+        )
+    }
+    $warmStdout = Join-Path $temporaryDirectory "warm-worker.out"
+    $warmStderr = Join-Path $temporaryDirectory "warm-worker.err"
+    $warmResult = Invoke-OcrSmokeProcess `
+        -FilePath $helper `
+        -ArgumentList @(
+            "--ocr-warm-smoke",
+            "--image", "`"$image`"",
+            "--ocr-profile", $workerProfile
+        ) `
+        -StandardOutputPath $warmStdout `
+        -StandardErrorPath $warmStderr `
+        -Label "production warm OCR smoke"
+    if ($warmResult.ExitCode -ne 0) {
+        throw "Production warm OCR smoke failed: $($warmResult.Error)"
+    }
+    $warmNormalized = [Regex]::Replace(
+        $warmResult.Output,
+        "[^\p{L}\p{Nd}]",
+        ""
+    )
+    if ($warmNormalized -cne $expectedText) {
+        throw "Production warm OCR output mismatch: $($warmResult.Output)"
+    }
+    Write-Host "production warm OCR smoke passed: $($warmResult.Output.Trim())"
 }
 finally {
     if ($null -eq $originalDataDirectory) {

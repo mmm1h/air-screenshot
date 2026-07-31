@@ -22,6 +22,7 @@ $PSNativeCommandUseErrorActionPreference = $true
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "version.ps1")
+. (Join-Path $PSScriptRoot "ocr-runner-payload.ps1")
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = (Get-Content -LiteralPath (Join-Path $root "VERSION") -Raw).Trim()
@@ -166,14 +167,35 @@ if (Test-Path -LiteralPath $ocrSource -PathType Container) {
     New-Item -ItemType Directory -Path $ocrTarget -Force | Out-Null
     Copy-Item -Path (Join-Path $ocrSource "*") -Destination $ocrTarget -Recurse -Force
 
-    $files = Get-ChildItem -LiteralPath $ocrTarget -File -Recurse |
+    $payloadFiles = @(
+        Get-ChildItem -LiteralPath $ocrTarget -File -Recurse |
         Where-Object {
             $_.DirectoryName -ne $ocrTarget -or
             $_.Name -notin @(
                 ".airshot-manifest.json",
                 ".airshot-manifest.sig"
             )
-        } |
+        }
+    )
+    $emptyPayloadFiles = @($payloadFiles | Where-Object Length -EQ 0)
+    if ($emptyPayloadFiles.Count -gt 0) {
+        $relative = @(
+            $emptyPayloadFiles | ForEach-Object {
+                [IO.Path]::GetRelativePath($ocrTarget, $_.FullName).Replace("\", "/")
+            }
+        )
+        throw "OCR 发布源包含零字节文件：$($relative -join ', ')"
+    }
+    $invalidPayloadPaths = @(
+        $payloadFiles | ForEach-Object {
+            [IO.Path]::GetRelativePath($ocrTarget, $_.FullName).Replace("\", "/")
+        } | Where-Object { -not (Test-OcrManifestRelativePath -Path $_) }
+    )
+    if ($invalidPayloadPaths.Count -gt 0) {
+        throw "OCR 发布源包含不受支持的签名路径：$($invalidPayloadPaths -join ', ')"
+    }
+
+    $files = $payloadFiles |
         Sort-Object FullName |
         ForEach-Object {
             $relative = [IO.Path]::GetRelativePath($ocrTarget, $_.FullName).Replace("\", "/")
