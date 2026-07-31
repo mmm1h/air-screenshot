@@ -14,7 +14,7 @@ param(
     [switch]$Sign,
     [string]$CertPath,
     [string]$CertPassword,
-    [string]$TimestampUrl = "https://timestamp.digicert.com",
+    [string]$TimestampUrl = "http://timestamp.digicert.com",
     [string]$DownloadUrl = "https://mmm1h.github.io/air-screenshot/AirScreenshot.exe"
 )
 
@@ -45,8 +45,17 @@ if (-not [uint64]::TryParse(
 if ($DownloadUrl -notmatch "^https://") {
     throw "下载地址必须使用 HTTPS。"
 }
-if ($TimestampUrl -notmatch "^https://") {
-    throw "RFC 3161 时间戳地址必须使用 HTTPS。"
+[Uri]$timestampUri = $null
+if (-not [Uri]::TryCreate(
+        $TimestampUrl,
+        [UriKind]::Absolute,
+        [ref]$timestampUri
+    ) -or
+    $timestampUri.Scheme -notin @("http", "https") -or
+    [string]::IsNullOrWhiteSpace($timestampUri.Host) -or
+    -not [string]::IsNullOrEmpty($timestampUri.UserInfo) -or
+    -not [string]::IsNullOrEmpty($timestampUri.Fragment)) {
+    throw "RFC 3161 时间戳地址必须是无凭据、无片段的 HTTP(S) 绝对地址。"
 }
 if (($OcrManifestKeyId -or $OcrManifestPublicKeyHex -or $OcrManifestPrivateKeyPem) -and
     ($OcrManifestKeyId -notmatch "^[A-Za-z0-9._-]{1,64}$" -or
@@ -126,8 +135,8 @@ if ($Sign) {
     $signTool = Find-WindowsSdkTool "signtool.exe"
     & $signTool sign `
         /fd SHA256 `
-        /td SHA256 `
         /tr $TimestampUrl `
+        /td SHA256 `
         /f $CertPath `
         /p $CertPassword `
         $executable
