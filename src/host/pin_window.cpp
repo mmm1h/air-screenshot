@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <format>
 #include <limits>
 #include <mutex>
@@ -119,6 +120,88 @@ public:
 private:
     HDROP value_{};
 };
+
+[[nodiscard]] bool set_extended_style(
+    HWND window,
+    LONG_PTR style) noexcept {
+    SetLastError(ERROR_SUCCESS);
+    return SetWindowLongPtrW(window, GWL_EXSTYLE, style) != 0 ||
+           GetLastError() == ERROR_SUCCESS;
+}
+
+void notify_extended_style_changed(HWND window) noexcept {
+    SetWindowPos(
+        window,
+        nullptr,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+            SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+[[nodiscard]] bool present_layered_bitmap(
+    HWND window,
+    const Bitmap& premultiplied,
+    int alpha) noexcept {
+    if (!window || !IsWindow(window) || !premultiplied.valid()) {
+        return false;
+    }
+    ScreenDc screen;
+    if (!screen.get()) {
+        return false;
+    }
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = premultiplied.width;
+    info.bmiHeader.biHeight = -premultiplied.height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    OwnedGdiObject surface(CreateDIBSection(
+        screen.get(),
+        &info,
+        DIB_RGB_COLORS,
+        &bits,
+        nullptr,
+        0));
+    if (!surface.get() || !bits) {
+        return false;
+    }
+    std::memcpy(
+        bits,
+        premultiplied.pixels.data(),
+        premultiplied.pixels.size());
+
+    MemoryDc source_dc(screen.get());
+    SelectedObject selected(source_dc.get(), surface.get());
+    RECT window_rect{};
+    if (!source_dc.get() || !selected.valid() ||
+        !GetWindowRect(window, &window_rect)) {
+        return false;
+    }
+    POINT destination{window_rect.left, window_rect.top};
+    SIZE size{premultiplied.width, premultiplied.height};
+    POINT source{};
+    BLENDFUNCTION blend{};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = static_cast<BYTE>(
+        std::clamp(alpha, 0, 255));
+    blend.AlphaFormat = AC_SRC_ALPHA;
+    return UpdateLayeredWindow(
+               window,
+               screen.get(),
+               &destination,
+               &size,
+               source_dc.get(),
+               &source,
+               0,
+               &blend,
+               ULW_ALPHA) != FALSE;
+}
 
 constexpr wchar_t kScalePromptClass[] =
     L"AirScreenshot.PinScalePrompt";
@@ -482,8 +565,17 @@ std::unique_ptr<PinWindow> PinWindow::create(
     if (!initial_size) {
         return nullptr;
     }
+    const PinWindowStylePlan initial_style = plan_pin_window_style(
+        pin->source_has_transparency_,
+        pin->alpha_,
+        false);
+    pin->per_pixel_presentation_active_ =
+        initial_style.per_pixel_alpha;
+    const DWORD extended_style =
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
+        (initial_style.layered ? WS_EX_LAYERED : 0U);
     HWND hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+        extended_style,
         L"AirScreenshot.Pin",
         L"Air Screenshot Pin",
         WS_POPUP | WS_VISIBLE,
@@ -498,10 +590,11 @@ std::unique_ptr<PinWindow> PinWindow::create(
         return nullptr;
     }
 
-    if (!SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)) {
+    if (!pin->refresh_window_presentation()) {
         DestroyWindow(hwnd);
         return nullptr;
     }
+
     // Keep Air Screenshot's own reference windows out of subsequent captures.
     // Older Windows releases safely degrade this affinity to WDA_MONITOR.
     (void)SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
@@ -553,6 +646,120 @@ bool PinWindow::rebuild_native_bitmap() {
         DeleteObject(hbitmap_);
     }
     hbitmap_ = replacement;
+    source_has_transparency_ =
+        summarize_pin_bitmap_alpha(bitmap_).has_transparency;
+    return true;
+}
+
+bool PinWindow::refresh_window_presentation() noexcept {
+    return update_window_presentation(
+        alpha_,
+        click_through(),
+        source_has_transparency_);
+}
+
+bool PinWindow::update_window_presentation(
+    int alpha,
+    bool click_through_enabled,
+    bool source_has_transparency) noexcept {
+    if (!hwnd_ || !IsWindow(hwnd_) || !bitmap_.valid()) {
+        return false;
+    }
+
+    const PinWindowStylePlan plan = plan_pin_window_style(
+        source_has_transparency,
+        alpha,
+        click_through_enabled);
+    Bitmap layered_frame;
+    if (plan.per_pixel_alpha) {
+        RECT client{};
+        if (!GetClientRect(hwnd_, &client)) {
+            return false;
+        }
+        const int width = client.right - client.left;
+        const int height = client.bottom - client.top;
+        layered_frame = render_pin_layered_bitmap(
+            bitmap_,
+            visual_effects_,
+            width,
+            height,
+            smooth_scaling_);
+        if (!layered_frame.valid()) {
+            return false;
+        }
+    }
+
+    const LONG_PTR original_style =
+        GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+    LONG_PTR desired_style = original_style;
+    if (click_through_enabled) {
+        desired_style |= WS_EX_TRANSPARENT;
+    } else {
+        desired_style &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
+    }
+    if (plan.layered) {
+        desired_style |= WS_EX_LAYERED;
+    } else {
+        desired_style &= ~static_cast<LONG_PTR>(WS_EX_LAYERED);
+    }
+
+    const bool mode_changed =
+        plan.per_pixel_alpha != per_pixel_presentation_active_;
+    bool style_was_reset = false;
+    if (mode_changed && (original_style & WS_EX_LAYERED) != 0) {
+        if (!set_extended_style(
+                hwnd_,
+                original_style &
+                    ~static_cast<LONG_PTR>(WS_EX_LAYERED))) {
+            return false;
+        }
+        style_was_reset = true;
+    }
+    if ((style_was_reset || desired_style != original_style) &&
+        !set_extended_style(hwnd_, desired_style)) {
+        (void)set_extended_style(hwnd_, original_style);
+        notify_extended_style_changed(hwnd_);
+        return false;
+    }
+    if (style_was_reset || desired_style != original_style) {
+        notify_extended_style_changed(hwnd_);
+    }
+
+    bool presented = true;
+    if (plan.per_pixel_alpha) {
+        presented = present_layered_bitmap(
+            hwnd_,
+            layered_frame,
+            alpha);
+    } else if (plan.layered) {
+        presented = SetLayeredWindowAttributes(
+                        hwnd_,
+                        0,
+                        static_cast<BYTE>(std::clamp(alpha, 0, 255)),
+                        LWA_ALPHA) != FALSE;
+    } else {
+        InvalidateRect(hwnd_, nullptr, TRUE);
+    }
+    if (!presented) {
+        (void)set_extended_style(hwnd_, original_style);
+        notify_extended_style_changed(hwnd_);
+        if (!per_pixel_presentation_active_ &&
+            (original_style & WS_EX_LAYERED) != 0) {
+            (void)SetLayeredWindowAttributes(
+                hwnd_,
+                0,
+                static_cast<BYTE>(alpha_),
+                LWA_ALPHA);
+        } else {
+            InvalidateRect(hwnd_, nullptr, TRUE);
+        }
+        return false;
+    }
+
+    per_pixel_presentation_active_ = plan.per_pixel_alpha;
+    if (!plan.per_pixel_alpha) {
+        InvalidateRect(hwnd_, nullptr, TRUE);
+    }
     return true;
 }
 
@@ -590,11 +797,26 @@ bool PinWindow::replace_bitmap(Bitmap bitmap) {
         DeleteObject(replacement);
         return false;
     }
-    if (hbitmap_) {
-        DeleteObject(hbitmap_);
-    }
+    const bool replacement_has_transparency =
+        summarize_pin_bitmap_alpha(bitmap).has_transparency;
+    Bitmap previous_bitmap = std::move(bitmap_);
+    HBITMAP previous_native_bitmap = hbitmap_;
+    const bool previous_has_transparency = source_has_transparency_;
     bitmap_ = std::move(bitmap);
     hbitmap_ = replacement;
+    source_has_transparency_ = replacement_has_transparency;
+    if (hwnd_ && IsWindow(hwnd_) &&
+        !refresh_window_presentation()) {
+        bitmap_ = std::move(previous_bitmap);
+        hbitmap_ = previous_native_bitmap;
+        source_has_transparency_ = previous_has_transparency;
+        DeleteObject(replacement);
+        (void)refresh_window_presentation();
+        return false;
+    }
+    if (previous_native_bitmap) {
+        DeleteObject(previous_native_bitmap);
+    }
     return true;
 }
 
@@ -693,56 +915,10 @@ bool PinWindow::set_click_through(bool enabled) noexcept {
     if (enabled && !click_through_available_) {
         return false;
     }
-    const LONG_PTR original_style =
-        GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
-    LONG_PTR style = original_style;
-    if (enabled) {
-        style |= WS_EX_TRANSPARENT | WS_EX_LAYERED;
-    } else {
-        style &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
-    }
-    SetLastError(ERROR_SUCCESS);
-    if (SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, style) == 0 &&
-        GetLastError() != ERROR_SUCCESS) {
-        return false;
-    }
-    if (!SetLayeredWindowAttributes(
-            hwnd_,
-            0,
-            static_cast<BYTE>(alpha_),
-            LWA_ALPHA)) {
-        SetWindowLongPtrW(
-            hwnd_,
-            GWL_EXSTYLE,
-            original_style);
-        return false;
-    }
-    if (!SetWindowPos(
-            hwnd_,
-            topmost_ ? HWND_TOPMOST : HWND_NOTOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE |
-                SWP_NOACTIVATE | SWP_FRAMECHANGED)) {
-        SetWindowLongPtrW(
-            hwnd_,
-            GWL_EXSTYLE,
-            original_style);
-        SetWindowPos(
-            hwnd_,
-            nullptr,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE |
-                SWP_NOZORDER | SWP_NOACTIVATE |
-                SWP_FRAMECHANGED);
-        return false;
-    }
-    return true;
+    return update_window_presentation(
+        alpha_,
+        enabled,
+        source_has_transparency_);
 }
 
 void PinWindow::set_click_through_available(bool available) noexcept {
@@ -815,8 +991,10 @@ bool PinWindow::set_alpha(int alpha) noexcept {
         return false;
     }
     const int candidate = std::clamp(alpha, 30, 255);
-    if (!SetLayeredWindowAttributes(
-            hwnd_, 0, static_cast<BYTE>(candidate), LWA_ALPHA)) {
+    if (!update_window_presentation(
+            candidate,
+            click_through(),
+            source_has_transparency_)) {
         return false;
     }
     alpha_ = candidate;
@@ -836,9 +1014,12 @@ void PinWindow::zoom_by_steps(double steps) {
 }
 
 void PinWindow::toggle_smooth_scaling() noexcept {
+    const bool previous = smooth_scaling_;
     smooth_scaling_ = !smooth_scaling_;
-    if (hwnd_ && IsWindow(hwnd_)) {
-        InvalidateRect(hwnd_, nullptr, TRUE);
+    if (hwnd_ && IsWindow(hwnd_) &&
+        !refresh_window_presentation()) {
+        smooth_scaling_ = previous;
+        (void)refresh_window_presentation();
     }
 }
 
@@ -852,14 +1033,16 @@ void PinWindow::toggle_visual_effect(
     visual_effects_ = transition_pin_visual_effects(
         visual_effects_,
         action);
-    if (!rebuild_native_bitmap()) {
+    if (!rebuild_native_bitmap() ||
+        !refresh_window_presentation()) {
         visual_effects_ = previous;
+        (void)rebuild_native_bitmap();
+        (void)refresh_window_presentation();
         show_message(
             L"无法切换贴图显示效果：内存或 GDI 资源不足。",
             MB_OK | MB_ICONERROR);
         return;
     }
-    InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
 void PinWindow::set_scale_percent(int percent) {
@@ -985,9 +1168,20 @@ bool PinWindow::resize_to_scale(
             SWP_NOZORDER | SWP_NOACTIVATE)) {
         return false;
     }
+    if (!refresh_window_presentation()) {
+        (void)SetWindowPos(
+            hwnd_,
+            nullptr,
+            window_rect.left,
+            window_rect.top,
+            current_width,
+            current_height,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        (void)refresh_window_presentation();
+        return false;
+    }
     scale_ = candidate_scale;
     ensure_visible();
-    InvalidateRect(hwnd_, nullptr, TRUE);
     return true;
 }
 
@@ -1239,6 +1433,11 @@ void PinWindow::paint() {
     PAINTSTRUCT ps{};
     HDC hdc = BeginPaint(hwnd_, &ps);
     if (!hdc) {
+        EndPaint(hwnd_, &ps);
+        return;
+    }
+
+    if (per_pixel_presentation_active_) {
         EndPaint(hwnd_, &ps);
         return;
     }
@@ -1545,19 +1744,16 @@ void PinWindow::rotate(bool cw) {
                      MB_OK | MB_ICONERROR);
         return;
     }
-    const auto size = scaled_size(scale_);
     RECT rect_window{};
-    if (size && GetWindowRect(hwnd_, &rect_window)) {
-        SetWindowPos(hwnd_,
-                     nullptr,
-                     rect_window.left,
-                     rect_window.top,
-                     size->cx,
-                     size->cy,
-                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    if (GetWindowRect(hwnd_, &rect_window)) {
+        const POINT anchor{rect_window.left, rect_window.top};
+        if (!resize_to_scale(scale_, anchor)) {
+            show_message(
+                L"贴图已旋转，但无法按新尺寸刷新透明显示。",
+                MB_OK | MB_ICONWARNING);
+        }
     }
     ensure_visible();
-    InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
 void PinWindow::flip(bool horizontal) {
@@ -1572,7 +1768,6 @@ void PinWindow::flip(bool horizontal) {
             MB_OK | MB_ICONERROR);
         return;
     }
-    InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
 } // namespace airshot

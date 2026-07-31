@@ -12,6 +12,7 @@
 #include "overlay_helpers.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -31,6 +32,7 @@ namespace airshot::overlay_detail {
 
 inline constexpr UINT kOverlayOcrCompletedMessage = WM_APP + 0x131;
 inline constexpr UINT kOverlayScrollFrameCompletedMessage = WM_APP + 0x132;
+inline constexpr UINT kOverlayOcrProgressMessage = WM_APP + 0x133;
 
 class OverlaySession {
 public:
@@ -46,7 +48,11 @@ public:
     void on_mouse_move(POINT point);
     void on_mouse_up(HWND source, POINT point);
     void on_double_click(POINT point);
-    void on_key_down(HWND source, WPARAM key);
+    void on_key_down(HWND source, WPARAM key, bool is_auto_repeat);
+    [[nodiscard]] bool on_system_key_down(
+        HWND source,
+        WPARAM key,
+        bool is_auto_repeat);
     void on_capture_lost();
     void on_mouse_wheel(short delta);
     void show_quick_menu(HWND hwnd, POINT pt);
@@ -109,8 +115,16 @@ public:
     [[nodiscard]] int snap_coordinate(int value, bool is_x, int threshold = 8) const noexcept;
     [[nodiscard]] bool hit_test_annotation(POINT relative) const;
     [[nodiscard]] bool ocr_running() const noexcept { return ocr_running_; }
-    [[nodiscard]] std::wstring_view ocr_status_text() const noexcept {
-        return ocr_cancelling_ ? L"正在取消文字识别…" : L"正在识别文字…  按 Esc 取消";
+    [[nodiscard]] std::wstring ocr_status_text() const;
+    [[nodiscard]] int ocr_progress_percent() const noexcept {
+        return std::clamp(
+            ocr_progress_percent_.load(std::memory_order_relaxed),
+            0,
+            100);
+    }
+    [[nodiscard]] bool ocr_recognizing() const noexcept {
+        return ocr_dependency_state_.load(std::memory_order_relaxed) ==
+               OcrDependencyState::ready;
     }
 
 private:
@@ -139,6 +153,7 @@ private:
     void remember_active_style(Tool tool) noexcept;
     void remember_current_style() noexcept;
     void load_active_style(Tool tool) noexcept;
+    void toggle_active_tool(Tool tool) noexcept;
     void sync_active_style_from_selected();
     void apply_active_style_to_selected();
     void edit_selected_text(HWND source);
@@ -168,6 +183,7 @@ private:
     void capture_scroll_frame();
     void handle_scroll_frame_completion();
     void toggle_scroll_pause();
+    void update_scroll_control_status();
     void stop_scroll_worker();
     void finish_scroll_capture(bool cancelled);
     void destroy_scroll_windows();
@@ -243,6 +259,8 @@ private:
     std::wstring watermark_text_{L"Air Screenshot"};
     std::wstring hovered_button_id_;
     bool dimension_badge_hovered_{};
+    SelectionSizeAnchor selection_size_anchor_{SelectionSizeAnchor::center};
+    bool selection_aspect_ratio_locked_{};
     POINT cursor_pos_{};
     bool color_format_hex_{true};
     int selected_annotation_idx_{-1};
@@ -275,12 +293,12 @@ private:
     struct ScrollFrameCompletion {
         ScrollFrameStatus status{ScrollFrameStatus::capture_failed};
         int direction{};
-        int stitched_height{};
     };
 
     struct ActiveScrollCapture {
         std::unique_ptr<ScrollStitcher> stitcher;
         Bitmap last_frame;
+        RectI capture_bounds;
         ScrollControlState control_state;
         HWND border_window{};
         HWND control_window{};
@@ -293,6 +311,7 @@ private:
         std::wstring pause_text;
         HWND target_window{};
         DWORD target_process_id{};
+        RectI target_bounds;
         std::mutex frame_mutex;
         std::optional<ScrollFrameCompletion> frame_completion;
         std::jthread frame_worker;
@@ -307,8 +326,18 @@ private:
     std::optional<OcrCompletion> ocr_completion_;
     std::jthread ocr_thread_;
     std::wstring pending_ocr_text_;
+    RectI pending_ocr_bounds_;
+    std::uint64_t pending_ocr_revision_{};
     bool ocr_running_{};
     bool ocr_cancelling_{};
+    std::atomic<OcrDependencyState> ocr_dependency_state_{
+        OcrDependencyState::checking};
+    std::atomic<int> ocr_progress_percent_{};
+    std::atomic<std::size_t> ocr_completed_files_{};
+    std::atomic<std::size_t> ocr_total_files_{};
+    std::atomic<std::uint64_t> ocr_downloaded_bytes_{};
+    std::atomic<std::uint64_t> ocr_total_bytes_{};
+    std::atomic_bool ocr_cancellable_{true};
 
     friend class OverlayWindow;
 };

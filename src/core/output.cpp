@@ -1907,7 +1907,10 @@ private:
         result = {};
         return false;
     }
-    result.make_opaque();
+    // The optional compatibility formats do not have a reliable alpha
+    // contract. Composite over white so transparent corners cannot reveal
+    // hidden source RGB or turn black in older applications.
+    composite_onto_background(result, 255U, 255U, 255U);
     return result.valid();
 }
 
@@ -2353,12 +2356,6 @@ bool copy_bitmap_to_clipboard(HWND owner, const Bitmap& bitmap, std::wstring* er
         return false;
     }
 
-    Bitmap opaque_bitmap;
-    if (!make_opaque_copy(bitmap, opaque_bitmap)) {
-        set_error(error, L"无法为剪贴板分配图像内存。");
-        return false;
-    }
-
     ComPtr<IWICImagingFactory> factory;
     HRESULT encoding_error = create_wic_factory(factory);
     if (FAILED(encoding_error)) {
@@ -2366,7 +2363,7 @@ bool copy_bitmap_to_clipboard(HWND owner, const Bitmap& bitmap, std::wstring* er
         return false;
     }
     std::vector<std::uint8_t> png_bytes;
-    if (!encode_png_bytes(factory.Get(), opaque_bitmap, png_bytes, encoding_error)) {
+    if (!encode_png_bytes(factory.Get(), bitmap, png_bytes, encoding_error)) {
         set_error(error, windows_error_message(static_cast<DWORD>(encoding_error)));
         return false;
     }
@@ -2389,7 +2386,7 @@ bool copy_bitmap_to_clipboard(HWND owner, const Bitmap& bitmap, std::wstring* er
 
     GlobalMemory png_memory = global_from_bytes(png_bytes);
     GlobalMemory png_memory_alt = global_from_bytes(png_bytes);
-    GlobalMemory dibv5_memory = make_dibv5(opaque_bitmap);
+    GlobalMemory dibv5_memory = make_dibv5(bitmap);
     if (!png_memory || !png_memory_alt || !dibv5_memory) {
         set_error(error, L"无法为剪贴板分配图像内存。");
         return false;
@@ -2397,15 +2394,17 @@ bool copy_bitmap_to_clipboard(HWND owner, const Bitmap& bitmap, std::wstring* er
 
     GlobalMemory dib_memory;
     OwnedBitmap device_bitmap;
+    Bitmap opaque_bitmap;
     std::size_t dib_stride = 0;
     std::size_t dib_image_bytes = 0;
-    const auto optional_dib_bytes = dib24_size(opaque_bitmap, dib_stride, dib_image_bytes);
+    const auto optional_dib_bytes = dib24_size(bitmap, dib_stride, dib_image_bytes);
     std::size_t optional_total = 0;
     std::size_t with_dib = 0;
     if (optional_dib_bytes &&
         checked_add(mandatory_bytes, *optional_dib_bytes, with_dib) &&
-        checked_add(with_dib, opaque_bitmap.pixels.size(), optional_total) &&
-        optional_total <= kClipboardBudget) {
+        checked_add(with_dib, bitmap.pixels.size(), optional_total) &&
+        optional_total <= kClipboardBudget &&
+        make_opaque_copy(bitmap, opaque_bitmap)) {
         dib_memory = make_dib24(opaque_bitmap);
         device_bitmap = make_device_bitmap(opaque_bitmap);
         if (!dib_memory || !device_bitmap) {
@@ -2538,16 +2537,10 @@ bool save_png(const Bitmap& bitmap, const std::filesystem::path& path, std::wstr
         set_error(error, L"无法初始化图像编码组件。");
         return false;
     }
-    Bitmap opaque_bitmap;
-    if (!make_opaque_copy(bitmap, opaque_bitmap)) {
-        set_error(error, L"无法为 PNG 编码分配图像内存。");
-        return false;
-    }
-
     ComPtr<IWICImagingFactory> factory;
     HRESULT result = create_wic_factory(factory);
     if (SUCCEEDED(result)) {
-        result = encode_png_file(factory.Get(), opaque_bitmap, temporary.path());
+        result = encode_png_file(factory.Get(), bitmap, temporary.path());
     }
     factory.Reset();
     if (FAILED(result)) {

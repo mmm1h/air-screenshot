@@ -573,6 +573,27 @@ void test_config_contract() {
                 LR"("futureBrush":{"glow":3})") != std::wstring::npos,
         L"unknown future tool-style keys survive a same-schema save");
 
+    const auto rounded_output = airshot::config_from_json(
+        LR"({"schemaVersion":2,"capture":{"cornerRadius":24}})");
+    expect(
+        rounded_output && rounded_output->capture_corner_radius == 24 &&
+            airshot::config_to_json(*rounded_output).find(
+                LR"("cornerRadius":24)") != std::wstring::npos,
+        L"rounded capture output radius survives configuration round trip");
+    const auto clamped_rounded_output = airshot::config_from_json(
+        LR"({"schemaVersion":2,"capture":{"cornerRadius":4096}})");
+    expect(
+        clamped_rounded_output &&
+            clamped_rounded_output->capture_corner_radius == 512,
+        L"rounded capture output radius is clamped to the product limit");
+    std::wstring rounded_output_error;
+    expect(
+        !airshot::config_from_json(
+            LR"({"schemaVersion":2,"capture":{"cornerRadius":"24"}})",
+            &rounded_output_error) &&
+            !rounded_output_error.empty(),
+        L"rounded capture output rejects a malformed known field");
+
     const auto region_history = airshot::config_from_json(
         LR"({"schemaVersion":2,"capture":{"lastRegion":{"left":-1920,"top":-10,"width":640,"height":480,"topology":"v1-0123456789abcdef"}}})");
     expect(
@@ -781,6 +802,24 @@ void test_config_contract() {
                LR"({"schemaVersion":2,"hotkey":{"capture":"Ctrl+A","globalOcr":"Win+F2"},"shortcut":{"toolPen":"P"}})")
                .has_value(),
            L"config accepts modified global hotkeys while local shortcuts remain single-key");
+
+    const auto reserved_f2 = airshot::parse_hotkey(L"F2");
+    const auto reserved_redo = airshot::parse_hotkey(L"Ctrl+Shift+Z");
+    const auto available_modified_f2 = airshot::parse_hotkey(L"Shift+F2");
+    const auto available_tool = airshot::parse_hotkey(L"R");
+    expect(
+        reserved_f2 &&
+            airshot::capture_editor_reserved_shortcut(*reserved_f2) ==
+                airshot::capture_editor_shortcuts::precision_size &&
+            reserved_redo &&
+            airshot::capture_editor_reserved_shortcut(*reserved_redo) ==
+                airshot::capture_editor_shortcuts::redo_alternate &&
+            available_modified_f2 &&
+            !airshot::capture_editor_reserved_shortcut(
+                *available_modified_f2) &&
+            available_tool &&
+            !airshot::capture_editor_reserved_shortcut(*available_tool),
+        L"settings and runtime share the complete reserved editor shortcut table");
 
     const airshot::AppConfig hotkey_defaults;
     const auto unsafe_legacy_hotkeys = airshot::config_from_json(

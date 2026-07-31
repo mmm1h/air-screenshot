@@ -45,9 +45,11 @@ dependencies where available.
 ## Behavioral references not redistributed
 
 Snipaste (<https://www.snipaste.com/>), PixPin
-(<https://pixpin.cn/>), Snow Shot
+(<https://pixpin.com/>), Snow Shot
 (<https://github.com/mg-chao/snow-shot>), and Flameshot
-(<https://github.com/flameshot-org/flameshot>) are used as behavioral and
-interaction references for capture, annotation, scrolling capture, pinning,
-and OCR workflows. No code, binary, brand asset, or proprietary artwork from
-those products is included on that basis.
+(<https://github.com/flameshot-org/flameshot>), together with ShareX's official
+scrolling-capture documentation
+(<https://getsharex.com/docs/scrolling-screenshot.html>), are used only as
+behavioral and interaction references for capture, annotation, scrolling
+capture, pinning, and OCR workflows. No code, binary, brand asset, or
+proprietary artwork from those products is included on that basis.

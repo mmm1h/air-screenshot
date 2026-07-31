@@ -265,7 +265,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish immutable release
+    name: Attest and stage release
     needs:
       - build
       - sign
@@ -273,7 +273,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       attestations: write
-      contents: write
+      contents: read
       id-token: write
       pages: write
     steps:
@@ -297,7 +297,38 @@ jobs:
             dist/release-assets/AirScreenshot.spdx.json
             dist/release-assets/SHA256SUMS.txt
 
-      - name: Create GitHub Release
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: dist/site
+
+  deploy:
+    name: Deploy download site
+    needs:
+      - build
+      - publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      attestations: read
+      contents: write
+      id-token: write
+      pages: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download signed release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: signed-release-${{ github.run_id }}
+          path: dist
+
+      - name: Validate release state
+        id: release_state
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -350,11 +381,6 @@ jobs:
             return 1
           }
 
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $GITHUB_REF_NAME already exists; refusing to overwrite it." >&2
-            exit 1
-          fi
-
           read_git_object \
             "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME"
           for ((depth = 0; depth < 16 && object_type == "tag"; depth++)); do
@@ -370,11 +396,20 @@ jobs:
             exit 1
           fi
 
+          release_exists=false
+          if gh release view "$GITHUB_REF_NAME" \
+               --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_exists=true
+          fi
+
           published_tags="$(gh api --paginate \
             "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             --jq '.[] | select(.draft == false and .prerelease == false and .published_at != null) | .tag_name')"
           highest_version=""
           while IFS= read -r release_tag; do
+            if [[ "$release_exists" = true && "$release_tag" = "$GITHUB_REF_NAME" ]]; then
+              continue
+            fi
             if [[ ! "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
               continue
             fi
@@ -390,6 +425,67 @@ jobs:
             exit 1
           fi
 
+          if [[ "$release_exists" = true ]]; then
+            release_metadata="$(gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json tagName,isDraft,isPrerelease,assets)"
+            jq -e --arg tag "$GITHUB_REF_NAME" \
+              '.tagName == $tag and .isDraft == false and .isPrerelease == false' \
+              <<<"$release_metadata" >/dev/null
+            assets="$(jq -c '[.assets[].name] | sort' <<<"$release_metadata")"
+            expected_assets='["AirScreenshot.exe","AirScreenshot.pdb","AirScreenshot.spdx.json","LICENSE","SHA256SUMS.txt","THIRD_PARTY_NOTICES.md","ocr-dependencies.json","ocr-dependencies.json.sig"]'
+            if [[ "$assets" != "$expected_assets" ]]; then
+              echo "Existing release assets do not match the immutable release contract." >&2
+              exit 1
+            fi
+
+            release_temp="$(mktemp -d)"
+            gh release download "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir "$release_temp"
+            release_names=(
+              AirScreenshot.exe
+              AirScreenshot.pdb
+              AirScreenshot.spdx.json
+              LICENSE
+              SHA256SUMS.txt
+              THIRD_PARTY_NOTICES.md
+              ocr-dependencies.json
+              ocr-dependencies.json.sig
+            )
+            source_paths=(
+              dist/site/AirScreenshot.exe
+              dist/release-assets/AirScreenshot.pdb
+              dist/release-assets/AirScreenshot.spdx.json
+              dist/release-assets/LICENSE
+              dist/release-assets/SHA256SUMS.txt
+              dist/release-assets/THIRD_PARTY_NOTICES.md
+              dist/site/ocr-dependencies.json
+              dist/site/ocr-dependencies.json.sig
+            )
+            for index in "${!release_names[@]}"; do
+              if ! cmp --silent \
+                   "${source_paths[$index]}" \
+                   "$release_temp/${release_names[$index]}"; then
+                echo "Existing immutable release differs from this run: ${release_names[$index]}" >&2
+                exit 1
+              fi
+            done
+          fi
+          echo "exists=$release_exists" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+
+      - name: Create GitHub Release
+        if: steps.release_state.outputs.exists != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
           gh release create "$GITHUB_REF_NAME" \
             dist/site/AirScreenshot.exe \
             dist/site/ocr-dependencies.json \
@@ -405,34 +501,6 @@ jobs:
             --generate-notes \
             --notes "下载 AirScreenshot.exe，双击即可运行，无需安装。"
 
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
-
-      - name: Upload GitHub Pages artifact
-        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
-        with:
-          path: dist/site
-
-  deploy:
-    name: Deploy download site
-    needs:
-      - build
-      - publish
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      attestations: read
-      contents: read
-      id-token: write
-      pages: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
-
       - name: Verify public release and download entry
         shell: bash
         env:
@@ -442,6 +510,64 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
+          ocr_payload_dir="$(mktemp -d)"
+
+          verify_ocr_payload() {
+            local target_root="$1"
+            local downloaded_count=0
+            local file_path file_url file_sha256 file_size
+            local expected_url target_path partial_path actual_sha256 actual_size
+
+            while IFS=$'\t' read -r \
+                file_path file_url file_sha256 file_size; do
+              if [[ ! "$file_path" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] ||
+                 [[ "$file_path" == /* || "$file_path" == *"//"* ||
+                    "$file_path" == "." || "$file_path" == ".." ||
+                    "$file_path" == ./* || "$file_path" == ../* ||
+                    "$file_path" == */../* || "$file_path" == */.. ]]; then
+                return 1
+              fi
+              expected_url="https://mmm1h.github.io/air-screenshot/ocr/rapidocr-onnx/$file_path"
+              if [[ "$file_url" != "$expected_url" ]] ||
+                 [[ ! "$file_sha256" =~ ^[0-9a-f]{64}$ ]] ||
+                 [[ ! "$file_size" =~ ^[1-9][0-9]*$ ]]; then
+                return 1
+              fi
+
+              target_path="$target_root/$file_path"
+              mkdir -p "$(dirname "$target_path")"
+              if [[ -f "$target_path" ]]; then
+                actual_sha256="$(sha256sum "$target_path" | cut -d' ' -f1)"
+                actual_size="$(stat -c%s "$target_path")"
+                if [[ "$actual_sha256" = "$file_sha256" ]] &&
+                   [[ "$actual_size" = "$file_size" ]]; then
+                  downloaded_count=$((downloaded_count + 1))
+                  continue
+                fi
+              fi
+
+              partial_path="$target_path.part"
+              if ! curl -fsS --retry 3 --retry-delay 2 --retry-all-errors \
+                   --connect-timeout 10 --max-time 180 \
+                   -H 'Cache-Control: no-cache' \
+                   -o "$partial_path" "$file_url"; then
+                return 1
+              fi
+              actual_sha256="$(sha256sum "$partial_path" | cut -d' ' -f1)"
+              actual_size="$(stat -c%s "$partial_path")"
+              if [[ "$actual_sha256" != "$file_sha256" ]] ||
+                 [[ "$actual_size" != "$file_size" ]]; then
+                return 1
+              fi
+              mv -f "$partial_path" "$target_path"
+              downloaded_count=$((downloaded_count + 1))
+            done < <(jq -r \
+              '.files[] | [.path, .url, (.sha256 | ascii_downcase), (.size | tostring)] | @tsv' \
+              ocr-dependencies.json)
+
+            [[ "$downloaded_count" = "$ocr_file_count" ]]
+          }
+
           assets="$(gh release view "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --json assets \
@@ -450,13 +576,21 @@ jobs:
           test "$assets" = "$expected_assets"
 
           for attempt in {1..30}; do
-            if curl -fsS -H 'Cache-Control: no-cache' -o latest.json \
+            if curl -fsS --retry 3 --retry-delay 2 --retry-all-errors \
+                 --connect-timeout 10 --max-time 120 \
+                 -H 'Cache-Control: no-cache' -o latest.json \
                  "https://mmm1h.github.io/air-screenshot/latest.json" &&
-               curl -fsS -H 'Cache-Control: no-cache' -o index.html \
+               curl -fsS --retry 3 --retry-delay 2 --retry-all-errors \
+                 --connect-timeout 10 --max-time 120 \
+                 -H 'Cache-Control: no-cache' -o index.html \
                  "https://mmm1h.github.io/air-screenshot/" &&
-               curl -fsS -H 'Cache-Control: no-cache' -o ocr-dependencies.json \
+               curl -fsS --retry 3 --retry-delay 2 --retry-all-errors \
+                 --connect-timeout 10 --max-time 120 \
+                 -H 'Cache-Control: no-cache' -o ocr-dependencies.json \
                  "https://mmm1h.github.io/air-screenshot/ocr-dependencies.json" &&
-               curl -fsS -H 'Cache-Control: no-cache' -o ocr-dependencies.json.sig \
+               curl -fsS --retry 3 --retry-delay 2 --retry-all-errors \
+                 --connect-timeout 10 --max-time 120 \
+                 -H 'Cache-Control: no-cache' -o ocr-dependencies.json.sig \
                  "https://mmm1h.github.io/air-screenshot/ocr-dependencies.json.sig"; then
               download_url="$(jq -r '.url' latest.json)"
               expected_sha256="$(jq -r '.sha256 | ascii_downcase' latest.json)"
@@ -469,18 +603,17 @@ jobs:
               ocr_file_count="$(jq -r '.files | length' ocr-dependencies.json)"
               ocr_zero_hash_count="$(jq -r '[.files[] | select(.sha256 == ("0" * 64))] | length' ocr-dependencies.json)"
               ocr_zero_size_count="$(jq -r '[.files[] | select(.size == 0)] | length' ocr-dependencies.json)"
-              ocr_runner_url="$(jq -r '.files[] | select(.path == "rapidocr_runner.exe") | .url' ocr-dependencies.json)"
               ocr_runner_sha256="$(jq -r '.files[] | select(.path == "rapidocr_runner.exe") | .sha256 | ascii_downcase' ocr-dependencies.json)"
               ocr_runner_size="$(jq -r '.files[] | select(.path == "rapidocr_runner.exe") | .size' ocr-dependencies.json)"
               ocr_signature_key_id="$(jq -r '.keyId' ocr-dependencies.json.sig)"
               ocr_signature_length="$(jq -r '.signature | length' ocr-dependencies.json.sig)"
 
-              curl -fsS -H 'Cache-Control: no-cache' -o AirScreenshot.exe "$download_url" || true
-              curl -fsS -H 'Cache-Control: no-cache' -o rapidocr_runner.exe "$ocr_runner_url" || true
+              curl -fsS --retry 3 --retry-delay 2 --retry-all-errors \
+                --connect-timeout 10 --max-time 180 \
+                -H 'Cache-Control: no-cache' \
+                -o AirScreenshot.exe "$download_url" || true
               actual_sha256="$(sha256sum AirScreenshot.exe 2>/dev/null | cut -d' ' -f1 || true)"
               actual_size="$(stat -c%s AirScreenshot.exe 2>/dev/null || true)"
-              actual_runner_sha256="$(sha256sum rapidocr_runner.exe 2>/dev/null | cut -d' ' -f1 || true)"
-              actual_runner_size="$(stat -c%s rapidocr_runner.exe 2>/dev/null || true)"
               IFS=. read -r version_major version_minor version_patch <<< "$VERSION"
               expected_ocr_sequence="$((10#$version_major * 1000000000000 + 10#$version_minor * 1000000 + 10#$version_patch))"
               now="$(date +%s)"
@@ -523,8 +656,22 @@ jobs:
                 continue
               fi
 
+              if ! verify_ocr_payload "$ocr_payload_dir"; then
+                sleep 10
+                continue
+              fi
+              actual_runner_sha256="$(sha256sum \
+                "$ocr_payload_dir/rapidocr_runner.exe" | cut -d' ' -f1)"
+              actual_runner_size="$(stat -c%s \
+                "$ocr_payload_dir/rapidocr_runner.exe")"
+
               if [[ "$(jq -r '.version' latest.json)" = "$VERSION" ]] &&
                  [[ "$download_url" = "https://mmm1h.github.io/air-screenshot/AirScreenshot.exe" ]] &&
+                 cmp --silent latest.json dist/site/latest.json &&
+                 cmp --silent index.html dist/site/index.html &&
+                 cmp --silent AirScreenshot.exe dist/site/AirScreenshot.exe &&
+                 cmp --silent ocr-dependencies.json dist/site/ocr-dependencies.json &&
+                 cmp --silent ocr-dependencies.json.sig dist/site/ocr-dependencies.json.sig &&
                  [[ "$actual_sha256" = "$expected_sha256" ]] &&
                  [[ "$actual_size" = "$expected_size" ]] &&
                  [[ "$ocr_package_id" = "rapidocr-onnx" ]] &&
@@ -557,7 +704,7 @@ jobs:
                    --signer-workflow "github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml" \
                    --source-ref "$GITHUB_REF" \
                    --source-digest "$GITHUB_SHA" >/dev/null &&
-                 gh attestation verify rapidocr_runner.exe \
+                  gh attestation verify "$ocr_payload_dir/rapidocr_runner.exe" \
                    --repo "$GITHUB_REPOSITORY" \
                    --signer-workflow "github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml" \
                    --source-ref "$GITHUB_REF" \

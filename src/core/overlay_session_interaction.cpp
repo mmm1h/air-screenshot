@@ -489,18 +489,21 @@ void OverlaySession::open_selection_size_prompt(HWND source) {
     prompt_window_ = overlay_detail::show_selection_size_prompt(
         modal_owner(source),
         position,
-        selection_.width(),
-        selection_.height(),
-        virtual_bounds_.width(),
-        virtual_bounds_.height(),
+        selection_,
+        virtual_bounds_,
+        selection_size_anchor_,
+        selection_aspect_ratio_locked_,
+        request_.config.capture_corner_radius,
         light,
         [this](std::optional<SelectionSizeInput> input) {
             prompt_window_ = nullptr;
             if (done_ || !input) {
                 return;
             }
-            const auto resized = resize_selection_to_size(
+            const auto resized = resolve_selection_geometry(
                 selection_,
+                input->x,
+                input->y,
                 input->width,
                 input->height,
                 virtual_bounds_,
@@ -510,6 +513,11 @@ void OverlaySession::open_selection_size_prompt(HWND source) {
                 return;
             }
             selection_ = *resized;
+            selection_aspect_ratio_locked_ =
+                input->aspect_ratio_locked;
+            selection_size_anchor_ = input->anchor;
+            request_.config.capture_corner_radius =
+                input->corner_radius;
             dimension_badge_hovered_ = false;
             build_toolbar();
             build_sub_toolbar();
@@ -1410,7 +1418,10 @@ void OverlaySession::on_double_click(POINT point) {
     }
 }
 
-void OverlaySession::on_key_down(HWND source, WPARAM key) {
+void OverlaySession::on_key_down(
+    HWND source,
+    WPARAM key,
+    bool is_auto_repeat) {
     if (scroll_capture_) {
         switch (scroll_keyboard_command(key)) {
             case ScrollKeyboardCommand::toggle_pause:
@@ -1481,7 +1492,11 @@ void OverlaySession::on_key_down(HWND source, WPARAM key) {
             custom_color_ = color;
             request_.config.custom_color = format_hex_color(color);
 
-            finish({ExitCode::success, std::format(L"已复制颜色 {} 到剪贴板。", color_str)});
+            RegionResult result{
+                ExitCode::success,
+                std::format(L"已复制颜色 {} 到剪贴板。", color_str)};
+            result.action = RegionAction::clipboard;
+            finish(std::move(result));
             return;
         }
         // Shift key: toggle between Hex and RGB display format in magnifier
@@ -1494,7 +1509,9 @@ void OverlaySession::on_key_down(HWND source, WPARAM key) {
     }
 
     // Editing commands take precedence over user-defined tool shortcuts.
-    if (key == VK_F2) {
+    if (shortcut_triggered(
+            capture_editor_shortcuts::precision_size,
+            key)) {
         open_selection_size_prompt(source);
         return;
     }
@@ -1503,7 +1520,7 @@ void OverlaySession::on_key_down(HWND source, WPARAM key) {
         selected_annotation_idx_ >= 0 &&
         selected_annotation_idx_ <
             static_cast<int>(annotations_.size()) &&
-        shortcut_triggered(L"Ctrl+D", key)) {
+        shortcut_triggered(capture_editor_shortcuts::duplicate, key)) {
         duplicate_selected_annotation();
         return;
     }
@@ -1551,23 +1568,46 @@ void OverlaySession::on_key_down(HWND source, WPARAM key) {
         if (!annotations_.empty()) {
             return;
         }
-        const int step = keyboard_selection_step(
-            (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+        const bool control_down =
+            (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool shift_down =
+            (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        const SelectionResizeDirection direction =
+            key == VK_LEFT
+                ? SelectionResizeDirection::left
+                : key == VK_RIGHT
+                      ? SelectionResizeDirection::right
+                      : key == VK_UP
+                            ? SelectionResizeDirection::up
+                            : SelectionResizeDirection::down;
+        if (control_down != shift_down) {
+            selection_ = resize_selection_one_pixel(
+                selection_,
+                virtual_bounds_,
+                direction,
+                control_down);
+            build_toolbar();
+            build_sub_toolbar();
+            invalidate_all();
+            return;
+        }
+        if (control_down && shift_down) {
+            return;
+        }
+
         int delta_x = 0;
         int delta_y = 0;
-        if (key == VK_LEFT) delta_x = -step;
-        else if (key == VK_RIGHT) delta_x = step;
-        else if (key == VK_UP) delta_y = -step;
-        else if (key == VK_DOWN) delta_y = step;
+        if (key == VK_LEFT) delta_x = -1;
+        else if (key == VK_RIGHT) delta_x = 1;
+        else if (key == VK_UP) delta_y = -1;
+        else if (key == VK_DOWN) delta_y = 1;
         selection_ = translate_selection_within_bounds(
             selection_,
             delta_x,
             delta_y,
             virtual_bounds_);
-        if (!annotations_.empty()) {
-            mark_annotation_visual_changed();
-        }
         build_toolbar();
+        build_sub_toolbar();
         invalidate_all();
         return;
     }
@@ -1605,19 +1645,21 @@ void OverlaySession::on_key_down(HWND source, WPARAM key) {
         }
     }
 
-    if (shortcut_triggered(L"Ctrl+C", key)) {
+    if (shortcut_triggered(capture_editor_shortcuts::copy, key)) {
         complete_clipboard();
         return;
     }
-    if (shortcut_triggered(L"Ctrl+Z", key)) {
+    if (shortcut_triggered(capture_editor_shortcuts::undo, key)) {
         undo();
         return;
     }
-    if (shortcut_triggered(L"Ctrl+Y", key)) {
+    if (shortcut_triggered(capture_editor_shortcuts::redo, key)) {
         redo();
         return;
     }
-    if (shortcut_triggered(L"Ctrl+Shift+Z", key)) {
+    if (shortcut_triggered(
+            capture_editor_shortcuts::redo_alternate,
+            key)) {
         redo();
         return;
     }
@@ -1630,7 +1672,7 @@ void OverlaySession::on_key_down(HWND source, WPARAM key) {
         complete_default(source);
         return;
     }
-    if (shortcut_triggered(L"Ctrl+S", key)) {
+    if (shortcut_triggered(capture_editor_shortcuts::save, key)) {
         complete_file({}, source);
         return;
     }
@@ -1703,18 +1745,47 @@ void OverlaySession::on_key_down(HWND source, WPARAM key) {
         target_tool = Tool::eraser;
     }
 
-    if (target_tool != Tool::none) {
+    if (target_tool != Tool::none &&
+        tool_shortcut_keydown_allowed(is_auto_repeat)) {
         (void)settle_active_interaction(
             source,
             InteractionSettleMode::cancel);
-        remember_current_style();
-        active_tool_ = target_tool;
-        load_active_style(target_tool);
-        selected_annotation_idx_ = -1;
+        toggle_active_tool(target_tool);
         build_toolbar();
         build_sub_toolbar();
         invalidate_all();
     }
+}
+
+bool OverlaySession::on_system_key_down(
+    HWND source,
+    WPARAM key,
+    bool is_auto_repeat) {
+    const std::array<std::wstring_view, 13> configurable_shortcuts{
+        request_.config.capture_ocr_shortcut,
+        request_.config.tool_shortcut_select,
+        request_.config.tool_shortcut_rectangle,
+        request_.config.tool_shortcut_ellipse,
+        request_.config.tool_shortcut_line,
+        request_.config.tool_shortcut_arrow,
+        request_.config.tool_shortcut_pen,
+        request_.config.tool_shortcut_mosaic,
+        request_.config.tool_shortcut_blur,
+        request_.config.tool_shortcut_highlight,
+        request_.config.tool_shortcut_text,
+        request_.config.tool_shortcut_serial,
+        request_.config.tool_shortcut_eraser,
+    };
+    const bool matched = std::ranges::any_of(
+        configurable_shortcuts,
+        [&](std::wstring_view shortcut) {
+            return shortcut_triggered(shortcut, key);
+        });
+    if (!matched) {
+        return false;
+    }
+    on_key_down(source, key, is_auto_repeat);
+    return true;
 }
 
 void OverlaySession::invalidate_all() const {

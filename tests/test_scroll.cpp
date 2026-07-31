@@ -1,4 +1,5 @@
 #include "../src/core/overlay_helpers.h"
+#include "airshot/overlay.h"
 
 #include <algorithm>
 #include <array>
@@ -278,11 +279,13 @@ void test_chunked_stitching() {
 
     const Bitmap initial_down = frame_from(document, 50, 40);
     ScrollStitcher downward(initial_down);
-    expect(downward.valid() && downward.height() == 40 && downward.direction() == 0,
+    expect(downward.valid() && downward.height() == 40 &&
+               downward.frame_count() == 1 && downward.direction() == 0,
            L"downward stitcher initializes");
     expect(downward.append(frame_from(document, 57, 40), 7) == StitchStatus::success,
            L"downward strip appends");
-    expect(downward.direction() == 1 && downward.height() == 47,
+    expect(downward.direction() == 1 && downward.height() == 47 &&
+               downward.frame_count() == 2,
            L"downward stitcher tracks direction and height");
     expect(downward.prepend(frame_from(document, 43, 40), 7) ==
                StitchStatus::direction_mismatch,
@@ -299,6 +302,8 @@ void test_chunked_stitching() {
            L"first upward strip prepends");
     expect(upward.prepend(frame_from(document, 36, 40), 7) == StitchStatus::success,
            L"second upward strip prepends without materializing prior strips");
+    expect(upward.frame_count() == 3,
+           L"upward stitcher exposes the authoritative accumulated frame count");
 
     Bitmap materialized_up;
     expect(upward.materialize(materialized_up) == StitchStatus::success,
@@ -403,13 +408,133 @@ void test_resume_baseline_and_keyboard_commands() {
     expect(
         airshot::overlay_detail::scroll_keyboard_command('P') ==
                 ScrollKeyboardCommand::toggle_pause &&
+            airshot::overlay_detail::scroll_keyboard_command(VK_SPACE) ==
+                ScrollKeyboardCommand::toggle_pause &&
             airshot::overlay_detail::scroll_keyboard_command(VK_RETURN) ==
                 ScrollKeyboardCommand::finish &&
             airshot::overlay_detail::scroll_keyboard_command(VK_ESCAPE) ==
                 ScrollKeyboardCommand::cancel &&
             airshot::overlay_detail::scroll_keyboard_command('Q') ==
                 ScrollKeyboardCommand::none,
-        L"overlay keyboard forwarding maps P, Enter, and Escape deterministically");
+        L"overlay keyboard forwarding maps P, Space, Enter, and Escape deterministically");
+}
+
+void test_scroll_feedback_and_resume_context() {
+    using airshot::overlay_detail::ScrollMatchOutcome;
+    using airshot::overlay_detail::ScrollMatchQuality;
+    using airshot::overlay_detail::advance_scroll_match_feedback;
+
+    int streak = 0;
+    for (int attempt = 1;
+         attempt < airshot::overlay_detail::kScrollMatchFailurePauseThreshold;
+         ++attempt) {
+        const auto feedback = advance_scroll_match_feedback(
+            streak,
+            ScrollMatchOutcome::mismatch);
+        streak = feedback.consecutive_failures;
+        expect(
+            feedback.quality == ScrollMatchQuality::low_confidence &&
+                !feedback.safe_pause && streak == attempt,
+            L"transient scroll mismatch remains low confidence without stopping capture");
+    }
+    const auto failed = advance_scroll_match_feedback(
+        streak,
+        ScrollMatchOutcome::mismatch);
+    expect(
+        failed.quality == ScrollMatchQuality::failed &&
+            failed.safe_pause &&
+            failed.consecutive_failures ==
+                airshot::overlay_detail::kScrollMatchFailurePauseThreshold,
+        L"fourth consecutive mismatch triggers a deterministic safe pause");
+
+    const auto recovered = advance_scroll_match_feedback(
+        failed.consecutive_failures,
+        ScrollMatchOutcome::success);
+    const auto unchanged = advance_scroll_match_feedback(
+        failed.consecutive_failures,
+        ScrollMatchOutcome::unchanged);
+    const auto hard_failure = advance_scroll_match_feedback(
+        2,
+        ScrollMatchOutcome::hard_failure);
+    expect(
+        recovered.quality == ScrollMatchQuality::success &&
+            recovered.consecutive_failures == 0 &&
+            !recovered.safe_pause &&
+            unchanged.quality == ScrollMatchQuality::waiting &&
+            unchanged.consecutive_failures == 0 &&
+            !unchanged.safe_pause &&
+            hard_failure.quality == ScrollMatchQuality::failed &&
+            hard_failure.consecutive_failures == 2 &&
+            hard_failure.safe_pause,
+        L"feedback resets on recovery and immediately pauses on hard failure");
+
+    const airshot::RectI capture_bounds{100, 120, 500, 420};
+    expect(
+        airshot::overlay_detail::scroll_capture_bounds_match(
+            capture_bounds,
+            capture_bounds) &&
+            !airshot::overlay_detail::scroll_capture_bounds_match(
+                capture_bounds,
+                {101, 120, 501, 420}) &&
+            !airshot::overlay_detail::scroll_capture_bounds_match(
+                capture_bounds,
+                {100, 120, 500, 421}),
+        L"resume requires the original pixel bounds, not merely a similar region");
+    expect(
+        airshot::overlay_detail::scroll_target_frame_is_stable(
+            true,
+            capture_bounds,
+            capture_bounds,
+            capture_bounds) &&
+            !airshot::overlay_detail::scroll_target_frame_is_stable(
+                false,
+                capture_bounds,
+                capture_bounds,
+                capture_bounds) &&
+            !airshot::overlay_detail::scroll_target_frame_is_stable(
+                true,
+                capture_bounds,
+                {101, 120, 501, 420},
+                capture_bounds) &&
+            !airshot::overlay_detail::scroll_target_frame_is_stable(
+                true,
+                capture_bounds,
+                capture_bounds,
+                {100, 120, 500, 421}),
+        L"every scroll frame rejects identity, one-pixel move, and one-pixel resize drift");
+    expect(
+        airshot::overlay_detail::scroll_frame_commit_allowed(false, true) &&
+            !airshot::overlay_detail::scroll_frame_commit_allowed(true, true) &&
+            !airshot::overlay_detail::scroll_frame_commit_allowed(false, false),
+        L"scroll detection cannot commit after pause cancellation or target drift");
+
+    const Bitmap document = make_document(24, 100);
+    ScrollStitcher stitcher(frame_from(document, 20, 40));
+    expect(
+        stitcher.append(frame_from(document, 27, 40), 7) ==
+            StitchStatus::success,
+        L"safe-pause fixture contains already stitched content");
+    Bitmap before_pause;
+    Bitmap after_pause;
+    expect(
+        stitcher.materialize(before_pause) == StitchStatus::success,
+        L"safe-pause fixture materializes before failures");
+    streak = 0;
+    for (int attempt = 0;
+         attempt < airshot::overlay_detail::kScrollMatchFailurePauseThreshold;
+         ++attempt) {
+        streak = advance_scroll_match_feedback(
+                     streak,
+                     ScrollMatchOutcome::mismatch)
+                     .consecutive_failures;
+    }
+    expect(
+        stitcher.materialize(after_pause) == StitchStatus::success &&
+            stitcher.frame_count() == 2 &&
+            after_pause.width == before_pause.width &&
+            after_pause.height == before_pause.height &&
+            after_pause.pixels == before_pause.pixels,
+        L"safe pause preserves every strip stitched before matching failed");
 }
 
 void test_scroll_control_clicks() {
@@ -417,7 +542,7 @@ void test_scroll_control_clicks() {
     const auto click_button = [](HWND window, int center_dip) {
         RECT bounds{};
         GetClientRect(window, &bounds);
-        const int x = MulDiv(bounds.right, center_dip, 328);
+        const int x = MulDiv(bounds.right, center_dip, 640);
         const int y = bounds.bottom / 2;
         SendMessageW(
             window,
@@ -450,7 +575,7 @@ void test_scroll_control_clicks() {
                 reinterpret_cast<WPARAM>(pause_window),
                 MAKELPARAM(HTCLIENT, WM_LBUTTONDOWN)) == MA_NOACTIVATE,
             L"scroll controls never steal focus from the captured target");
-        click_button(pause_window, 141);
+        click_button(pause_window, 375);
         expect(
             pause_toggled && pause_state.paused &&
                 !pause_state.finished && !pause_state.cancelled,
@@ -465,7 +590,7 @@ void test_scroll_control_clicks() {
             L"paused scroll controls suppress scheduled frame capture");
         pause_toggled = false;
         pause_state.can_resume = false;
-        click_button(pause_window, 141);
+        click_button(pause_window, 375);
         expect(
             !pause_toggled && pause_state.paused,
             L"hard pause disables the continue action");
@@ -479,7 +604,7 @@ void test_scroll_control_clicks() {
         instance, nullptr, {100, 100, 400, 400}, &finish_state);
     expect(finish_window != nullptr, L"finish control window is created");
     if (finish_window) {
-        click_button(finish_window, 213);
+        click_button(finish_window, 483);
         expect(finished && finish_state.finished && !finish_state.cancelled,
                L"finish click survives capture release");
         DestroyWindow(finish_window);
@@ -492,11 +617,34 @@ void test_scroll_control_clicks() {
         instance, nullptr, {100, 100, 400, 400}, &cancel_state);
     expect(cancel_window != nullptr, L"cancel control window is created");
     if (cancel_window) {
-        click_button(cancel_window, 285);
+        click_button(cancel_window, 585);
         expect(cancelled && cancel_state.cancelled && !cancel_state.finished,
                L"cancel click survives capture release");
         DestroyWindow(cancel_window);
     }
+}
+
+void test_scroll_completion_does_not_inherit_pin_action() {
+    using airshot::ExitCode;
+    using airshot::RegionAction;
+    using airshot::resolve_region_result_action;
+
+    expect(
+        resolve_region_result_action(
+            ExitCode::success,
+            RegionAction::clipboard,
+            RegionAction::pin) == RegionAction::clipboard &&
+            resolve_region_result_action(
+                ExitCode::success,
+                RegionAction::file,
+                RegionAction::pin) == RegionAction::file,
+        L"scroll completion keeps its explicit clipboard/file action instead of becoming a pin");
+    expect(
+        resolve_region_result_action(
+            ExitCode::success,
+            RegionAction::interactive,
+            RegionAction::pin) == RegionAction::interactive,
+        L"successful unspecified completion never silently inherits the session pin action");
 }
 
 }  // namespace
@@ -511,7 +659,9 @@ int wmain() {
     test_chunked_stitching();
     test_stitch_limits_and_compatibility();
     test_resume_baseline_and_keyboard_commands();
+    test_scroll_feedback_and_resume_context();
     test_scroll_control_clicks();
+    test_scroll_completion_does_not_inherit_pin_action();
     if (failures == 0) {
         std::wcout << L"All scroll tests passed.\n";
     }

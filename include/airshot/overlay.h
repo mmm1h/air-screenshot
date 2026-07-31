@@ -16,6 +16,20 @@ enum class RegionAction {
     pin,
 };
 
+[[nodiscard]] constexpr RegionAction resolve_region_result_action(
+    ExitCode code,
+    RegionAction result_action,
+    RegionAction request_action) noexcept {
+    // A successful interactive result means that the completing feature did
+    // not request a host-side action. Never turn it into a pin merely because
+    // the session itself was launched by the pin command.
+    if (code == ExitCode::success ||
+        result_action != RegionAction::interactive) {
+        return result_action;
+    }
+    return request_action;
+}
+
 struct RegionRequest {
     RegionAction action{RegionAction::interactive};
     std::wstring path;

@@ -75,6 +75,19 @@ void test_theme_refresh_policy() {
         L"missing render resources are recreated");
 }
 
+void test_ocr_terminal_status_policy() {
+    using airshot::settings_detail::settings_use_terminal_ocr_status;
+
+    expect(
+        settings_use_terminal_ocr_status(true, false, false),
+        L"terminal OCR security and local failures survive lightweight inspection");
+    expect(
+        !settings_use_terminal_ocr_status(true, true, false) &&
+            !settings_use_terminal_ocr_status(true, false, true) &&
+            !settings_use_terminal_ocr_status(false, false, false),
+        L"ready, cancelled, and missing terminal OCR states are re-inspected locally");
+}
+
 void test_automatic_update_draft_round_trip() {
     airshot::AppConfig saved;
     saved.automatic_updates_enabled = true;
@@ -170,6 +183,7 @@ void test_dpi_specific_window_icon() {
 
 int wmain() {
     test_theme_refresh_policy();
+    test_ocr_terminal_status_policy();
     test_automatic_update_draft_round_trip();
     test_dpi_specific_window_icon();
     if (failures == 0) {

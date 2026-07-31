@@ -3,6 +3,7 @@
 #include "airshot/common.h"
 #include "airshot/region_policy.h"
 
+#include <array>
 #include <cstdint>
 #include <map>
 
@@ -22,6 +23,25 @@ inline constexpr wchar_t kDefaultOcrDependencyManifestUrl[] =
 inline constexpr int kCurrentConfigSchemaVersion = 2;
 inline constexpr std::wstring_view kDefaultToolbarOrder =
     L"lock,rect,ellipse,line,arrow,pen,text,serial,mosaic,blur,highlight,watermark,pin,ocr,select,scroll,eraser,undo,redo,save,close,copy";
+
+namespace capture_editor_shortcuts {
+inline constexpr std::wstring_view precision_size = L"F2";
+inline constexpr std::wstring_view duplicate = L"Ctrl+D";
+inline constexpr std::wstring_view copy = L"Ctrl+C";
+inline constexpr std::wstring_view save = L"Ctrl+S";
+inline constexpr std::wstring_view undo = L"Ctrl+Z";
+inline constexpr std::wstring_view redo = L"Ctrl+Y";
+inline constexpr std::wstring_view redo_alternate = L"Ctrl+Shift+Z";
+inline constexpr std::array<std::wstring_view, 7> reserved{
+    precision_size,
+    duplicate,
+    copy,
+    save,
+    undo,
+    redo,
+    redo_alternate,
+};
+}  // namespace capture_editor_shortcuts
 
 struct AnnotationToolStyleConfig {
     std::wstring color{L"#F5222D"};
@@ -61,6 +81,10 @@ struct AppConfig {
     std::wstring capture_ocr_shortcut{L"Shift+C"};
     std::wstring default_output{L"clipboard"};
     bool capture_cursor{false};
+    // Final PNG/clipboard output corner radius in physical pixels. Zero keeps
+    // the traditional square capture. The value is clamped again to the
+    // selected bitmap dimensions before rendering.
+    int capture_corner_radius{};
     std::optional<LastRegionCapture> last_region_capture;
     std::wstring custom_color{L"#8000FF"};
     std::wstring annotation_hidden_tools;
@@ -101,6 +125,8 @@ struct Hotkey {
 [[nodiscard]] bool is_windows_system_light_theme();
 [[nodiscard]] bool should_use_light_theme(std::wstring_view theme_config);
 [[nodiscard]] std::optional<Hotkey> parse_hotkey(std::wstring_view value);
+[[nodiscard]] std::optional<std::wstring_view>
+capture_editor_reserved_shortcut(const Hotkey& hotkey);
 [[nodiscard]] bool validate_global_hotkeys(
     const AppConfig& config,
     std::wstring* error = nullptr);

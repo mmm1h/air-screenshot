@@ -9,7 +9,7 @@ Air Screenshot is a native Windows capture utility for fast region capture, ligh
 The settings window configures six product areas:
 
 1. **截图与输出** — annotation behavior, clipboard or PNG output, and completion notifications.
-2. **文本与 OCR** — local OCR enablement, the three supported recognition profiles, signed dependency state/download, and annotation typography.
+2. **文本与 OCR** — local OCR enablement, the three supported recognition profiles, signed dependency state/preparation/repair, and annotation typography. Dependency preparation also starts automatically from the first real OCR action; Settings is not a prerequisite detour.
 3. **工具栏** — tool visibility and order, with drag, buttons, and keyboard alternatives.
 4. **快捷键** — global screenshot, clipboard pin, OCR, and annotation-tool bindings with inline validation and conflict recovery.
 5. **应用与外观** — background service, tray visibility, startup behavior, system/light/dark themes, and one of three built-in application icons: 精准取景 (Focus Frame, default), 流光镜 (Flow Lens), or 像素舱 (Pixel Console).
@@ -23,7 +23,17 @@ The surface must never imply unsupported output destinations, cloud OCR, account
 - **OWN-WORLD:** A near-black precision rail, cool neutral canvas, open setting rows, cobalt interaction states, and cyan only for healthy or synchronized state.
 - **STORY:** Users choose a capture result, tune annotation and OCR, arrange tools, record shortcuts, select a built-in application icon, set update policy as part of the draft, and understand exactly what Save will change.
 - **FIRST VIEWPORT:** Six destinations live in a 224-DIP rail; the selected task appears beside a compact workflow strip; save state is anchored to a 64-DIP footer.
-- **FORM:** `Capture Console`, seeded by Stitch screen `450cf4261edd46d287f5f04e5a5a7428` in project `454227981142275123`; the icon family began in session `8313762202511579579`, with Flow Lens refined in screen `bdd901cfa6904c73b36e187a8a39c930`.
+- **FORM:** `Capture Console`, seeded by Stitch screen `450cf4261edd46d287f5f04e5a5a7428` in project `454227981142275123`; the application-icon family began in session `8313762202511579579`, with Flow Lens refined in screen `bdd901cfa6904c73b36e187a8a39c930`. The capture-toolbar family is specified by Stitch icon sheet `f0c53416ed804eac9dc8c1e6083d9d4d` and overlay specimen `9e90bc8e2d0c451b863f1215ce583cab`.
+
+## Capture Overlay Contract
+
+- The toolbar is a coherent 20 × 20 optical icon family in 24 px frames with 1.5 px rounded strokes and 40 px interaction targets. Selection, mosaic, blur, OCR, scrolling capture, pin, copy, and save must be distinguishable by silhouette rather than text or color alone.
+- `F2` opens one non-destructive precision surface for signed virtual-desktop `X / Y`, `W / H`, center/top-left anchoring, aspect-ratio lock, and square/rounded output with a bounded pixel radius.
+- Arrow keys move an unannotated selection by 1 px. `Ctrl + Arrow` grows the corresponding edge by 1 px and `Shift + Arrow` shrinks it by 1 px; annotation-object nudging remains 1 px, or 10 px with Shift, once an annotation is selected.
+- Rounded output is applied only to the final rendered image. PNG file, clipboard PNG, and `CF_DIBV5` retain transparent corners; legacy clipboard formats receive an opaque compatibility rendering.
+- First-use OCR is one continuous action: check, signed preparation when needed, progress, cancellation, retry, automatic quarantine/reinstallation of a damaged user-local package, then recognition. A verified local installation remains usable offline; security failures are never downgraded to ordinary retry prompts.
+- Scrolling capture reports accumulated dimensions, frame count, and match quality in text and color. Target changes and sustained low-confidence matching pause safely; resume must revalidate target identity, geometry, selection dimensions, stitch dimensions, and baseline.
+- Pin creation requires a valid decoded bitmap. An all-zero reserved alpha plane from GDI/capture paths is normalized as opaque, while intentional mixed or non-zero alpha remains intact; an opaque interactive pin begins on the normal paint path.
 
 ## Interaction Principles
 
@@ -32,7 +42,7 @@ The surface must never imply unsupported output destinations, cloud OCR, account
 - Show shortcut problems inline, retain the entered value for correction, focus the shortcut destination, and block Save until valid.
 - Probe global shortcut availability before Save; keep the screenshot shortcut required and allow clipboard pin to remain unassigned.
 - Confirm before hiding the tray icon and explain how to reopen Settings while the background service continues running.
-- Show OCR download progress without freezing the rest of the window.
+- Show OCR preparation and recognition progress without freezing the rest of the window. Cancellation and retry must preserve the current selection and any already verified installation.
 - Keep automatic-update preference separate from the manual tray action. Disabling automatic updates cancels only automatic work and pauses automatic-origin pending installation; it must not erase explicit manual intent.
 - Support full keyboard navigation, visible focus, `Ctrl + S`, `Esc`, and `Alt + ↑ / ↓` as a toolbar drag alternative.
 - Keep application-icon selection in the settings draft until Save; support hover, visible keyboard focus, and arrow-key movement across the three choices.
@@ -48,12 +58,18 @@ The surface must never imply unsupported output destinations, cloud OCR, account
 - Depth comes from surface contrast and 1-DIP borders, not gradients, glass, glow, or decorative shadows.
 - Chinese is the primary interface language. English is reserved for product identity and technical values such as font names and shortcuts.
 - The native window, real interaction path, and actual configuration schema are the source of truth; the Stitch composition governs structure, not invented semantics.
+- The capture overlay remains native Win32/Direct2D. Acrylic or decorative translucency is not a requirement over live screenshot content; stable contrast, per-monitor DPI, and predictable capture latency take priority.
 
 ## Acceptance Evidence
 
 - Debug build succeeds with warnings treated as errors.
 - All repository tests pass.
 - The six destinations, light/dark modes, 820 × 640 scaling, toolbar drag/visibility, clipboard-pin shortcut, tray visibility, inline shortcut errors, update-policy draft, and the three application-icon choices are visually exercised in the native window.
+- The capture-toolbar family is checked at 100%, 150%, and 200% DPI for silhouette consistency, 40 px target geometry, active/pressed/focus states, and separation of scroll, pin, OCR, copy, and save actions.
+- Precision selection is exercised with negative desktop coordinates, invalid and out-of-bounds geometry, aspect lock, both anchors, 1 px keyboard movement/resize, square output, and rounded output through PNG, modern clipboard formats, and the opaque legacy fallback.
+- OCR first-use preparation is exercised for verified-local reuse, offline missing dependencies, cancellation, retryable transport failure, security-blocked manifest/file failure, automatic quarantine/reinstallation of damaged user-local data, and cancellation during recognition.
+- Scrolling capture is exercised for dimensions/frame-count updates, low-confidence escalation, safe pause, target/geometry changes while paused, successful resume revalidation, output failure retry, and the rule that a successful scroll result never falls through into pin.
+- Pin creation is exercised with ordinary opaque captures, all-zero GDI alpha, intentional partial alpha, decode failure, and first-paint behavior before opacity/click-through is enabled.
 - The application-icon selector is exercised by pointer, keyboard focus, and Left/Right arrow keys; selection remains dirty until Save and is discarded by Cancel or close.
 - Each Focus Frame, Flow Lens, and Pixel Console ICO contains 16, 20, 24, 32, 40, 48, 64, 128, and 256 px images produced with small-size optical correction rather than simple master-image downscaling.
 - Saving an icon choice updates the tray and running window/taskbar HICON resources, while Explorer continues to show the default Focus Frame program-file icon.

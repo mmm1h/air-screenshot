@@ -1,6 +1,7 @@
 #include "airshot/bitmap.h"
 
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -237,6 +238,80 @@ void Bitmap::make_opaque() noexcept {
     }
     for (std::size_t index = 3; index < pixels.size(); index += bytes_per_pixel) {
         pixels[index] = 255;
+    }
+}
+
+void composite_onto_background(Bitmap& bitmap,
+                               std::uint8_t red,
+                               std::uint8_t green,
+                               std::uint8_t blue) noexcept {
+    if (!bitmap.valid()) {
+        return;
+    }
+    const std::array<std::uint8_t, 3> background{blue, green, red};
+    for (std::size_t offset = 0;
+         offset < bitmap.pixels.size();
+         offset += Bitmap::bytes_per_pixel) {
+        const unsigned int alpha = bitmap.pixels[offset + 3];
+        const unsigned int inverse = 255U - alpha;
+        for (std::size_t channel = 0; channel < background.size(); ++channel) {
+            bitmap.pixels[offset + channel] = static_cast<std::uint8_t>(
+                (static_cast<unsigned int>(bitmap.pixels[offset + channel]) *
+                     alpha +
+                 static_cast<unsigned int>(background[channel]) * inverse +
+                 127U) /
+                255U);
+        }
+        bitmap.pixels[offset + 3] = 255U;
+    }
+}
+
+void apply_rounded_corner_mask(Bitmap& bitmap, int radius) noexcept {
+    if (!bitmap.valid() || radius <= 0) {
+        return;
+    }
+
+    const int effective_radius =
+        std::min({radius, bitmap.width / 2, bitmap.height / 2});
+    if (effective_radius <= 0) {
+        return;
+    }
+
+    const double corner_center = static_cast<double>(effective_radius);
+    const double antialias_outer = corner_center + 0.5;
+    const double antialias_inner = corner_center - 0.5;
+    for (int y = 0; y < effective_radius; ++y) {
+        const double dy = corner_center - (static_cast<double>(y) + 0.5);
+        for (int x = 0; x < effective_radius; ++x) {
+            const double dx = corner_center - (static_cast<double>(x) + 0.5);
+            const double distance = std::sqrt(dx * dx + dy * dy);
+            std::uint8_t mask = 255;
+            if (distance >= antialias_outer) {
+                mask = 0;
+            } else if (distance > antialias_inner) {
+                const double coverage = antialias_outer - distance;
+                mask = static_cast<std::uint8_t>(
+                    std::clamp(std::lround(coverage * 255.0), 0L, 255L));
+            }
+            if (mask == 255) {
+                continue;
+            }
+
+            const std::array<POINT, 4> points{
+                POINT{x, y},
+                POINT{bitmap.width - 1 - x, y},
+                POINT{x, bitmap.height - 1 - y},
+                POINT{bitmap.width - 1 - x, bitmap.height - 1 - y},
+            };
+            for (const POINT point : points) {
+                auto row = bitmap.row(point.y);
+                auto& alpha = row[static_cast<std::size_t>(point.x) *
+                                      Bitmap::bytes_per_pixel +
+                                  3];
+                alpha = static_cast<std::uint8_t>(
+                    (static_cast<unsigned int>(alpha) * mask + 127U) / 255U);
+            }
+        }
     }
 }
 

@@ -303,6 +303,29 @@ void test_annotation_geometry_and_history() {
                 airshot::overlay_detail::InteractionSettleMode::cancel,
         L"output commands commit active gestures while history and close cancel them");
 
+    expect(
+        !airshot::overlay_detail::should_discard_ocr_completion(
+            false,
+            false,
+            false) &&
+            airshot::overlay_detail::should_discard_ocr_completion(
+                false,
+                true,
+                false) &&
+            airshot::overlay_detail::should_discard_ocr_completion(
+                false,
+                false,
+                true) &&
+            airshot::overlay_detail::should_discard_ocr_completion(
+                true,
+                false,
+                false),
+        L"OCR completion always honors a UI cancellation requested after the worker finished");
+    expect(
+        airshot::overlay_detail::tool_shortcut_keydown_allowed(false) &&
+            !airshot::overlay_detail::tool_shortcut_keydown_allowed(true),
+        L"holding a tool shortcut cannot auto-repeat the active tool on and off");
+
     const auto square =
         airshot::overlay_detail::constrained_annotation_geometry(
             Tool::rectangle,
@@ -596,10 +619,6 @@ void test_annotation_geometry_and_history() {
                 bounded_centered_endpoint).right <= 100,
         L"center scaling clamps both line endpoints at the canvas edge");
 
-    expect(
-        airshot::overlay_detail::keyboard_selection_step(false) == 1 &&
-            airshot::overlay_detail::keyboard_selection_step(true) == 10,
-        L"selection arrow keys use one pixel or ten pixels with Shift");
     const auto nudged_selection =
         airshot::overlay_detail::translate_selection_within_bounds(
             {20, 20, 50, 40},
@@ -622,6 +641,57 @@ void test_annotation_geometry_and_history() {
             clamped_selection.height() == 20,
         L"keyboard selection movement preserves size and clamps to the desktop");
 
+    using airshot::overlay_detail::SelectionResizeDirection;
+    const airshot::RectI keyboard_selection{20, 20, 50, 40};
+    expect(
+        same_rect(
+            airshot::overlay_detail::resize_selection_one_pixel(
+                keyboard_selection,
+                {0, 0, 100, 100},
+                SelectionResizeDirection::left,
+                true),
+            {19, 20, 50, 40}) &&
+            same_rect(
+                airshot::overlay_detail::resize_selection_one_pixel(
+                    keyboard_selection,
+                    {0, 0, 100, 100},
+                    SelectionResizeDirection::down,
+                    true),
+                {20, 20, 50, 41}),
+        L"Ctrl+arrow enlarges the selection one pixel toward the arrow");
+    expect(
+        same_rect(
+            airshot::overlay_detail::resize_selection_one_pixel(
+                keyboard_selection,
+                {0, 0, 100, 100},
+                SelectionResizeDirection::left,
+                false),
+            {20, 20, 49, 40}) &&
+            same_rect(
+                airshot::overlay_detail::resize_selection_one_pixel(
+                    keyboard_selection,
+                    {0, 0, 100, 100},
+                    SelectionResizeDirection::down,
+                    false),
+                {20, 21, 50, 40}),
+        L"Shift+arrow shrinks the selection one pixel toward the arrow");
+    expect(
+        same_rect(
+            airshot::overlay_detail::resize_selection_one_pixel(
+                {0, 0, 20, 20},
+                {0, 0, 100, 100},
+                SelectionResizeDirection::left,
+                true),
+            {0, 0, 20, 20}) &&
+            same_rect(
+                airshot::overlay_detail::resize_selection_one_pixel(
+                    {10, 10, 12, 12},
+                    {0, 0, 100, 100},
+                    SelectionResizeDirection::right,
+                    false),
+                {10, 10, 12, 12}),
+        L"keyboard resizing respects desktop edges and the two-pixel minimum");
+
     const POINT clone_offset =
         airshot::overlay_detail::preferred_clone_translation(
             rectangle,
@@ -637,6 +707,7 @@ void test_repeat_region_and_selection_size_policy() {
     using airshot::DisplayMonitorGeometry;
     using airshot::LastRegionCapture;
     using airshot::RepeatRegionStatus;
+    using airshot::SelectionGeometryParseError;
     using airshot::SelectionSizeAnchor;
     using airshot::SelectionSizeParseError;
 
@@ -754,6 +825,88 @@ void test_repeat_region_and_selection_size_policy() {
         L"selection size parser rejects range, syntax, and overflow errors");
 
     const airshot::RectI negative_desktop{-1920, -200, 1920, 1080};
+    const auto explicit_geometry = airshot::parse_selection_geometry(
+        L"-1800",
+        L"-100",
+        L"640",
+        L"480",
+        {-100, 100, 100, 300},
+        negative_desktop,
+        SelectionSizeAnchor::top_left);
+    expect(
+        explicit_geometry &&
+            same_rect(
+                explicit_geometry.bounds,
+                {-1800, -100, -1160, 380}),
+        L"four-field geometry accepts negative virtual-desktop coordinates");
+    const auto centered_geometry = airshot::parse_selection_geometry(
+        L"-100",
+        L"100",
+        L"400",
+        L"300",
+        {-100, 100, 100, 300},
+        negative_desktop,
+        SelectionSizeAnchor::center);
+    expect(
+        centered_geometry &&
+            same_rect(centered_geometry.bounds, {-200, 50, 200, 350}),
+        L"unchanged X and Y preserve the center when dimensions change");
+    const auto mixed_anchor_geometry = airshot::parse_selection_geometry(
+        L"-500",
+        L"100",
+        L"400",
+        L"300",
+        {-100, 100, 100, 300},
+        negative_desktop,
+        SelectionSizeAnchor::center);
+    expect(
+        mixed_anchor_geometry &&
+            same_rect(
+                mixed_anchor_geometry.bounds,
+                {-500, 50, -100, 350}),
+        L"an edited coordinate wins while an unchanged axis keeps center anchoring");
+    expect(
+        airshot::parse_selection_geometry(
+            L"1800",
+            L"100",
+            L"400",
+            L"300",
+            {100, 100, 200, 200},
+            negative_desktop,
+            SelectionSizeAnchor::top_left)
+                .error == SelectionGeometryParseError::horizontal_out_of_range &&
+            airshot::parse_selection_geometry(
+                L"0",
+                L"1000",
+                L"400",
+                L"300",
+                {100, 100, 200, 200},
+                negative_desktop,
+                SelectionSizeAnchor::top_left)
+                    .error == SelectionGeometryParseError::vertical_out_of_range &&
+            airshot::parse_selection_geometry(
+                L"--20",
+                L"0",
+                L"20",
+                L"20",
+                {0, 0, 20, 20},
+                negative_desktop,
+                SelectionSizeAnchor::top_left)
+                    .error == SelectionGeometryParseError::invalid_x,
+        L"four-field geometry rejects syntax and every out-of-bounds edge without clamping");
+    const auto full_desktop_geometry = airshot::parse_selection_geometry(
+        L"-1920",
+        L"-200",
+        L"3840",
+        L"1280",
+        {-100, 100, 100, 300},
+        negative_desktop,
+        SelectionSizeAnchor::top_left);
+    expect(
+        full_desktop_geometry &&
+            same_rect(full_desktop_geometry.bounds, negative_desktop),
+        L"strict geometry validation still accepts exact desktop boundaries");
+
     const auto centered = airshot::resize_selection_to_size(
         {-100, 100, 100, 300},
         400,
@@ -1389,15 +1542,15 @@ void test_overlay_ui_dpi_metrics() {
     const airshot::RectI desktop{0, 0, 2000, 1200};
     expect(same_rect(
                airshot::selection_size_badge_bounds(selection, desktop, 96),
-               {100, 172, 260, 196}),
+               {100, 172, 400, 196}),
            L"selection badge metrics at 96 DPI");
     expect(same_rect(
                airshot::selection_size_badge_bounds(selection, desktop, 144),
-               {100, 158, 340, 194}),
+               {100, 158, 550, 194}),
            L"selection badge metrics at 144 DPI");
     expect(same_rect(
                airshot::selection_size_badge_bounds(selection, desktop, 192),
-               {100, 144, 420, 192}),
+               {100, 144, 700, 192}),
            L"selection badge metrics at 192 DPI");
     expect(selection.width() == 400 && selection.height() == 400,
            L"DPI scaling leaves screenshot canvas coordinates unchanged");

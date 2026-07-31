@@ -135,6 +135,18 @@ enum class InteractionCommand {
     close,
 };
 
+[[nodiscard]] constexpr bool tool_shortcut_keydown_allowed(
+    bool is_auto_repeat) noexcept {
+    return !is_auto_repeat;
+}
+
+[[nodiscard]] constexpr bool should_discard_ocr_completion(
+    bool session_done,
+    bool cancellation_requested,
+    bool worker_cancelled) noexcept {
+    return session_done || cancellation_requested || worker_cancelled;
+}
+
 [[nodiscard]] constexpr InteractionSettleMode
 interaction_settle_mode(InteractionCommand command) noexcept {
     switch (command) {
@@ -1016,11 +1028,6 @@ struct AnnotationGeometry {
     }.normalized();
 }
 
-[[nodiscard]] inline int keyboard_selection_step(
-    bool accelerated) noexcept {
-    return accelerated ? 10 : 1;
-}
-
 [[nodiscard]] inline RectI translate_selection_within_bounds(
     RectI selection,
     int delta_x,
@@ -1045,6 +1052,69 @@ struct AnnotationGeometry {
         bounds.top,
         bounds.bottom - height);
     return {left, top, left + width, top + height};
+}
+
+enum class SelectionResizeDirection {
+    left,
+    up,
+    right,
+    down,
+};
+
+// Mirrors Snipaste's pixel-precise selection shortcuts. Enlarging grows the
+// edge in the arrow direction; shrinking moves the opposite edge toward that
+// direction. A valid selection is never reduced below 2 x 2 pixels.
+[[nodiscard]] inline RectI resize_selection_one_pixel(
+    RectI selection,
+    RectI bounds,
+    SelectionResizeDirection direction,
+    bool enlarge) noexcept {
+    selection = selection.normalized();
+    bounds = bounds.normalized();
+    const std::int64_t width =
+        static_cast<std::int64_t>(selection.right) - selection.left;
+    const std::int64_t height =
+        static_cast<std::int64_t>(selection.bottom) - selection.top;
+    if (width < 2 || height < 2 ||
+        selection.left < bounds.left || selection.top < bounds.top ||
+        selection.right > bounds.right ||
+        selection.bottom > bounds.bottom) {
+        return selection;
+    }
+
+    if (enlarge) {
+        switch (direction) {
+            case SelectionResizeDirection::left:
+                if (selection.left > bounds.left) --selection.left;
+                break;
+            case SelectionResizeDirection::up:
+                if (selection.top > bounds.top) --selection.top;
+                break;
+            case SelectionResizeDirection::right:
+                if (selection.right < bounds.right) ++selection.right;
+                break;
+            case SelectionResizeDirection::down:
+                if (selection.bottom < bounds.bottom) ++selection.bottom;
+                break;
+        }
+        return selection;
+    }
+
+    switch (direction) {
+        case SelectionResizeDirection::left:
+            if (width > 2) --selection.right;
+            break;
+        case SelectionResizeDirection::up:
+            if (height > 2) --selection.bottom;
+            break;
+        case SelectionResizeDirection::right:
+            if (width > 2) ++selection.left;
+            break;
+        case SelectionResizeDirection::down:
+            if (height > 2) ++selection.top;
+            break;
+    }
+    return selection;
 }
 
 [[nodiscard]] inline RectI annotation_bounds(

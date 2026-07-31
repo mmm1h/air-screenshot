@@ -260,28 +260,6 @@ private:
     return result;
 }
 
-void flatten_transparency(Bitmap& bitmap) noexcept {
-    if (!bitmap.valid()) {
-        return;
-    }
-    constexpr int background = 248;
-    for (std::size_t offset = 0;
-         offset < bitmap.pixels.size();
-         offset += Bitmap::bytes_per_pixel) {
-        const int alpha = bitmap.pixels[offset + 3];
-        for (std::size_t channel = 0; channel < 3; ++channel) {
-            const int value = bitmap.pixels[offset + channel];
-            bitmap.pixels[offset + channel] =
-                static_cast<std::uint8_t>(
-                    (value * alpha +
-                     background * (255 - alpha) +
-                     127) /
-                    255);
-        }
-        bitmap.pixels[offset + 3] = 255;
-    }
-}
-
 [[nodiscard]] std::optional<Bitmap> decode_wic_source(
     IWICImagingFactory* factory,
     IWICBitmapSource* source) {
@@ -331,7 +309,6 @@ void flatten_transparency(Bitmap& bitmap) noexcept {
         if (FAILED(result)) {
             return std::nullopt;
         }
-        flatten_transparency(bitmap);
         return bitmap;
     } catch (const std::bad_alloc&) {
         return std::nullopt;
@@ -566,9 +543,7 @@ copy_global_bytes(
             std::memcpy(&v4, bytes.data(), sizeof(v4));
             declared_alpha = v4.bV4AlphaMask != 0;
         }
-        if (declared_alpha) {
-            flatten_transparency(bitmap);
-        } else {
+        if (!declared_alpha) {
             bitmap.make_opaque();
         }
         return bitmap;

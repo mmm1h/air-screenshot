@@ -5,6 +5,8 @@
 #include <array>
 #include <atomic>
 #include <exception>
+#include <new>
+#include <stdexcept>
 
 namespace airshot::overlay_detail {
 namespace {
@@ -13,9 +15,16 @@ std::atomic<HWND> g_scroll_keyboard_sink{};
 std::atomic<unsigned int> g_scroll_pressed_keys{};
 
 [[nodiscard]] unsigned int scroll_key_bit(WPARAM key) noexcept {
-    if (key == 'P') return 1U;
-    if (key == VK_RETURN) return 2U;
-    if (key == VK_ESCAPE) return 4U;
+    switch (scroll_keyboard_command(key)) {
+        case ScrollKeyboardCommand::toggle_pause:
+            return key == VK_SPACE ? 8U : 1U;
+        case ScrollKeyboardCommand::finish:
+            return 2U;
+        case ScrollKeyboardCommand::cancel:
+            return 4U;
+        case ScrollKeyboardCommand::none:
+            return 0U;
+    }
     return 0U;
 }
 
@@ -70,7 +79,7 @@ void uninstall_scroll_keyboard_forwarding(HHOOK hook) noexcept {
     }
 }
 
-[[nodiscard]] bool scroll_target_matches(
+[[nodiscard]] bool scroll_target_identity_matches(
     HWND target_window,
     DWORD target_process_id) noexcept {
     if (!target_window) {
@@ -88,7 +97,40 @@ void uninstall_scroll_keyboard_forwarding(HHOOK hook) noexcept {
            !IsIconic(target_window) &&
            process_id == target_process_id &&
            (foreground_root == target_window ||
-            foreground_root_owner == target_window);
+             foreground_root_owner == target_window);
+}
+
+[[nodiscard]] std::optional<RectI> scroll_target_bounds(
+    HWND target_window) noexcept {
+    if (!target_window || !IsWindow(target_window)) {
+        return std::nullopt;
+    }
+    RECT current{};
+    if (!GetWindowRect(target_window, &current)) {
+        return std::nullopt;
+    }
+    return RectI{
+        current.left,
+        current.top,
+        current.right,
+        current.bottom};
+}
+
+[[nodiscard]] bool scroll_target_matches(
+    HWND target_window,
+    DWORD target_process_id,
+    const RectI& expected_bounds) noexcept {
+    if (!target_window) {
+        return true;
+    }
+    const auto current_bounds = scroll_target_bounds(target_window);
+    return current_bounds &&
+           scroll_target_identity_matches(
+               target_window,
+               target_process_id) &&
+           scroll_capture_bounds_match(
+               expected_bounds,
+               *current_bounds);
 }
 
 bool hidden(const AppConfig& config, std::wstring_view id) {
@@ -1082,7 +1124,6 @@ void OverlaySession::build_toolbar() {
     const auto ordered_tools = split_by_comma(
         normalize_toolbar_order(request_.config.toolbar_order));
     for (const auto& token : ordered_tools) {
-        if (token == L"blur") continue;
         if (token == L"ocr" && !request_.config.ocr_enabled) continue;
         if (token == L"lock" && !request_.config.annotation_enabled) continue;
 
@@ -1094,12 +1135,7 @@ void OverlaySession::build_toolbar() {
             token == L"serial" || token == L"eraser" || token == L"undo" || token == L"redo";
         if (annotation_tool && !request_.config.annotation_enabled) continue;
 
-        if (token == L"mosaic") {
-            if (hidden(request_.config, L"mosaic") &&
-                hidden(request_.config, L"blur")) {
-                continue;
-            }
-        } else if (hidden(request_.config, token) && token != L"close") {
+        if (hidden(request_.config, token) && token != L"close") {
             continue;
         }
 
@@ -1307,7 +1343,7 @@ void OverlaySession::build_sub_toolbar() {
     };
     const OverlayUiMetrics ui{ui_dpi_at(host_center)};
     const ToolbarMetrics metrics{
-        ui.px(36), ui.px(34), ui.px(4), ui.px(8), ui.dpi};
+        ui.px(40), ui.px(40), ui.px(4), ui.px(8), ui.dpi};
     const auto rows = wrap_toolbar_items(items, metrics, host_bounds);
     const int total_width = toolbar_width(rows, metrics);
     const int total_height = toolbar_height(rows, metrics);
@@ -1539,40 +1575,8 @@ void OverlaySession::invoke(std::wstring_view id, HWND source) {
     }
     if (id == L"lock") {
         request_.config.annotation_locked_tool = !request_.config.annotation_locked_tool;
-    } else if (id == L"mosaic") {
-        remember_current_style();
-        const bool mosaic_available =
-            !hidden(request_.config, L"mosaic");
-        const bool blur_available =
-            !hidden(request_.config, L"blur");
-        const Tool target =
-            !mosaic_available && blur_available
-                ? Tool::blur
-                : (mosaic_is_blur_ && blur_available
-                       ? Tool::blur
-                       : Tool::mosaic);
-        const bool switching_on = active_tool_ != target;
-        active_tool_ = switching_on ? target : Tool::none;
-        selected_annotation_idx_ = -1;
-        if (switching_on) {
-            load_active_style(target);
-        }
-    } else if (id == L"watermark") {
-        remember_current_style();
-        const bool switching_on = active_tool_ != Tool::watermark;
-        active_tool_ = switching_on ? Tool::watermark : Tool::none;
-        selected_annotation_idx_ = -1;
-        if (switching_on) {
-            load_active_style(Tool::watermark);
-        }
     } else if (const Tool tool = tool_from_id(id); tool != Tool::none) {
-        remember_current_style();
-        const bool switching_on = active_tool_ != tool;
-        active_tool_ = switching_on ? tool : Tool::none;
-        selected_annotation_idx_ = -1;
-        if (switching_on) {
-            load_active_style(tool);
-        }
+        toggle_active_tool(tool);
     } else if (id == L"undo") {
         undo();
     } else if (id == L"redo") {
@@ -1632,6 +1636,19 @@ void OverlaySession::finish_annotation() {
     build_toolbar();
     build_sub_toolbar();
     invalidate_all();
+}
+
+void OverlaySession::toggle_active_tool(Tool tool) noexcept {
+    if (tool == Tool::none) {
+        return;
+    }
+    remember_current_style();
+    const bool switching_on = active_tool_ != tool;
+    active_tool_ = switching_on ? tool : Tool::none;
+    selected_annotation_idx_ = -1;
+    if (switching_on) {
+        load_active_style(tool);
+    }
 }
 
 void OverlaySession::record_annotation_change() {
@@ -2448,6 +2465,9 @@ void OverlaySession::complete_clipboard() {
         show_output_error(nullptr, L"无法生成截图图像。截图和标注仍会保留，您可以调整后重试。");
         return;
     }
+    apply_rounded_corner_mask(
+        rendered,
+        request_.config.capture_corner_radius);
     std::wstring error;
     if (!copy_bitmap_to_clipboard(rendered, &error)) {
         show_output_error(
@@ -2457,7 +2477,9 @@ void OverlaySession::complete_clipboard() {
                 : error + L"\n\n截图和标注仍会保留，您可以重试或改为保存文件。");
         return;
     }
-    finish({ExitCode::success, L"截图已复制到剪贴板。"});
+    RegionResult result{ExitCode::success, L"截图已复制到剪贴板。"};
+    result.action = RegionAction::clipboard;
+    finish(std::move(result));
 }
 
 void OverlaySession::complete_default(HWND owner) {
@@ -2492,6 +2514,9 @@ void OverlaySession::complete_file(std::wstring_view requested_path, HWND owner)
         show_output_error(owner, L"无法生成截图图像。截图和标注仍会保留，您可以调整后重试。");
         return;
     }
+    apply_rounded_corner_mask(
+        rendered,
+        request_.config.capture_corner_radius);
     std::wstring error;
     if (!save_png(rendered, *path, &error)) {
         show_output_error(
@@ -2502,8 +2527,82 @@ void OverlaySession::complete_file(std::wstring_view requested_path, HWND owner)
         return;
     }
     RegionResult result{ExitCode::success, L"截图已保存。"};
+    result.action = RegionAction::file;
     result.path = path->wstring();
     finish(std::move(result));
+}
+
+std::wstring OverlaySession::ocr_status_text() const {
+    if (ocr_cancelling_) {
+        return L"正在取消 OCR…";
+    }
+
+    const int percent =
+        std::clamp(ocr_progress_percent_.load(std::memory_order_relaxed), 0, 100);
+    const bool cancellable =
+        ocr_cancellable_.load(std::memory_order_relaxed);
+    const std::wstring_view suffix = cancellable
+                                         ? L"  ·  Esc 取消"
+                                         : L"  ·  正在安全收尾";
+    switch (ocr_dependency_state_.load(std::memory_order_relaxed)) {
+        case OcrDependencyState::checking:
+        case OcrDependencyState::download_required:
+            return L"正在检查 OCR 组件…" + std::wstring(suffix);
+        case OcrDependencyState::downloading_manifest:
+            return L"首次使用 · 正在获取 OCR 安全清单…" +
+                   std::wstring(suffix);
+        case OcrDependencyState::verifying_manifest:
+            return L"正在验证 OCR 组件签名…" + std::wstring(suffix);
+        case OcrDependencyState::downloading_files: {
+            std::wstring detail;
+            const std::size_t completed_files =
+                ocr_completed_files_.load(std::memory_order_relaxed);
+            const std::size_t total_files =
+                ocr_total_files_.load(std::memory_order_relaxed);
+            if (total_files > 0) {
+                detail += std::format(
+                    L" · {}/{} 个文件",
+                    std::min(completed_files, total_files),
+                    total_files);
+            }
+            const std::uint64_t downloaded_bytes =
+                ocr_downloaded_bytes_.load(std::memory_order_relaxed);
+            const std::uint64_t total_bytes =
+                ocr_total_bytes_.load(std::memory_order_relaxed);
+            if (total_bytes > 0) {
+                constexpr double bytes_per_mb = 1024.0 * 1024.0;
+                detail += std::format(
+                    L" · {:.1f}/{:.1f} MB",
+                    static_cast<double>(
+                        std::min(downloaded_bytes, total_bytes)) /
+                        bytes_per_mb,
+                    static_cast<double>(total_bytes) / bytes_per_mb);
+            }
+            return std::format(
+                       L"首次使用 · 正在准备 OCR {}%{}",
+                       percent,
+                       detail) +
+                   std::wstring(suffix);
+        }
+        case OcrDependencyState::installing:
+            return L"正在安装 OCR 组件…" + std::wstring(suffix);
+        case OcrDependencyState::verifying_installation:
+            return std::format(
+                       L"正在校验 OCR 组件 {}%",
+                       percent) +
+                   std::wstring(suffix);
+        case OcrDependencyState::repair_required:
+            return L"正在安全修复 OCR 组件…" + std::wstring(suffix);
+        case OcrDependencyState::ready:
+            return L"OCR 已就绪 · 正在识别文字…" + std::wstring(suffix);
+        case OcrDependencyState::cancelled:
+            return L"正在取消 OCR…";
+        case OcrDependencyState::offline:
+        case OcrDependencyState::retryable_error:
+        case OcrDependencyState::unavailable:
+            return L"OCR 准备未完成…";
+    }
+    return L"正在准备 OCR…" + std::wstring(suffix);
 }
 
 void OverlaySession::complete_ocr() {
@@ -2518,6 +2617,15 @@ void OverlaySession::complete_ocr() {
         return;
     }
 
+    const bool pending_result_matches =
+        pending_ocr_bounds_.left == selection_.left &&
+        pending_ocr_bounds_.top == selection_.top &&
+        pending_ocr_bounds_.right == selection_.right &&
+        pending_ocr_bounds_.bottom == selection_.bottom &&
+        pending_ocr_revision_ == annotation_revision_;
+    if (!pending_result_matches) {
+        pending_ocr_text_.clear();
+    }
     if (request_.copy_ocr && !pending_ocr_text_.empty()) {
         std::wstring error;
         if (!copy_text_to_clipboard(pending_ocr_text_, &error)) {
@@ -2528,6 +2636,7 @@ void OverlaySession::complete_ocr() {
             return;
         }
         RegionResult result{ExitCode::success, std::wstring(strings::ocr_success)};
+        result.action = RegionAction::ocr;
         result.text = std::move(pending_ocr_text_);
         finish(std::move(result));
         return;
@@ -2547,6 +2656,15 @@ void OverlaySession::complete_ocr() {
     }
     ocr_running_ = true;
     ocr_cancelling_ = false;
+    ocr_dependency_state_.store(
+        OcrDependencyState::checking,
+        std::memory_order_relaxed);
+    ocr_progress_percent_.store(0, std::memory_order_relaxed);
+    ocr_completed_files_.store(0, std::memory_order_relaxed);
+    ocr_total_files_.store(0, std::memory_order_relaxed);
+    ocr_downloaded_bytes_.store(0, std::memory_order_relaxed);
+    ocr_total_bytes_.store(0, std::memory_order_relaxed);
+    ocr_cancellable_.store(true, std::memory_order_relaxed);
     invalidate_all();
 
     try {
@@ -2557,7 +2675,160 @@ void OverlaySession::complete_ocr() {
              notification_window](std::stop_token stop_token) mutable {
                 OcrOutput output;
                 try {
-                    output = recognize_text(bitmap, config, stop_token);
+                    const auto publish_progress =
+                        [this, notification_window](
+                            const OcrPreparationProgress& progress) {
+                            const OcrDependencyState previous_state =
+                                ocr_dependency_state_.exchange(
+                                    progress.state,
+                                    std::memory_order_relaxed);
+                            const int next_percent =
+                                std::clamp(progress.percent, 0, 100);
+                            const int previous_percent =
+                                ocr_progress_percent_.exchange(
+                                    next_percent,
+                                    std::memory_order_relaxed);
+                            const std::size_t previous_completed_files =
+                                ocr_completed_files_.exchange(
+                                    progress.completed_files,
+                                    std::memory_order_relaxed);
+                            const std::size_t previous_total_files =
+                                ocr_total_files_.exchange(
+                                    progress.total_files,
+                                    std::memory_order_relaxed);
+                            const std::uint64_t previous_downloaded_bytes =
+                                ocr_downloaded_bytes_.exchange(
+                                    progress.downloaded_bytes,
+                                    std::memory_order_relaxed);
+                            const std::uint64_t previous_total_bytes =
+                                ocr_total_bytes_.exchange(
+                                    progress.total_bytes,
+                                    std::memory_order_relaxed);
+                            const bool previous_cancellable =
+                                ocr_cancellable_.exchange(
+                                    progress.cancellable,
+                                    std::memory_order_relaxed);
+                            if ((previous_state != progress.state ||
+                                 previous_percent != next_percent ||
+                                 previous_completed_files !=
+                                     progress.completed_files ||
+                                 previous_total_files != progress.total_files ||
+                                 previous_downloaded_bytes !=
+                                     progress.downloaded_bytes ||
+                                 previous_total_bytes != progress.total_bytes ||
+                                 previous_cancellable != progress.cancellable) &&
+                                notification_window &&
+                                IsWindow(notification_window)) {
+                                PostMessageW(
+                                    notification_window,
+                                    kOverlayOcrProgressMessage,
+                                    0,
+                                    0);
+                            }
+                        };
+
+                    OcrPreparationResult preparation =
+                        prepare_ocr_dependencies(
+                            config,
+                            true,
+                            publish_progress,
+                            stop_token);
+                    if (!preparation.status.ready &&
+                        !stop_token.stop_requested() &&
+                        preparation.status.recommended_action ==
+                            OcrRecoveryAction::repair) {
+                        OcrPreparationProgress repair_progress;
+                        repair_progress.state =
+                            OcrDependencyState::repair_required;
+                        repair_progress.percent = 0;
+                        publish_progress(repair_progress);
+                        const OcrRepairResult repair =
+                            repair_ocr_dependencies(
+                                config.ocr_engine,
+                                stop_token);
+                        if (repair.ok && !stop_token.stop_requested()) {
+                            preparation = prepare_ocr_dependencies(
+                                config,
+                                true,
+                                publish_progress,
+                                stop_token);
+                        } else {
+                            preparation.status = repair.status;
+                            preparation.cancelled =
+                                stop_token.stop_requested() ||
+                                repair.status.state ==
+                                    OcrDependencyState::cancelled;
+                            if (preparation.status.message.empty()) {
+                                preparation.status.message = repair.error;
+                            }
+                            if (preparation.status.detail.empty()) {
+                                preparation.status.detail = repair.error;
+                            }
+                        }
+                    }
+
+                    if (stop_token.stop_requested() || preparation.cancelled) {
+                        output = {false, {}, L"OCR 已取消。"};
+                    } else if (!preparation.status.ready) {
+                        std::wstring message = preparation.status.message;
+                        if (message.empty()) {
+                            message = L"OCR 组件准备失败。";
+                        }
+                        if (!preparation.status.detail.empty() &&
+                            preparation.status.detail != message) {
+                            message += L"\n" + preparation.status.detail;
+                        }
+                        switch (preparation.status.recommended_action) {
+                            case OcrRecoveryAction::retry:
+                                message += preparation.status.requires_network
+                                               ? L"\n请检查网络后再次点击 OCR 重试。"
+                                               : L"\n请直接重试；若仍失败，请检查磁盘空间、目录权限或是否有其他 OCR 准备任务正在运行。";
+                                break;
+                            case OcrRecoveryAction::download:
+                                message += L"\n请检查网络后再次点击 OCR 重试。";
+                                break;
+                            case OcrRecoveryAction::go_online:
+                                message += L"\n首次使用需要联网；已安装后可离线识别。";
+                                break;
+                            case OcrRecoveryAction::check_system_time:
+                                message += L"\n请校准 Windows 日期和时间后重试。";
+                                break;
+                            case OcrRecoveryAction::configure_build:
+                                message += L"\n当前构建未配置 OCR 组件来源。";
+                                break;
+                            case OcrRecoveryAction::contact_support:
+                                message += L"\n安全校验未通过，已停止安装；请勿使用未知来源组件。";
+                                break;
+                            case OcrRecoveryAction::repair:
+                                message += L"\n自动修复未完成，请在设置中执行 OCR 修复后重试。";
+                                break;
+                            case OcrRecoveryAction::none:
+                                break;
+                        }
+                        output = {false, {}, std::move(message)};
+                    } else {
+                        ocr_dependency_state_.store(
+                            OcrDependencyState::ready,
+                            std::memory_order_relaxed);
+                        ocr_progress_percent_.store(
+                            100,
+                            std::memory_order_relaxed);
+                        ocr_cancellable_.store(
+                            true,
+                            std::memory_order_relaxed);
+                        if (notification_window &&
+                            IsWindow(notification_window)) {
+                            PostMessageW(
+                                notification_window,
+                                kOverlayOcrProgressMessage,
+                                0,
+                                0);
+                        }
+                        output = recognize_text(
+                            bitmap,
+                            config,
+                            stop_token);
+                    }
                 } catch (const std::exception& exception) {
                     output = {
                         false,
@@ -2587,18 +2858,29 @@ void OverlaySession::complete_ocr() {
     } catch (const std::exception& exception) {
         ocr_running_ = false;
         ocr_cancelling_ = false;
+        ocr_dependency_state_.store(
+            OcrDependencyState::unavailable,
+            std::memory_order_relaxed);
         show_output_error(
             nullptr,
             L"无法启动后台 OCR：" + from_utf8(exception.what()));
     } catch (...) {
         ocr_running_ = false;
         ocr_cancelling_ = false;
+        ocr_dependency_state_.store(
+            OcrDependencyState::unavailable,
+            std::memory_order_relaxed);
         show_output_error(nullptr, L"无法启动后台 OCR。");
     }
 }
 
 void OverlaySession::cancel_ocr() {
     if (!ocr_running_) {
+        return;
+    }
+    if (!ocr_cancellable_.load(std::memory_order_relaxed)) {
+        MessageBeep(MB_ICONINFORMATION);
+        invalidate_all();
         return;
     }
     ocr_cancelling_ = true;
@@ -2621,10 +2903,14 @@ void OverlaySession::handle_ocr_completion() {
     if (ocr_thread_.joinable()) {
         ocr_thread_.join();
     }
+    const bool discard_completion = should_discard_ocr_completion(
+        done_,
+        ocr_cancelling_,
+        completion->cancelled);
     ocr_running_ = false;
     ocr_cancelling_ = false;
 
-    if (done_ || completion->cancelled) {
+    if (discard_completion) {
         invalidate_all();
         return;
     }
@@ -2642,6 +2928,8 @@ void OverlaySession::handle_ocr_completion() {
         std::wstring error;
         if (!copy_text_to_clipboard(completion->output.text, &error)) {
             pending_ocr_text_ = std::move(completion->output.text);
+            pending_ocr_bounds_ = selection_;
+            pending_ocr_revision_ = annotation_revision_;
             show_output_error(
                 nullptr,
                 (error.empty() ? L"无法复制识别结果。" : error) +
@@ -2650,6 +2938,7 @@ void OverlaySession::handle_ocr_completion() {
         }
     }
     RegionResult result{ExitCode::success, request_.copy_ocr ? std::wstring(strings::ocr_success) : L"OCR 完成。"};
+    result.action = RegionAction::ocr;
     result.text = std::move(completion->output.text);
     finish(std::move(result));
 }
@@ -2673,6 +2962,9 @@ void OverlaySession::complete_pin() {
         show_output_error(nullptr, L"无法生成贴图图像。截图和标注仍会保留，您可以调整后重试。");
         return;
     }
+    apply_rounded_corner_mask(
+        rendered,
+        request_.config.capture_corner_radius);
     RegionResult result{ExitCode::success, L"贴图已创建。"};
     result.action = RegionAction::pin;
     result.bitmap = std::move(rendered);
@@ -2699,6 +2991,58 @@ void OverlaySession::complete_scroll(HWND source) {
     run_scroll_capture(source);
 }
 
+void OverlaySession::update_scroll_control_status() {
+    if (!scroll_capture_ ||
+        !scroll_capture_->control_window ||
+        !IsWindow(scroll_capture_->control_window)) {
+        return;
+    }
+
+    ActiveScrollCapture& active = *scroll_capture_;
+    ScrollControlState::Progress& progress =
+        active.control_state.progress;
+    if (!active.processing &&
+        active.stitcher &&
+        active.stitcher->valid()) {
+        progress.capture_width = active.stitcher->width();
+        progress.stitched_height = active.stitcher->height();
+        progress.stitched_frames = active.stitcher->frame_count();
+    }
+    std::wstring quality_text;
+    switch (progress.match_quality) {
+        case ScrollMatchQuality::waiting:
+            quality_text = L"等待滚动";
+            break;
+        case ScrollMatchQuality::success:
+            quality_text = L"匹配成功";
+            break;
+        case ScrollMatchQuality::low_confidence:
+            quality_text = active.consecutive_failures > 0
+                               ? std::format(
+                                     L"低置信 {}/{}",
+                                     active.consecutive_failures,
+                                     kScrollMatchFailurePauseThreshold)
+                               : L"低置信";
+            break;
+        case ScrollMatchQuality::failed:
+            quality_text = L"匹配失败";
+            break;
+    }
+
+    std::wstring status = std::format(
+        L"{} × {} · {} 帧 · {}",
+        progress.capture_width,
+        progress.stitched_height,
+        progress.stitched_frames,
+        quality_text);
+    if (active.paused && !active.pause_text.empty()) {
+        status.append(L" · ");
+        status.append(active.pause_text);
+    }
+    SetWindowTextW(active.control_window, status.c_str());
+    InvalidateRect(active.control_window, nullptr, FALSE);
+}
+
 void OverlaySession::run_scroll_capture(HWND source) {
     const auto restore_overlay =
         [this, source](std::wstring_view message) {
@@ -2712,24 +3056,10 @@ void OverlaySession::run_scroll_capture(HWND source) {
             show_output_error(source, message);
         };
 
-    Bitmap first_frame = capture_rect(selection_);
-    if (first_frame.empty()) {
-        restore_overlay(
-            L"长截图初始化失败。已返回当前选区，您可以调整后重试。");
-        return;
-    }
-
-    auto active = std::make_unique<ActiveScrollCapture>();
-    active->last_frame = first_frame;
-    active->stitcher = std::make_unique<ScrollStitcher>(std::move(first_frame));
-    if (!active->stitcher->valid()) {
-        restore_overlay(
-            L"长截图选区过大或初始化失败。已返回当前选区，您可以缩小选区后重试。");
-        return;
-    }
+    const RectI capture_bounds = selection_;
     const POINT selection_center{
-        selection_.left + selection_.width() / 2,
-        selection_.top + selection_.height() / 2,
+        capture_bounds.left + capture_bounds.width() / 2,
+        capture_bounds.top + capture_bounds.height() / 2,
     };
     HWND target = WindowFromPoint(selection_center);
     target = target ? GetAncestor(target, GA_ROOT) : nullptr;
@@ -2744,17 +3074,80 @@ void OverlaySession::run_scroll_capture(HWND source) {
             target_process_id = 0;
         }
     }
+    if (!target) {
+        restore_overlay(
+            L"未识别到可滚动的目标窗口。已返回当前选区，请把选区放在目标窗口内后重试。");
+        return;
+    }
+
+    RectI target_bounds;
+    {
+        const auto before_capture = scroll_target_bounds(target);
+        if (!before_capture ||
+            !scroll_target_identity_matches(target, target_process_id)) {
+            restore_overlay(
+                L"无法锁定长截图目标窗口。已返回当前选区，请激活目标窗口后重试。");
+            return;
+        }
+        target_bounds = *before_capture;
+    }
+
+    Bitmap first_frame = capture_rect(capture_bounds);
+    if (first_frame.empty()) {
+        restore_overlay(
+            L"长截图初始化失败。已返回当前选区，您可以调整后重试。");
+        return;
+    }
+    {
+        const auto after_capture = scroll_target_bounds(target);
+        if (!after_capture ||
+            !scroll_target_frame_is_stable(
+                scroll_target_identity_matches(
+                    target,
+                    target_process_id),
+                target_bounds,
+                target_bounds,
+                *after_capture)) {
+            restore_overlay(
+                L"目标窗口在长截图初始化时移动或缩放。已返回当前选区，请重试。");
+            return;
+        }
+    }
+
+    auto active = std::make_unique<ActiveScrollCapture>();
+    active->last_frame = first_frame;
+    active->capture_bounds = capture_bounds;
+    active->stitcher = std::make_unique<ScrollStitcher>(std::move(first_frame));
+    if (!active->stitcher->valid()) {
+        restore_overlay(
+            L"长截图选区过大或初始化失败。已返回当前选区，您可以缩小选区后重试。");
+        return;
+    }
     active->target_window = target;
     active->target_process_id = target_process_id;
+    active->target_bounds = target_bounds;
+    active->control_state.progress.capture_width =
+        active->stitcher->width();
+    active->control_state.progress.stitched_height =
+        active->stitcher->height();
+    active->control_state.progress.stitched_frames =
+        active->stitcher->frame_count();
+    active->control_state.progress.match_quality =
+        ScrollMatchQuality::waiting;
 
     HINSTANCE instance = GetModuleHandleW(nullptr);
-    active->border_window = create_scroll_border_window(instance, source, selection_);
+    active->border_window =
+        create_scroll_border_window(instance, source, capture_bounds);
     active->control_state.on_tick = [this] { capture_scroll_frame(); };
     active->control_state.on_toggle_pause = [this] { toggle_scroll_pause(); };
     active->control_state.on_finish = [this] { finish_scroll_capture(false); };
     active->control_state.on_cancel = [this] { finish_scroll_capture(true); };
     active->control_window =
-        create_scroll_control_window(instance, source, selection_, &active->control_state);
+        create_scroll_control_window(
+            instance,
+            source,
+            capture_bounds,
+            &active->control_state);
     if (!active->control_window) {
         if (active->border_window) {
             DestroyWindow(active->border_window);
@@ -2763,9 +3156,8 @@ void OverlaySession::run_scroll_capture(HWND source) {
             L"无法创建长截图控制窗口。已返回当前选区，您可以重试。");
         return;
     }
-    std::wstring progress = std::format(L"{} px", active->stitcher->height());
-    SetWindowTextW(active->control_window, progress.c_str());
     scroll_capture_ = std::move(active);
+    update_scroll_control_status();
     scroll_capture_->keyboard_sink = modal_owner(source);
     scroll_capture_->keyboard_hook =
         install_scroll_keyboard_forwarding(
@@ -2788,7 +3180,7 @@ void OverlaySession::capture_scroll_frame() {
     }
 
     ActiveScrollCapture* const active_ptr = &active;
-    const RectI selection = selection_;
+    const RectI selection = active.capture_bounds;
     const int locked_direction = active.locked_direction;
     const HWND notification_window = modal_owner();
     try {
@@ -2802,19 +3194,45 @@ void OverlaySession::capture_scroll_frame() {
                     if (stop_token.stop_requested()) {
                         completion.status = ScrollFrameStatus::cancelled;
                     } else {
-                        if (!scroll_target_matches(
-                                active_ptr->target_window,
-                                active_ptr->target_process_id)) {
+                        std::optional<RectI> before_capture;
+                        bool target_stable = true;
+                        if (active_ptr->target_window) {
+                            before_capture = scroll_target_bounds(
+                                active_ptr->target_window);
+                            target_stable =
+                                before_capture.has_value() &&
+                                scroll_target_identity_matches(
+                                    active_ptr->target_window,
+                                    active_ptr->target_process_id);
+                        }
+                        if (!target_stable) {
                             completion.status =
                                 ScrollFrameStatus::target_changed;
                         } else {
                             Bitmap new_frame = capture_rect(selection);
-                            if (new_frame.empty()) {
-                                completion.status =
-                                    ScrollFrameStatus::capture_failed;
-                            } else if (stop_token.stop_requested()) {
+                            std::optional<RectI> after_capture;
+                            if (active_ptr->target_window) {
+                                after_capture = scroll_target_bounds(
+                                    active_ptr->target_window);
+                                target_stable =
+                                    after_capture.has_value() &&
+                                    scroll_target_frame_is_stable(
+                                        scroll_target_identity_matches(
+                                            active_ptr->target_window,
+                                            active_ptr->target_process_id),
+                                        active_ptr->target_bounds,
+                                        *before_capture,
+                                        *after_capture);
+                            }
+                            if (stop_token.stop_requested()) {
                                 completion.status =
                                     ScrollFrameStatus::cancelled;
+                            } else if (!target_stable) {
+                                completion.status =
+                                    ScrollFrameStatus::target_changed;
+                            } else if (new_frame.empty()) {
+                                completion.status =
+                                    ScrollFrameStatus::capture_failed;
                             } else {
                                 const ScrollResult detected =
                                     detect_scroll(
@@ -2823,7 +3241,28 @@ void OverlaySession::capture_scroll_frame() {
                                         locked_direction);
                                 completion.direction =
                                     detected.direction;
-                                if (detected.status() ==
+                                if (active_ptr->target_window) {
+                                    const auto before_commit =
+                                        scroll_target_bounds(
+                                            active_ptr->target_window);
+                                    target_stable =
+                                        before_commit.has_value() &&
+                                        scroll_target_frame_is_stable(
+                                            scroll_target_identity_matches(
+                                                active_ptr->target_window,
+                                                active_ptr->target_process_id),
+                                            active_ptr->target_bounds,
+                                            *after_capture,
+                                            *before_commit);
+                                }
+                                if (!scroll_frame_commit_allowed(
+                                        stop_token.stop_requested(),
+                                        target_stable)) {
+                                    completion.status =
+                                        stop_token.stop_requested()
+                                            ? ScrollFrameStatus::cancelled
+                                            : ScrollFrameStatus::target_changed;
+                                } else if (detected.status() ==
                                     ScrollResult::Status::unchanged) {
                                     completion.status =
                                         ScrollFrameStatus::unchanged;
@@ -2876,12 +3315,17 @@ void OverlaySession::capture_scroll_frame() {
                             }
                         }
                     }
-                    completion.stitched_height =
-                        active_ptr->stitcher->height();
-                } catch (...) {
+                } catch (const std::bad_alloc&) {
                     completion.status =
                         ScrollFrameStatus::
                             stitch_allocation_failed;
+                } catch (const std::length_error&) {
+                    completion.status =
+                        ScrollFrameStatus::
+                            stitch_allocation_failed;
+                } catch (...) {
+                    completion.status =
+                        ScrollFrameStatus::stitch_failed;
                 }
                 {
                     std::scoped_lock lock(active_ptr->frame_mutex);
@@ -2898,6 +3342,12 @@ void OverlaySession::capture_scroll_frame() {
                 }
             });
     } catch (...) {
+        const ScrollMatchFeedback feedback =
+            advance_scroll_match_feedback(
+                active.consecutive_failures,
+                ScrollMatchOutcome::hard_failure);
+        active.consecutive_failures = feedback.consecutive_failures;
+        active.control_state.progress.match_quality = feedback.quality;
         active.processing = false;
         active.paused = true;
         active.pause_text = L"后台采集失败";
@@ -2908,10 +3358,8 @@ void OverlaySession::capture_scroll_frame() {
             KillTimer(
                 active.control_window,
                 kScrollCaptureTimer);
-            SetWindowTextW(
-                active.control_window,
-                active.pause_text.c_str());
         }
+        update_scroll_control_status();
     }
 }
 
@@ -2938,53 +3386,66 @@ void OverlaySession::handle_scroll_frame_completion() {
         return;
     }
 
+    const auto record_feedback = [&](ScrollMatchOutcome outcome) {
+        const ScrollMatchFeedback feedback =
+            advance_scroll_match_feedback(
+                active.consecutive_failures,
+                outcome);
+        active.consecutive_failures = feedback.consecutive_failures;
+        active.control_state.progress.match_quality = feedback.quality;
+        return feedback.safe_pause;
+    };
+
     switch (completion->status) {
         case ScrollFrameStatus::unchanged:
-            active.consecutive_failures = 0;
+            record_feedback(ScrollMatchOutcome::unchanged);
             break;
         case ScrollFrameStatus::capture_failed:
         case ScrollFrameStatus::mismatch:
-            ++active.consecutive_failures;
+            if (record_feedback(ScrollMatchOutcome::mismatch)) {
+                active.paused = true;
+                active.pause_text = L"已安全暂停";
+                active.control_state.can_resume = true;
+            }
             break;
         case ScrollFrameStatus::target_changed:
+            record_feedback(ScrollMatchOutcome::hard_failure);
             active.paused = true;
             active.pause_text = L"目标已切换";
             active.control_state.can_resume = true;
             break;
         case ScrollFrameStatus::reverse_direction:
+            record_feedback(ScrollMatchOutcome::hard_failure);
             active.paused = true;
-            active.pause_text = L"反向暂停";
+            active.pause_text = L"检测到反向滚动";
             active.control_state.can_resume = true;
             break;
         case ScrollFrameStatus::stitched:
             if (active.locked_direction == 0) {
                 active.locked_direction = completion->direction;
             }
-            active.consecutive_failures = 0;
+            record_feedback(ScrollMatchOutcome::success);
             break;
         case ScrollFrameStatus::stitch_limit:
+            record_feedback(ScrollMatchOutcome::hard_failure);
             active.paused = true;
-            active.pause_text = L"已达上限";
+            active.pause_text = L"已达拼接上限";
             active.control_state.can_resume = false;
             break;
         case ScrollFrameStatus::stitch_allocation_failed:
+            record_feedback(ScrollMatchOutcome::hard_failure);
             active.paused = true;
             active.pause_text = L"内存不足";
             active.control_state.can_resume = false;
             break;
         case ScrollFrameStatus::stitch_failed:
+            record_feedback(ScrollMatchOutcome::hard_failure);
             active.paused = true;
             active.pause_text = L"拼接已暂停";
             active.control_state.can_resume = false;
             break;
         case ScrollFrameStatus::cancelled:
             break;
-    }
-    if (!active.paused &&
-        active.consecutive_failures >= 4) {
-        active.paused = true;
-        active.pause_text = L"匹配暂停";
-        active.control_state.can_resume = true;
     }
     active.control_state.paused = active.paused;
 
@@ -2993,14 +3454,8 @@ void OverlaySession::handle_scroll_frame_completion() {
         if (active.paused) {
             KillTimer(control, kScrollCaptureTimer);
         }
-        const std::wstring progress =
-            active.paused
-                ? active.pause_text
-                : std::format(
-                      L"{} px",
-                      completion->stitched_height);
-        SetWindowTextW(control, progress.c_str());
     }
+    update_scroll_control_status();
 }
 
 void OverlaySession::toggle_scroll_pause() {
@@ -3014,13 +3469,20 @@ void OverlaySession::toggle_scroll_pause() {
     }
 
     const HWND control = active.control_window;
-    const auto show_status = [&](std::wstring_view status) {
-        if (control && IsWindow(control)) {
-            SetWindowTextW(control, std::wstring(status).c_str());
-            InvalidateRect(control, nullptr, FALSE);
-        }
+    const auto report_resume_failure =
+        [&](std::wstring_view status, bool can_resume) {
+            const ScrollMatchFeedback feedback =
+                advance_scroll_match_feedback(
+                    active.consecutive_failures,
+                    ScrollMatchOutcome::hard_failure);
+            active.consecutive_failures = feedback.consecutive_failures;
+            active.control_state.progress.match_quality = feedback.quality;
+            active.paused = true;
+            active.pause_text = status;
+            active.control_state.paused = true;
+            active.control_state.can_resume = can_resume;
+            update_scroll_control_status();
     };
-
     if (!active.paused) {
         active.paused = true;
         active.pause_text = L"已暂停";
@@ -3029,7 +3491,8 @@ void OverlaySession::toggle_scroll_pause() {
         if (control && IsWindow(control)) {
             KillTimer(control, kScrollCaptureTimer);
         }
-        show_status(active.pause_text);
+        stop_scroll_worker();
+        update_scroll_control_status();
         return;
     }
     if (!active.control_state.can_resume) {
@@ -3037,27 +3500,45 @@ void OverlaySession::toggle_scroll_pause() {
     }
 
     stop_scroll_worker();
+    const int expected_width = active.capture_bounds.width();
+    const int expected_height = active.capture_bounds.height();
+    if (!scroll_capture_bounds_match(
+            active.capture_bounds,
+            selection_) ||
+        !active.stitcher ||
+        !active.stitcher->valid() ||
+        active.stitcher->width() != expected_width ||
+        active.last_frame.width != expected_width ||
+        active.last_frame.height != expected_height) {
+        report_resume_failure(L"选区或拼接尺寸已变化", false);
+        return;
+    }
     if (!scroll_target_matches(
             active.target_window,
-            active.target_process_id)) {
-        active.pause_text = L"请回到原窗口";
-        show_status(active.pause_text);
+            active.target_process_id,
+            active.target_bounds)) {
+        report_resume_failure(L"请回到原目标窗口", true);
         return;
     }
 
-    Bitmap resume_frame = capture_rect(selection_);
+    Bitmap resume_frame = capture_rect(active.capture_bounds);
     if (!scroll_target_matches(
             active.target_window,
-            active.target_process_id)) {
-        active.pause_text = L"请回到原窗口";
-        show_status(active.pause_text);
+            active.target_process_id,
+            active.target_bounds)) {
+        report_resume_failure(L"目标窗口在校验时发生变化", true);
+        return;
+    }
+    if (resume_frame.empty() ||
+        resume_frame.width != expected_width ||
+        resume_frame.height != expected_height) {
+        report_resume_failure(L"恢复帧尺寸校验失败", true);
         return;
     }
     if (!replace_scroll_resume_baseline(
             active.last_frame,
             std::move(resume_frame))) {
-        active.pause_text = L"继续失败";
-        show_status(active.pause_text);
+        report_resume_failure(L"恢复基线校验失败", true);
         return;
     }
 
@@ -3066,13 +3547,12 @@ void OverlaySession::toggle_scroll_pause() {
     active.consecutive_failures = 0;
     active.control_state.paused = false;
     active.control_state.can_resume = true;
-    show_status(std::format(L"{} px", active.stitcher->height()));
+    active.control_state.progress.match_quality =
+        ScrollMatchQuality::waiting;
+    update_scroll_control_status();
     if (control && IsWindow(control) &&
         !SetTimer(control, kScrollCaptureTimer, 80, nullptr)) {
-        active.paused = true;
-        active.pause_text = L"继续失败";
-        active.control_state.paused = true;
-        show_status(active.pause_text);
+        report_resume_failure(L"恢复采集定时器失败", true);
         return;
     }
     capture_scroll_frame();
@@ -3121,12 +3601,7 @@ void OverlaySession::finish_scroll_capture(bool cancelled) {
         scroll_capture_->control_state.cancelled = false;
         scroll_capture_->control_state.paused = true;
         scroll_capture_->control_state.can_resume = false;
-        if (scroll_capture_->control_window &&
-            IsWindow(scroll_capture_->control_window)) {
-            SetWindowTextW(
-                scroll_capture_->control_window,
-                scroll_capture_->pause_text.c_str());
-        }
+        update_scroll_control_status();
     };
     const auto rearm_keyboard = [this] {
         if (!scroll_capture_ || scroll_capture_->keyboard_hook) {
@@ -3147,6 +3622,13 @@ void OverlaySession::finish_scroll_capture(bool cancelled) {
         rearm_keyboard();
         return;
     }
+    // GDI screen captures commonly leave the reserved alpha byte at zero.
+    // A stitched screenshot is an opaque document, so normalize it before it
+    // can enter clipboard, file, or host composition paths.
+    stitched.make_opaque();
+    apply_rounded_corner_mask(
+        stitched,
+        request_.config.capture_corner_radius);
     std::wstring error;
     const bool save_to_file =
         request_.action == RegionAction::file ||
@@ -3181,6 +3663,7 @@ void OverlaySession::finish_scroll_capture(bool cancelled) {
             return;
         }
         RegionResult result{ExitCode::success, L"长截图已保存。"};
+        result.action = RegionAction::file;
         result.path = path->wstring();
         result.bitmap = std::move(stitched);
         destroy_scroll_windows();
@@ -3198,6 +3681,7 @@ void OverlaySession::finish_scroll_capture(bool cancelled) {
             return;
         }
         RegionResult result{ExitCode::success, L"长截图已复制到剪贴板。"};
+        result.action = RegionAction::clipboard;
         result.bitmap = std::move(stitched);
         destroy_scroll_windows();
         finish(std::move(result));
@@ -3291,9 +3775,8 @@ void OverlaySession::finish(RegionResult result) {
     if (result_.bounds.empty()) {
         result_.bounds = selection_;
     }
-    if (result_.action == RegionAction::interactive) {
-        result_.action = request_.action;
-    }
+    result_.action = resolve_region_result_action(
+        result_.code, result_.action, request_.action);
     result_.config = request_.config;
     result_.topology_signature = capture_topology_signature_;
     done_ = true;

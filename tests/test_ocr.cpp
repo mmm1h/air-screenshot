@@ -17,6 +17,7 @@
 #include <optional>
 #include <span>
 #include <stop_token>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -496,8 +497,13 @@ void test_unconfigured_build_is_offline_and_unavailable() {
     const airshot::OcrDependencyStatus status =
         airshot::ocr_dependency_status(L"rapidocr-onnx");
     if (!status.ready && !status.can_download) {
-        expect(status.message.find(L"公钥") != std::wstring::npos,
-               L"an unconfigured build reports OCR as unavailable in the UI");
+        expect(
+            status.message.find(L"公钥") != std::wstring::npos &&
+                status.state == airshot::OcrDependencyState::unavailable &&
+                status.recommended_action ==
+                    airshot::OcrRecoveryAction::configure_build &&
+                status.security_blocked && !status.retryable,
+            L"an unconfigured build reports a structured security-blocked OCR state");
 
         int progress_calls = 0;
         std::wstring error;
@@ -515,11 +521,211 @@ void test_unconfigured_build_is_offline_and_unavailable() {
             L"an unconfigured build refuses OCR installation before network I/O");
     }
 
+    const airshot::OcrPreparationOptions offline_options{
+        std::wstring(airshot::kOcrEngineRapidV5Fast),
+        L"https://127.0.0.1:9/this-must-not-be-requested.json",
+        false,
+    };
+    std::vector<airshot::OcrPreparationProgress> offline_progress;
+    const auto offline_result = airshot::prepare_ocr_dependencies(
+        offline_options,
+        [&offline_progress](const airshot::OcrPreparationProgress& progress) {
+            offline_progress.push_back(progress);
+        });
+    if (status.ready) {
+        expect(
+            offline_result.status.ready && offline_result.used_existing &&
+                offline_result.status.state ==
+                    airshot::OcrDependencyState::ready &&
+                offline_result.status.usable_offline,
+            L"first-use preparation reuses a verified packaged OCR component offline");
+    } else if (status.can_download) {
+        expect(
+            !offline_result.status.ready &&
+                offline_result.status.state ==
+                    airshot::OcrDependencyState::offline &&
+                offline_result.status.recommended_action ==
+                    airshot::OcrRecoveryAction::go_online &&
+                offline_result.status.requires_network &&
+                offline_result.status.retryable,
+            L"first-use preparation stays offline when network use is disabled");
+    } else {
+        expect(
+            offline_result.status.state ==
+                    airshot::OcrDependencyState::unavailable &&
+                offline_result.status.recommended_action ==
+                    airshot::OcrRecoveryAction::configure_build &&
+                offline_result.status.security_blocked,
+            L"first-use preparation preserves the build trust prerequisite offline");
+    }
+    expect(
+        offline_progress.size() >= 2 &&
+            offline_progress.front().state ==
+                airshot::OcrDependencyState::checking &&
+            offline_progress.back().state == offline_result.status.state,
+        L"first-use preparation publishes stable checking and terminal states");
+
+    std::stop_source preparation_stop;
+    preparation_stop.request_stop();
+    std::vector<airshot::OcrPreparationProgress> cancelled_progress;
+    const auto cancelled_result = airshot::prepare_ocr_dependencies(
+        offline_options,
+        [&cancelled_progress](const airshot::OcrPreparationProgress& progress) {
+            cancelled_progress.push_back(progress);
+        },
+        preparation_stop.get_token());
+    expect(
+        cancelled_result.cancelled &&
+            cancelled_result.status.state ==
+                airshot::OcrDependencyState::cancelled &&
+            cancelled_result.status.recommended_action ==
+                airshot::OcrRecoveryAction::retry &&
+            cancelled_result.status.retryable &&
+            cancelled_progress.size() == 2 &&
+            cancelled_progress.back().state ==
+                airshot::OcrDependencyState::cancelled,
+        L"first-use preparation cancellation is explicit and retryable before network I/O");
+
+    const auto callback_isolation = airshot::prepare_ocr_dependencies(
+        offline_options,
+        [](const airshot::OcrPreparationProgress&) {
+            throw std::runtime_error("observer failure");
+        });
+    expect(
+        callback_isolation.status.state == offline_result.status.state,
+        L"OCR progress observers cannot abort or alter preparation state");
+
+    const std::filesystem::path invalid_root =
+        airshot::rapid_ocr_dependency_directory();
+    std::error_code repair_filesystem_error;
+    std::filesystem::create_directories(
+        invalid_root,
+        repair_filesystem_error);
+    const std::filesystem::path invalid_file = invalid_root / L"unexpected.bin";
+    HANDLE invalid_handle = CreateFileW(
+        invalid_file.c_str(),
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    const bool invalid_fixture_created =
+        !repair_filesystem_error &&
+        invalid_handle != INVALID_HANDLE_VALUE;
+    if (invalid_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(invalid_handle);
+    }
+    expect(
+        invalid_fixture_created,
+        L"OCR repair test creates an invalid local dependency directory");
+    if (invalid_fixture_created) {
+        std::stop_source repair_stop;
+        repair_stop.request_stop();
+        const auto cancelled_repair = airshot::repair_ocr_dependencies(
+            airshot::kOcrEngineRapidV5Fast,
+            repair_stop.get_token());
+        expect(
+            !cancelled_repair.ok &&
+                !cancelled_repair.changed &&
+                std::filesystem::exists(invalid_root) &&
+                cancelled_repair.error.find(L"取消") != std::wstring::npos,
+            L"OCR repair cancellation leaves the invalid package untouched");
+
+        const auto repaired = airshot::repair_ocr_dependencies(
+            airshot::kOcrEngineRapidV5Fast);
+        expect(
+            repaired.ok && repaired.changed &&
+                !repaired.preserved_path.empty() &&
+                !std::filesystem::exists(invalid_root) &&
+                std::filesystem::exists(repaired.preserved_path) &&
+                repaired.status.state !=
+                    airshot::OcrDependencyState::repair_required,
+            L"OCR repair quarantines invalid user-local data without deleting it");
+    }
+
     if (old_size > 0) {
         SetEnvironmentVariableW(L"AIRSHOT_DATA_DIR", old_value.c_str());
     } else {
         SetEnvironmentVariableW(L"AIRSHOT_DATA_DIR", nullptr);
     }
+}
+
+void test_preparation_failure_classification() {
+    const auto network =
+        airshot::ocr_test_support::classify_preparation_failure(
+            L"下载 OCR 依赖清单或签名失败：无法连接 OCR 依赖服务器");
+    expect(
+        network.state == airshot::OcrDependencyState::retryable_error &&
+            network.recommended_action == airshot::OcrRecoveryAction::retry &&
+            network.retryable && network.requires_network &&
+            !network.security_blocked,
+        L"OCR manifest transport failure remains retryable rather than looking like a signature attack");
+
+    const auto local_failure =
+        airshot::ocr_test_support::classify_preparation_failure(
+            L"无法创建 OCR 组件隔离目录：访问被拒绝");
+    expect(
+        local_failure.state == airshot::OcrDependencyState::retryable_error &&
+            local_failure.recommended_action ==
+                airshot::OcrRecoveryAction::retry &&
+            local_failure.retryable && !local_failure.requires_network &&
+            !local_failure.security_blocked,
+        L"local OCR preparation failures remain retryable without misleading network guidance");
+
+    const auto local_lock_timeout =
+        airshot::ocr_test_support::classify_preparation_failure(
+            L"等待 OCR 状态互斥锁超时。");
+    expect(
+        local_lock_timeout.state ==
+                airshot::OcrDependencyState::retryable_error &&
+            local_lock_timeout.recommended_action ==
+                airshot::OcrRecoveryAction::retry &&
+            local_lock_timeout.retryable &&
+            !local_lock_timeout.requires_network &&
+            !local_lock_timeout.security_blocked,
+        L"local OCR lock contention never produces misleading network guidance");
+
+    const auto unsafe_redirect =
+        airshot::ocr_test_support::classify_preparation_failure(
+            L"下载 OCR 依赖清单或签名失败：OCR 下载重定向目标不是可信的 HTTPS URL。");
+    expect(
+        unsafe_redirect.state == airshot::OcrDependencyState::unavailable &&
+            unsafe_redirect.recommended_action ==
+                airshot::OcrRecoveryAction::contact_support &&
+            unsafe_redirect.security_blocked &&
+            !unsafe_redirect.retryable &&
+            !unsafe_redirect.requires_network,
+        L"OCR redirect downgrade failures remain security-blocked despite the transport wrapper");
+
+    const auto invalid_clock =
+        airshot::ocr_test_support::classify_preparation_failure(
+            L"系统时间无效，无法验证 OCR 清单有效期。");
+    expect(
+        invalid_clock.state == airshot::OcrDependencyState::unavailable &&
+            invalid_clock.recommended_action ==
+                airshot::OcrRecoveryAction::check_system_time &&
+            invalid_clock.security_blocked && invalid_clock.retryable,
+        L"OCR clock validation failures provide an actionable recovery state");
+
+    const auto signature =
+        airshot::ocr_test_support::classify_preparation_failure(
+            L"OCR 依赖清单 ECDSA P-256 签名无效。");
+    expect(
+        signature.state == airshot::OcrDependencyState::unavailable &&
+            signature.recommended_action ==
+                airshot::OcrRecoveryAction::contact_support &&
+            signature.security_blocked && !signature.retryable,
+        L"OCR cryptographic failure remains fail-closed and non-retryable");
+
+    const auto installed =
+        airshot::ocr_test_support::classify_preparation_failure(
+            L"OCR 组件安装后状态复核失败：文件大小不一致");
+    expect(
+        installed.state == airshot::OcrDependencyState::repair_required &&
+            installed.recommended_action == airshot::OcrRecoveryAction::repair &&
+            installed.security_blocked && installed.retryable,
+        L"OCR post-install verification failure recommends the explicit repair path");
 }
 
 void test_compiled_sequence_floor() {
@@ -1383,6 +1589,7 @@ int wmain(int argc, wchar_t** argv) {
     test_signature_verifier();
     test_pre_requested_download_cancellation();
     test_unconfigured_build_is_offline_and_unavailable();
+    test_preparation_failure_classification();
     test_compiled_sequence_floor();
     test_sequence_high_watermark();
     test_locked_path_share_contract();

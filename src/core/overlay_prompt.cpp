@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <commctrl.h>
@@ -335,20 +337,35 @@ constexpr int kSizeWidthEdit = 201;
 constexpr int kSizeHeightEdit = 202;
 constexpr int kSizeCenterCheck = 203;
 constexpr int kSizeErrorLabel = 204;
+constexpr int kSizeXEdit = 205;
+constexpr int kSizeYEdit = 206;
+constexpr int kSizeAspectCheck = 207;
+constexpr int kSizeRoundedCheck = 208;
+constexpr int kSizeCornerRadiusEdit = 209;
 
 struct SelectionSizePromptState {
     HWND window{};
+    HWND x_edit{};
+    HWND y_edit{};
     HWND width_edit{};
     HWND height_edit{};
     HWND center_check{};
+    HWND aspect_check{};
+    HWND rounded_check{};
+    HWND corner_radius_edit{};
     HWND error_label{};
-    int current_width{};
-    int current_height{};
-    int maximum_width{};
-    int maximum_height{};
+    HWND ok_button{};
+    HWND cancel_button{};
+    RectI current_selection;
+    RectI desktop_bounds;
     UINT dpi{USER_DEFAULT_SCREEN_DPI};
     bool is_light_theme{};
     bool accepted{};
+    bool initialized{};
+    bool syncing_aspect_ratio{};
+    bool syncing_coordinates{};
+    bool x_user_edited{};
+    bool y_user_edited{};
     SelectionSizeInput input;
     HFONT font{};
     HBRUSH background_brush{};
@@ -387,11 +404,24 @@ LRESULT CALLBACK size_edit_subclass_proc(
     (void)subclass_id;
     (void)ref_data;
     if (message == WM_KEYDOWN) {
+        if (w_param == VK_TAB) {
+            const HWND parent = GetParent(window);
+            const bool previous =
+                (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (const HWND next =
+                    GetNextDlgTabItem(parent, window, previous)) {
+                SetFocus(next);
+            }
+            return 0;
+        }
         if (w_param == VK_RETURN) {
+            const int control_id = GetDlgCtrlID(window);
             PostMessageW(
                 GetParent(window),
                 WM_COMMAND,
-                MAKEWPARAM(IDOK, BN_CLICKED),
+                MAKEWPARAM(
+                    control_id == IDCANCEL ? IDCANCEL : IDOK,
+                    BN_CLICKED),
                 reinterpret_cast<LPARAM>(window));
             return 0;
         }
@@ -407,34 +437,168 @@ LRESULT CALLBACK size_edit_subclass_proc(
     return DefSubclassProc(window, message, w_param, l_param);
 }
 
+[[nodiscard]] std::optional<int> read_positive_size_value(
+    HWND control) noexcept {
+    std::array<wchar_t, 32> text{};
+    if (!control ||
+        GetWindowTextW(
+            control,
+            text.data(),
+            static_cast<int>(text.size())) <= 0) {
+        return std::nullopt;
+    }
+    std::int64_t value = 0;
+    for (const wchar_t character : std::wstring_view(text.data())) {
+        if (character < L'0' || character > L'9') {
+            return std::nullopt;
+        }
+        value = value * 10 + (character - L'0');
+        if (value > std::numeric_limits<int>::max()) {
+            return std::nullopt;
+        }
+    }
+    return static_cast<int>(value);
+}
+
+void synchronize_aspect_ratio(
+    SelectionSizePromptState& state,
+    int source_id) noexcept {
+    if (!state.initialized || state.syncing_aspect_ratio ||
+        SendMessageW(state.aspect_check, BM_GETCHECK, 0, 0) != BST_CHECKED) {
+        return;
+    }
+    const int base_width = state.current_selection.width();
+    const int base_height = state.current_selection.height();
+    if (base_width < 2 || base_height < 2) {
+        return;
+    }
+
+    const HWND source = source_id == kSizeHeightEdit
+                            ? state.height_edit
+                            : state.width_edit;
+    const HWND target = source_id == kSizeHeightEdit
+                            ? state.width_edit
+                            : state.height_edit;
+    const auto value = read_positive_size_value(source);
+    if (!value) {
+        return;
+    }
+    const std::int64_t numerator =
+        static_cast<std::int64_t>(*value) *
+        (source_id == kSizeHeightEdit ? base_width : base_height);
+    const int denominator =
+        source_id == kSizeHeightEdit ? base_height : base_width;
+    const std::int64_t linked =
+        (numerator + denominator / 2) / denominator;
+    if (linked < 0 || linked > std::numeric_limits<int>::max()) {
+        return;
+    }
+
+    state.syncing_aspect_ratio = true;
+    const std::wstring linked_text = std::to_wstring(linked);
+    SetWindowTextW(target, linked_text.c_str());
+    state.syncing_aspect_ratio = false;
+}
+
+void synchronize_anchor_coordinates(
+    SelectionSizePromptState& state) noexcept {
+    if (!state.initialized || state.syncing_coordinates) {
+        return;
+    }
+    const auto width = read_positive_size_value(state.width_edit);
+    const auto height = read_positive_size_value(state.height_edit);
+    if (!width || !height) {
+        return;
+    }
+    const bool centered =
+        SendMessageW(state.center_check, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    const auto anchored_coordinate = [centered](
+                                         int leading,
+                                         int trailing,
+                                         int extent) noexcept {
+        if (!centered) {
+            return leading;
+        }
+        const std::int64_t total =
+            static_cast<std::int64_t>(leading) + trailing - extent;
+        const std::int64_t divided =
+            total >= 0 || total % 2 == 0 ? total / 2 : total / 2 - 1;
+        return static_cast<int>(std::clamp<std::int64_t>(
+            divided,
+            std::numeric_limits<int>::min(),
+            std::numeric_limits<int>::max()));
+    };
+
+    state.syncing_coordinates = true;
+    if (!state.x_user_edited) {
+        const std::wstring value = std::to_wstring(
+            anchored_coordinate(
+                state.current_selection.left,
+                state.current_selection.right,
+                *width));
+        SetWindowTextW(state.x_edit, value.c_str());
+    }
+    if (!state.y_user_edited) {
+        const std::wstring value = std::to_wstring(
+            anchored_coordinate(
+                state.current_selection.top,
+                state.current_selection.bottom,
+                *height));
+        SetWindowTextW(state.y_edit, value.c_str());
+    }
+    state.syncing_coordinates = false;
+}
+
 void show_size_prompt_error(
     SelectionSizePromptState& state,
-    SelectionSizeParseError error) {
+    SelectionGeometryParseError error) {
     std::wstring message;
-    HWND focus = state.width_edit;
+    HWND focus = state.x_edit;
     switch (error) {
-        case SelectionSizeParseError::invalid_width:
-            message = L"宽度必须是整数。";
+        case SelectionGeometryParseError::invalid_x:
+            message = L"X 必须是整数，可使用负坐标。";
             break;
-        case SelectionSizeParseError::invalid_height:
+        case SelectionGeometryParseError::invalid_y:
+            message = L"Y 必须是整数，可使用负坐标。";
+            focus = state.y_edit;
+            break;
+        case SelectionGeometryParseError::invalid_width:
+            message = L"宽度必须是整数。";
+            focus = state.width_edit;
+            break;
+        case SelectionGeometryParseError::invalid_height:
             message = L"高度必须是整数。";
             focus = state.height_edit;
             break;
-        case SelectionSizeParseError::width_out_of_range:
+        case SelectionGeometryParseError::width_out_of_range:
             message = std::format(
                 L"宽度范围：2–{} px。",
-                state.maximum_width);
+                state.desktop_bounds.width());
+            focus = state.width_edit;
             break;
-        case SelectionSizeParseError::height_out_of_range:
+        case SelectionGeometryParseError::height_out_of_range:
             message = std::format(
                 L"高度范围：2–{} px。",
-                state.maximum_height);
+                state.desktop_bounds.height());
             focus = state.height_edit;
             break;
-        case SelectionSizeParseError::invalid_limits:
+        case SelectionGeometryParseError::horizontal_out_of_range:
+            message = std::format(
+                L"横向范围必须完全位于虚拟桌面 {}–{} px 内。",
+                state.desktop_bounds.left,
+                state.desktop_bounds.right);
+            break;
+        case SelectionGeometryParseError::vertical_out_of_range:
+            message = std::format(
+                L"纵向范围必须完全位于虚拟桌面 {}–{} px 内。",
+                state.desktop_bounds.top,
+                state.desktop_bounds.bottom);
+            focus = state.y_edit;
+            break;
+        case SelectionGeometryParseError::invalid_limits:
             message = L"当前虚拟桌面尺寸不可用。";
             break;
-        case SelectionSizeParseError::none:
+        case SelectionGeometryParseError::none:
             break;
     }
     SetWindowTextW(state.error_label, message.c_str());
@@ -494,14 +658,81 @@ LRESULT CALLBACK selection_size_prompt_proc(
             DEFAULT_PITCH | FF_DONTCARE,
             L"Microsoft YaHei UI");
 
+        const HWND x_label = CreateWindowExW(
+            0,
+            L"STATIC",
+            L"X",
+            WS_CHILD | WS_VISIBLE,
+            s(18),
+            s(20),
+            s(20),
+            s(24),
+            window,
+            nullptr,
+            nullptr,
+            nullptr);
+        state->x_edit = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            std::to_wstring(state->current_selection.left).c_str(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            s(42),
+            s(16),
+            s(116),
+            s(28),
+            window,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(kSizeXEdit)),
+            nullptr,
+            nullptr);
+        const HWND y_label = CreateWindowExW(
+            0,
+            L"STATIC",
+            L"Y",
+            WS_CHILD | WS_VISIBLE,
+            s(180),
+            s(20),
+            s(20),
+            s(24),
+            window,
+            nullptr,
+            nullptr,
+            nullptr);
+        state->y_edit = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            std::to_wstring(state->current_selection.top).c_str(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            s(204),
+            s(16),
+            s(116),
+            s(28),
+            window,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(kSizeYEdit)),
+            nullptr,
+            nullptr);
+        const HWND coordinate_hint = CreateWindowExW(
+            0,
+            L"STATIC",
+            L"虚拟桌面坐标",
+            WS_CHILD | WS_VISIBLE,
+            s(330),
+            s(20),
+            s(92),
+            s(24),
+            window,
+            nullptr,
+            nullptr,
+            nullptr);
         const HWND width_label = CreateWindowExW(
             0,
             L"STATIC",
             L"宽度",
             WS_CHILD | WS_VISIBLE,
             s(18),
-            s(20),
-            s(48),
+            s(60),
+            s(36),
             s(24),
             window,
             nullptr,
@@ -510,11 +741,11 @@ LRESULT CALLBACK selection_size_prompt_proc(
         state->width_edit = CreateWindowExW(
             WS_EX_CLIENTEDGE,
             L"EDIT",
-            std::to_wstring(state->current_width).c_str(),
+            std::to_wstring(state->current_selection.width()).c_str(),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL,
-            s(70),
-            s(16),
-            s(92),
+            s(58),
+            s(56),
+            s(100),
             s(28),
             window,
             reinterpret_cast<HMENU>(
@@ -526,9 +757,9 @@ LRESULT CALLBACK selection_size_prompt_proc(
             L"STATIC",
             L"px",
             WS_CHILD | WS_VISIBLE,
-            s(166),
-            s(20),
-            s(28),
+            s(164),
+            s(60),
+            s(24),
             s(24),
             window,
             nullptr,
@@ -540,8 +771,8 @@ LRESULT CALLBACK selection_size_prompt_proc(
             L"高度",
             WS_CHILD | WS_VISIBLE,
             s(198),
-            s(20),
-            s(48),
+            s(60),
+            s(36),
             s(24),
             window,
             nullptr,
@@ -550,11 +781,11 @@ LRESULT CALLBACK selection_size_prompt_proc(
         state->height_edit = CreateWindowExW(
             WS_EX_CLIENTEDGE,
             L"EDIT",
-            std::to_wstring(state->current_height).c_str(),
+            std::to_wstring(state->current_selection.height()).c_str(),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL,
-            s(250),
-            s(16),
-            s(92),
+            s(238),
+            s(56),
+            s(100),
             s(28),
             window,
             reinterpret_cast<HMENU>(
@@ -566,9 +797,9 @@ LRESULT CALLBACK selection_size_prompt_proc(
             L"STATIC",
             L"px",
             WS_CHILD | WS_VISIBLE,
-            s(346),
-            s(20),
-            s(28),
+            s(344),
+            s(60),
+            s(24),
             s(24),
             window,
             nullptr,
@@ -577,15 +808,100 @@ LRESULT CALLBACK selection_size_prompt_proc(
         state->center_check = CreateWindowExW(
             0,
             L"BUTTON",
-            L"以中心调整（取消勾选则固定左上角）",
+            L"以中心调整宽高",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
             s(18),
-            s(58),
-            s(330),
+            s(96),
+            s(190),
             s(28),
             window,
             reinterpret_cast<HMENU>(
                 static_cast<INT_PTR>(kSizeCenterCheck)),
+            nullptr,
+            nullptr);
+        state->aspect_check = CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"锁定宽高比",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            s(220),
+            s(96),
+            s(150),
+            s(28),
+            window,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(kSizeAspectCheck)),
+            nullptr,
+            nullptr);
+        state->rounded_check = CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"圆角输出",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            s(18),
+            s(132),
+            s(112),
+            s(28),
+            window,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(kSizeRoundedCheck)),
+            nullptr,
+            nullptr);
+        const HWND corner_radius_label = CreateWindowExW(
+            0,
+            L"STATIC",
+            L"半径",
+            WS_CHILD | WS_VISIBLE,
+            s(146),
+            s(136),
+            s(36),
+            s(24),
+            window,
+            nullptr,
+            nullptr,
+            nullptr);
+        state->corner_radius_edit = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            std::to_wstring(
+                state->input.corner_radius > 0
+                    ? state->input.corner_radius
+                    : 16).c_str(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER |
+                ES_AUTOHSCROLL,
+            s(186),
+            s(132),
+            s(74),
+            s(28),
+            window,
+            reinterpret_cast<HMENU>(
+                static_cast<INT_PTR>(kSizeCornerRadiusEdit)),
+            nullptr,
+            nullptr);
+        const HWND corner_radius_unit = CreateWindowExW(
+            0,
+            L"STATIC",
+            L"px · PNG / 剪贴板透明角",
+            WS_CHILD | WS_VISIBLE,
+            s(268),
+            s(136),
+            s(154),
+            s(24),
+            window,
+            nullptr,
+            nullptr,
+            nullptr);
+        const HWND anchor_hint = CreateWindowExW(
+            0,
+            L"STATIC",
+            L"修改 X/Y 时坐标优先；仅改宽高时按所选锚点调整。",
+            WS_CHILD | WS_VISIBLE,
+            s(18),
+            s(166),
+            s(404),
+            s(22),
+            window,
+            nullptr,
             nullptr,
             nullptr);
         state->error_label = CreateWindowExW(
@@ -594,21 +910,21 @@ LRESULT CALLBACK selection_size_prompt_proc(
             L"",
             WS_CHILD | WS_VISIBLE,
             s(18),
-            s(91),
-            s(356),
+            s(192),
+            s(404),
             s(24),
             window,
             reinterpret_cast<HMENU>(
                 static_cast<INT_PTR>(kSizeErrorLabel)),
             nullptr,
             nullptr);
-        const HWND ok = CreateWindowExW(
+        state->ok_button = CreateWindowExW(
             0,
             L"BUTTON",
             L"确认",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            s(214),
-            s(122),
+            s(262),
+            s(224),
             s(76),
             s(30),
             window,
@@ -616,13 +932,13 @@ LRESULT CALLBACK selection_size_prompt_proc(
                 static_cast<INT_PTR>(IDOK)),
             nullptr,
             nullptr);
-        const HWND cancel = CreateWindowExW(
+        state->cancel_button = CreateWindowExW(
             0,
             L"BUTTON",
             L"取消",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            s(298),
-            s(122),
+            s(346),
+            s(224),
             s(76),
             s(30),
             window,
@@ -632,6 +948,11 @@ LRESULT CALLBACK selection_size_prompt_proc(
             nullptr);
 
         for (const HWND control : {
+                 x_label,
+                 state->x_edit,
+                 y_label,
+                 state->y_edit,
+                 coordinate_hint,
                  width_label,
                  state->width_edit,
                  width_unit,
@@ -639,36 +960,138 @@ LRESULT CALLBACK selection_size_prompt_proc(
                  state->height_edit,
                  height_unit,
                  state->center_check,
+                 state->aspect_check,
+                 state->rounded_check,
+                 corner_radius_label,
+                 state->corner_radius_edit,
+                 corner_radius_unit,
+                 anchor_hint,
                  state->error_label,
-                 ok,
-                 cancel}) {
+                 state->ok_button,
+                 state->cancel_button}) {
             set_size_prompt_font(*state, control);
         }
         SendMessageW(
             state->center_check,
             BM_SETCHECK,
-            BST_CHECKED,
+            state->input.anchor == SelectionSizeAnchor::center
+                ? BST_CHECKED
+                : BST_UNCHECKED,
             0);
+        SendMessageW(
+            state->aspect_check,
+            BM_SETCHECK,
+            state->input.aspect_ratio_locked ? BST_CHECKED : BST_UNCHECKED,
+            0);
+        SendMessageW(
+            state->rounded_check,
+            BM_SETCHECK,
+            state->input.corner_radius > 0 ? BST_CHECKED : BST_UNCHECKED,
+            0);
+        EnableWindow(
+            state->corner_radius_edit,
+            state->input.corner_radius > 0);
+        SendMessageW(state->x_edit, EM_SETLIMITTEXT, 11, 0);
+        SendMessageW(state->y_edit, EM_SETLIMITTEXT, 11, 0);
         SendMessageW(state->width_edit, EM_SETLIMITTEXT, 10, 0);
         SendMessageW(state->height_edit, EM_SETLIMITTEXT, 10, 0);
-        SetWindowSubclass(
-            state->width_edit,
-            size_edit_subclass_proc,
-            1,
-            0);
-        SetWindowSubclass(
-            state->height_edit,
-            size_edit_subclass_proc,
-            1,
-            0);
-        SetFocus(state->width_edit);
-        SendMessageW(state->width_edit, EM_SETSEL, 0, -1);
+        SendMessageW(state->corner_radius_edit, EM_SETLIMITTEXT, 3, 0);
+        for (const HWND control : {
+                 state->x_edit,
+                 state->y_edit,
+                 state->width_edit,
+                 state->height_edit,
+                 state->center_check,
+                 state->aspect_check,
+                 state->rounded_check,
+                 state->corner_radius_edit,
+                 state->ok_button,
+                 state->cancel_button}) {
+            SetWindowSubclass(
+                control,
+                size_edit_subclass_proc,
+                1,
+                0);
+        }
+        state->initialized = true;
+        SetFocus(state->x_edit);
+        SendMessageW(state->x_edit, EM_SETSEL, 0, -1);
         return 0;
     }
     if (message == WM_COMMAND) {
+        const int control_id = LOWORD(w_param);
+        const int notification = HIWORD(w_param);
+        if ((control_id == kSizeWidthEdit ||
+             control_id == kSizeHeightEdit) &&
+            notification == EN_CHANGE) {
+            SetWindowTextW(state->error_label, L"");
+            synchronize_aspect_ratio(*state, control_id);
+            synchronize_anchor_coordinates(*state);
+            return 0;
+        }
+        if ((control_id == kSizeXEdit || control_id == kSizeYEdit) &&
+            notification == EN_CHANGE) {
+            SetWindowTextW(state->error_label, L"");
+            if (state->initialized && !state->syncing_coordinates) {
+                if (control_id == kSizeXEdit) {
+                    state->x_user_edited = true;
+                } else {
+                    state->y_user_edited = true;
+                }
+            }
+            return 0;
+        }
+        if (control_id == kSizeCenterCheck &&
+            notification == BN_CLICKED) {
+            SetWindowTextW(state->error_label, L"");
+            synchronize_anchor_coordinates(*state);
+            return 0;
+        }
+        if (control_id == kSizeAspectCheck &&
+            notification == BN_CLICKED) {
+            SetWindowTextW(state->error_label, L"");
+            synchronize_aspect_ratio(*state, kSizeWidthEdit);
+            synchronize_anchor_coordinates(*state);
+            return 0;
+        }
+        if (control_id == kSizeRoundedCheck &&
+            notification == BN_CLICKED) {
+            SetWindowTextW(state->error_label, L"");
+            const bool enabled =
+                SendMessageW(
+                    state->rounded_check,
+                    BM_GETCHECK,
+                    0,
+                    0) == BST_CHECKED;
+            EnableWindow(state->corner_radius_edit, enabled);
+            if (enabled) {
+                SetFocus(state->corner_radius_edit);
+                SendMessageW(
+                    state->corner_radius_edit,
+                    EM_SETSEL,
+                    0,
+                    -1);
+            }
+            return 0;
+        }
+        if (control_id == kSizeCornerRadiusEdit &&
+            notification == EN_CHANGE) {
+            SetWindowTextW(state->error_label, L"");
+            return 0;
+        }
         if (LOWORD(w_param) == IDOK) {
+            std::array<wchar_t, 32> x{};
+            std::array<wchar_t, 32> y{};
             std::array<wchar_t, 32> width{};
             std::array<wchar_t, 32> height{};
+            GetWindowTextW(
+                state->x_edit,
+                x.data(),
+                static_cast<int>(x.size()));
+            GetWindowTextW(
+                state->y_edit,
+                y.data(),
+                static_cast<int>(y.size()));
             GetWindowTextW(
                 state->width_edit,
                 width.data(),
@@ -677,28 +1100,70 @@ LRESULT CALLBACK selection_size_prompt_proc(
                 state->height_edit,
                 height.data(),
                 static_cast<int>(height.size()));
-            const SelectionSizeParseResult parsed = parse_selection_size(
-                width.data(),
-                height.data(),
-                state->maximum_width,
-                state->maximum_height);
-            if (!parsed) {
-                show_size_prompt_error(*state, parsed.error);
-                return 0;
-            }
             const bool center_checked =
                 SendMessageW(
                     state->center_check,
                     BM_GETCHECK,
                     0,
                     0) == BST_CHECKED;
+            const SelectionSizeAnchor anchor =
+                center_checked
+                    ? SelectionSizeAnchor::center
+                    : SelectionSizeAnchor::top_left;
+            const SelectionGeometryParseResult parsed =
+                parse_selection_geometry(
+                x.data(),
+                y.data(),
+                width.data(),
+                height.data(),
+                state->current_selection,
+                state->desktop_bounds,
+                anchor);
+            if (!parsed) {
+                show_size_prompt_error(*state, parsed.error);
+                return 0;
+            }
+            int corner_radius = 0;
+            const bool rounded =
+                SendMessageW(
+                    state->rounded_check,
+                    BM_GETCHECK,
+                    0,
+                    0) == BST_CHECKED;
+            if (rounded) {
+                const auto radius = read_positive_size_value(
+                    state->corner_radius_edit);
+                const int maximum_radius = std::min(
+                    {512, parsed.width / 2, parsed.height / 2});
+                if (!radius || *radius < 1 || *radius > maximum_radius) {
+                    SetWindowTextW(
+                        state->error_label,
+                        std::format(
+                            L"圆角半径范围：1–{} px。",
+                            std::max(1, maximum_radius)).c_str());
+                    SetFocus(state->corner_radius_edit);
+                    SendMessageW(
+                        state->corner_radius_edit,
+                        EM_SETSEL,
+                        0,
+                        -1);
+                    MessageBeep(MB_ICONWARNING);
+                    return 0;
+                }
+                corner_radius = *radius;
+            }
             state->input = {
+                parsed.x,
+                parsed.y,
                 parsed.width,
                 parsed.height,
-                center_checked &&
-                        (GetKeyState(VK_SHIFT) & 0x8000) == 0
-                    ? SelectionSizeAnchor::center
-                    : SelectionSizeAnchor::top_left};
+                anchor,
+                SendMessageW(
+                    state->aspect_check,
+                    BM_GETCHECK,
+                    0,
+                    0) == BST_CHECKED,
+                corner_radius};
             state->accepted = true;
             DestroyWindow(window);
             return 0;
@@ -748,15 +1213,22 @@ LRESULT CALLBACK selection_size_prompt_proc(
         return 0;
     }
     if (message == WM_DESTROY) {
-        if (state->width_edit) {
+        for (const HWND control : {
+                 state->x_edit,
+                 state->y_edit,
+                 state->width_edit,
+                 state->height_edit,
+                 state->center_check,
+                 state->aspect_check,
+                 state->rounded_check,
+                 state->corner_radius_edit,
+                 state->ok_button,
+                 state->cancel_button}) {
+            if (!control) {
+                continue;
+            }
             RemoveWindowSubclass(
-                state->width_edit,
-                size_edit_subclass_proc,
-                1);
-        }
-        if (state->height_edit) {
-            RemoveWindowSubclass(
-                state->height_edit,
+                control,
                 size_edit_subclass_proc,
                 1);
         }
@@ -788,10 +1260,11 @@ LRESULT CALLBACK selection_size_prompt_proc(
 HWND show_selection_size_prompt(
     HWND owner,
     POINT position,
-    int current_width,
-    int current_height,
-    int maximum_width,
-    int maximum_height,
+    RectI current_selection,
+    RectI desktop_bounds,
+    SelectionSizeAnchor current_anchor,
+    bool aspect_ratio_locked,
+    int current_corner_radius,
     bool is_light_theme,
     SelectionSizeCompletion completion) {
     static std::once_flag class_flag;
@@ -812,10 +1285,18 @@ HWND show_selection_size_prompt(
         }
         return nullptr;
     }
-    state->current_width = current_width;
-    state->current_height = current_height;
-    state->maximum_width = maximum_width;
-    state->maximum_height = maximum_height;
+    state->current_selection = current_selection.normalized();
+    state->desktop_bounds = desktop_bounds.normalized();
+    state->input.anchor = current_anchor;
+    state->input.aspect_ratio_locked = aspect_ratio_locked;
+    const int maximum_initial_radius = std::min(
+        {512,
+         state->current_selection.width() / 2,
+         state->current_selection.height() / 2});
+    state->input.corner_radius = std::clamp(
+        current_corner_radius,
+        0,
+        std::max(0, maximum_initial_radius));
     state->is_light_theme = is_light_theme;
     state->completion = std::move(completion);
     state->dpi = owner && IsWindow(owner)
@@ -825,14 +1306,14 @@ HWND show_selection_size_prompt(
         state->dpi = USER_DEFAULT_SCREEN_DPI;
     }
 
-    const int client_width = size_scale(*state, 392);
-    const int client_height = size_scale(*state, 168);
+    const int client_width = size_scale(*state, 440);
+    const int client_height = size_scale(*state, 270);
     RECT window_bounds{0, 0, client_width, client_height};
     AdjustWindowRectExForDpi(
         &window_bounds,
         WS_CAPTION | WS_SYSMENU,
         FALSE,
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT,
         state->dpi);
     const int window_width = window_bounds.right - window_bounds.left;
     const int window_height = window_bounds.bottom - window_bounds.top;
@@ -858,9 +1339,9 @@ HWND show_selection_size_prompt(
     }
 
     HWND window = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT,
         L"AirScreenshot.SelectionSizePrompt",
-        L"调整选区尺寸 · F2",
+        L"精确调整选区 · X / Y / W / H",
         WS_POPUP | WS_CAPTION | WS_SYSMENU,
         x,
         y,

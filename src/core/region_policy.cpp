@@ -77,12 +77,108 @@ void hash_wstring(
     return parsed;
 }
 
+[[nodiscard]] std::optional<int> parse_signed_integer(
+    std::wstring_view value) noexcept {
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    bool negative = false;
+    std::size_t offset = 0;
+    if (value.front() == L'-') {
+        negative = true;
+        offset = 1;
+    }
+    if (offset == value.size()) {
+        return std::nullopt;
+    }
+
+    const std::int64_t limit = negative
+                                   ? static_cast<std::int64_t>(
+                                         std::numeric_limits<int>::max()) +
+                                         1
+                                   : std::numeric_limits<int>::max();
+    std::int64_t parsed = 0;
+    for (; offset < value.size(); ++offset) {
+        const wchar_t character = value[offset];
+        if (character < L'0' || character > L'9') {
+            return std::nullopt;
+        }
+        const int digit = character - L'0';
+        if (parsed > (limit - digit) / 10) {
+            return std::nullopt;
+        }
+        parsed = parsed * 10 + digit;
+    }
+    if (negative) {
+        parsed = -parsed;
+    }
+    return static_cast<int>(parsed);
+}
+
 [[nodiscard]] std::int64_t floor_divide_by_two(
     std::int64_t value) noexcept {
     if (value >= 0 || value % 2 == 0) {
         return value / 2;
     }
     return value / 2 - 1;
+}
+
+struct SelectionGeometryResolution {
+    SelectionGeometryParseError error{SelectionGeometryParseError::none};
+    RectI bounds;
+};
+
+[[nodiscard]] SelectionGeometryResolution resolve_selection_geometry_impl(
+    RectI current,
+    int x,
+    int y,
+    int width,
+    int height,
+    RectI desktop_bounds,
+    SelectionSizeAnchor anchor) noexcept {
+    current = current.normalized();
+    desktop_bounds = desktop_bounds.normalized();
+    const auto current_size = checked_region(current, 2);
+    const auto desktop_size = checked_region(desktop_bounds, 2);
+    if (!current_size || !desktop_size) {
+        return {SelectionGeometryParseError::invalid_limits};
+    }
+    if (width < 2 || width > desktop_size->width) {
+        return {SelectionGeometryParseError::width_out_of_range};
+    }
+    if (height < 2 || height > desktop_size->height) {
+        return {SelectionGeometryParseError::height_out_of_range};
+    }
+
+    std::int64_t left = x;
+    std::int64_t top = y;
+    if (anchor == SelectionSizeAnchor::center) {
+        if (x == current.left) {
+            left = floor_divide_by_two(
+                static_cast<std::int64_t>(current.left) +
+                current.right - width);
+        }
+        if (y == current.top) {
+            top = floor_divide_by_two(
+                static_cast<std::int64_t>(current.top) +
+                current.bottom - height);
+        }
+    }
+    const std::int64_t right = left + width;
+    const std::int64_t bottom = top + height;
+    if (left < desktop_bounds.left || right > desktop_bounds.right) {
+        return {SelectionGeometryParseError::horizontal_out_of_range};
+    }
+    if (top < desktop_bounds.top || bottom > desktop_bounds.bottom) {
+        return {SelectionGeometryParseError::vertical_out_of_range};
+    }
+    return {
+        SelectionGeometryParseError::none,
+        RectI{
+            static_cast<int>(left),
+            static_cast<int>(top),
+            static_cast<int>(right),
+            static_cast<int>(bottom)}};
 }
 
 [[nodiscard]] bool regions_intersect(
@@ -293,6 +389,75 @@ SelectionSizeParseResult parse_selection_size(
         *parsed_height};
 }
 
+SelectionGeometryParseResult parse_selection_geometry(
+    std::wstring_view x,
+    std::wstring_view y,
+    std::wstring_view width,
+    std::wstring_view height,
+    RectI current,
+    RectI desktop_bounds,
+    SelectionSizeAnchor anchor) noexcept {
+    if (!checked_region(current.normalized(), 2) ||
+        !checked_region(desktop_bounds.normalized(), 2)) {
+        return {SelectionGeometryParseError::invalid_limits};
+    }
+    const auto parsed_x = parse_signed_integer(x);
+    if (!parsed_x) {
+        return {SelectionGeometryParseError::invalid_x};
+    }
+    const auto parsed_y = parse_signed_integer(y);
+    if (!parsed_y) {
+        return {SelectionGeometryParseError::invalid_y};
+    }
+    const auto parsed_width = parse_positive_integer(width);
+    if (!parsed_width) {
+        return {SelectionGeometryParseError::invalid_width};
+    }
+    const auto parsed_height = parse_positive_integer(height);
+    if (!parsed_height) {
+        return {SelectionGeometryParseError::invalid_height};
+    }
+
+    const SelectionGeometryResolution resolved =
+        resolve_selection_geometry_impl(
+            current,
+            *parsed_x,
+            *parsed_y,
+            *parsed_width,
+            *parsed_height,
+            desktop_bounds,
+            anchor);
+    return {
+        resolved.error,
+        *parsed_x,
+        *parsed_y,
+        *parsed_width,
+        *parsed_height,
+        resolved.bounds};
+}
+
+std::optional<RectI> resolve_selection_geometry(
+    RectI current,
+    int x,
+    int y,
+    int width,
+    int height,
+    RectI desktop_bounds,
+    SelectionSizeAnchor anchor) noexcept {
+    const SelectionGeometryResolution resolved =
+        resolve_selection_geometry_impl(
+            current,
+            x,
+            y,
+            width,
+            height,
+            desktop_bounds,
+            anchor);
+    return resolved.error == SelectionGeometryParseError::none
+               ? std::optional<RectI>(resolved.bounds)
+               : std::nullopt;
+}
+
 std::optional<RectI> resize_selection_to_size(
     RectI current,
     int width,
@@ -335,7 +500,7 @@ RectI selection_size_badge_bounds(
     RectI desktop_bounds,
     unsigned int dpi) noexcept {
     const overlay_detail::OverlayUiMetrics ui{dpi};
-    const int badge_width = ui.px(160);
+    const int badge_width = ui.px(300);
     const int badge_height = ui.px(24);
     const int gap = ui.px(4);
     if (!checked_region(selection, 2) ||

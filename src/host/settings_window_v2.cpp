@@ -12,6 +12,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <mutex>
 #include <vector>
 #include <string>
@@ -222,6 +223,14 @@ struct SettingsState {
     // Download state
     bool is_downloading{false};
     int download_progress{0};
+    OcrDependencyState download_state{OcrDependencyState::checking};
+    std::wstring download_message;
+    std::size_t download_completed_files{};
+    std::size_t download_total_files{};
+    std::uint64_t download_completed_bytes{};
+    std::uint64_t download_total_bytes{};
+    bool download_cancellable{true};
+    bool download_cancelled{};
     std::wstring download_error;
     OcrDependencyStatus ocr_dependency;
     UINT_PTR download_subscription{};
@@ -377,24 +386,17 @@ std::optional<std::wstring> shortcut_validation_error(const AppConfig& config) {
         }
     }
 
-    constexpr std::array<std::wstring_view, 4> reserved{
-        L"Ctrl+C",
-        L"Ctrl+S",
-        L"Ctrl+Z",
-        L"Ctrl+Y",
-    };
     for (int index = idx_capture_ocr_shortcut; index < shortcut_count; ++index) {
         const auto& value = parsed[static_cast<std::size_t>(index)];
         if (!value) {
             continue;
         }
-        for (const auto command : reserved) {
-            const auto built_in = parse_hotkey(command);
-            if (built_in && same_hotkey(*value, *built_in)) {
-                return std::format(L"“{}”不能使用截图编辑命令保留的快捷键 {}。",
-                                   kShortcutLabels[static_cast<std::size_t>(index)],
-                                   command);
-            }
+        if (const auto command =
+                capture_editor_reserved_shortcut(*value)) {
+            return std::format(
+                L"“{}”不能使用截图编辑命令保留的快捷键 {}。",
+                kShortcutLabels[static_cast<std::size_t>(index)],
+                *command);
         }
     }
     return std::nullopt;
@@ -405,7 +407,16 @@ constexpr UINT kOcrDownloadStateChanged = WM_APP + 0x120;
 struct OcrDownloadSnapshot {
     bool is_downloading{};
     int progress{};
+    OcrDependencyState state{OcrDependencyState::checking};
+    std::wstring message;
+    std::size_t completed_files{};
+    std::size_t total_files{};
+    std::uint64_t completed_bytes{};
+    std::uint64_t total_bytes{};
+    bool cancellable{true};
+    bool cancelled{};
     std::wstring error;
+    std::optional<OcrDependencyStatus> terminal_status;
 };
 
 class OcrDownloadContext {
@@ -428,7 +439,20 @@ public:
 
     [[nodiscard]] OcrDownloadSnapshot snapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return {is_downloading_, progress_, error_};
+        return {
+            is_downloading_,
+            progress_,
+            state_,
+            message_,
+            completed_files_,
+            total_files_,
+            completed_bytes_,
+            total_bytes_,
+            cancellable_,
+            cancelled_,
+            error_,
+            terminal_status_,
+        };
     }
 
     [[nodiscard]] UINT_PTR subscribe(HWND window) {
@@ -452,14 +476,29 @@ public:
 
     void clear_error() {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (error_.empty()) {
+        if (error_.empty() && !cancelled_) {
             return;
         }
         error_.clear();
+        message_.clear();
+        cancelled_ = false;
+        terminal_status_.reset();
+        state_ = OcrDependencyState::checking;
         post_update_locked();
     }
 
-    [[nodiscard]] bool start(std::wstring manifest_url) {
+    [[nodiscard]] bool cancel() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!is_downloading_ || !worker_.joinable() || !cancellable_) {
+            return false;
+        }
+        worker_.request_stop();
+        return true;
+    }
+
+    [[nodiscard]] bool start(
+        std::wstring engine,
+        std::wstring manifest_url) {
         std::jthread completed_worker;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -468,7 +507,16 @@ public:
             }
             is_downloading_ = true;
             progress_ = 0;
+            state_ = OcrDependencyState::checking;
+            message_ = L"正在检查本机 OCR 组件…";
+            completed_files_ = 0;
+            total_files_ = 0;
+            completed_bytes_ = 0;
+            total_bytes_ = 0;
+            cancellable_ = true;
+            cancelled_ = false;
             error_.clear();
+            terminal_status_.reset();
             completed_worker = std::move(worker_);
             post_update_locked();
         }
@@ -479,24 +527,140 @@ public:
 
         try {
             std::jthread worker(
-                [this, manifest_url = std::move(manifest_url)](
+                [this,
+                 engine = std::move(engine),
+                 manifest_url = std::move(manifest_url)](
                     std::stop_token stop_token) {
-                    std::wstring error;
-                    const bool ok = download_ocr_dependencies(
-                        manifest_url,
-                        [this, stop_token](int progress) {
-                            update_progress(progress, stop_token);
-                        },
-                        &error,
-                        stop_token);
-                    finish(ok, std::move(error), stop_token);
+                    try {
+                        OcrPreparationOptions options;
+                        options.engine = std::move(engine);
+                        options.manifest_url = std::move(manifest_url);
+                        options.allow_network = true;
+                        const auto report_progress =
+                            [this, stop_token](
+                                const OcrPreparationProgress& progress) {
+                                update_progress(progress, stop_token);
+                            };
+                        OcrPreparationResult result =
+                            prepare_ocr_dependencies(
+                                options,
+                                report_progress,
+                                stop_token);
+                        if (!result.status.ready &&
+                            !stop_token.stop_requested() &&
+                            result.status.recommended_action ==
+                                OcrRecoveryAction::repair) {
+                            const OcrRepairResult repair =
+                                repair_ocr_dependencies(
+                                    options.engine,
+                                    stop_token);
+                            if (repair.ok && !stop_token.stop_requested()) {
+                                result = prepare_ocr_dependencies(
+                                    options,
+                                    report_progress,
+                                    stop_token);
+                            } else {
+                                result.status = repair.status;
+                                result.cancelled =
+                                    stop_token.stop_requested() ||
+                                    repair.status.state ==
+                                        OcrDependencyState::cancelled;
+                                if (result.status.message.empty()) {
+                                    result.status.message = repair.error;
+                                }
+                                if (result.status.detail.empty()) {
+                                    result.status.detail = repair.error;
+                                }
+                            }
+                        }
+                        std::wstring error = result.status.message;
+                        if (!result.status.detail.empty() &&
+                            result.status.detail != error) {
+                            if (!error.empty()) {
+                                error += L" ";
+                            }
+                            error += result.status.detail;
+                        }
+                        const bool cancelled =
+                            !result.status.ready &&
+                            (stop_token.stop_requested() ||
+                             result.cancelled ||
+                             result.status.state ==
+                                 OcrDependencyState::cancelled);
+                        finish(
+                            std::move(result.status),
+                            cancelled,
+                            std::move(error));
+                    } catch (const std::exception& exception) {
+                        const bool cancelled = stop_token.stop_requested();
+                        try {
+                            OcrDependencyStatus status;
+                            status.state = cancelled
+                                               ? OcrDependencyState::cancelled
+                                               : OcrDependencyState::retryable_error;
+                            status.recommended_action = cancelled
+                                                            ? OcrRecoveryAction::none
+                                                            : OcrRecoveryAction::retry;
+                            status.retryable = !cancelled;
+                            status.message = cancelled
+                                                 ? L"OCR 准备已取消，可随时重试。"
+                                                 : L"OCR 准备发生异常，可直接重试。";
+                            status.detail = cancelled
+                                                ? std::wstring{}
+                                                : L"OCR 准备异常：" +
+                                                      from_utf8(exception.what());
+                            finish(
+                                std::move(status),
+                                cancelled,
+                                cancelled
+                                    ? std::wstring{}
+                                    : L"OCR 准备异常：" +
+                                          from_utf8(exception.what()));
+                        } catch (...) {
+                            // No exception may escape a std::jthread entry point.
+                        }
+                    } catch (...) {
+                        const bool cancelled = stop_token.stop_requested();
+                        try {
+                            OcrDependencyStatus status;
+                            status.state = cancelled
+                                               ? OcrDependencyState::cancelled
+                                               : OcrDependencyState::retryable_error;
+                            status.recommended_action = cancelled
+                                                            ? OcrRecoveryAction::none
+                                                            : OcrRecoveryAction::retry;
+                            status.retryable = !cancelled;
+                            status.message = cancelled
+                                                 ? L"OCR 准备已取消，可随时重试。"
+                                                 : L"OCR 准备发生未知异常，可直接重试。";
+                            status.detail = cancelled
+                                                ? std::wstring{}
+                                                : L"OCR 准备发生未知异常。";
+                            finish(
+                                std::move(status),
+                                cancelled,
+                                cancelled
+                                    ? std::wstring{}
+                                    : L"OCR 准备发生未知异常。");
+                        } catch (...) {
+                            // No exception may escape a std::jthread entry point.
+                        }
+                    }
                 });
             std::lock_guard<std::mutex> lock(mutex_);
             worker_ = std::move(worker);
         } catch (...) {
             std::lock_guard<std::mutex> lock(mutex_);
             is_downloading_ = false;
+            cancellable_ = false;
             error_ = L"无法启动 OCR 下载任务。";
+            OcrDependencyStatus status;
+            status.state = OcrDependencyState::retryable_error;
+            status.recommended_action = OcrRecoveryAction::retry;
+            status.retryable = true;
+            status.message = error_;
+            status.detail = error_;
+            terminal_status_ = std::move(status);
             post_update_locked();
             return false;
         }
@@ -519,7 +683,9 @@ private:
         }
     }
 
-    void update_progress(int progress, std::stop_token stop_token) {
+    void update_progress(
+        const OcrPreparationProgress& progress,
+        std::stop_token stop_token) {
         if (stop_token.stop_requested()) {
             return;
         }
@@ -527,30 +693,75 @@ private:
         if (!is_downloading_) {
             return;
         }
-        progress_ = std::clamp(progress, 0, 100);
+        progress_ = std::clamp(progress.percent, 0, 100);
+        state_ = progress.state;
+        message_ = progress.message;
+        completed_files_ = progress.completed_files;
+        total_files_ = progress.total_files;
+        completed_bytes_ = progress.downloaded_bytes;
+        total_bytes_ = progress.total_bytes;
+        cancellable_ = progress.cancellable;
+        cancelled_ = progress.state == OcrDependencyState::cancelled;
         post_update_locked();
     }
 
-    void finish(bool ok, std::wstring error, std::stop_token stop_token) {
+    void finish(
+        OcrDependencyStatus status,
+        bool cancelled,
+        std::wstring error) {
         std::lock_guard<std::mutex> lock(mutex_);
         is_downloading_ = false;
-        progress_ = ok ? 100 : progress_;
-        error_ = ok ? std::wstring{} : std::move(error);
-        if (!stop_token.stop_requested()) {
-            post_update_locked();
-        }
+        progress_ = status.ready ? 100 : progress_;
+        state_ = cancelled ? OcrDependencyState::cancelled : status.state;
+        cancellable_ = false;
+        cancelled_ = cancelled;
+        message_ = cancelled
+                       ? std::wstring(L"OCR 准备已取消，可随时重试。")
+                       : status.message;
+        error_ = status.ready || cancelled
+                     ? std::wstring{}
+                     : std::move(error);
+        terminal_status_ = std::move(status);
+        post_update_locked();
     }
 
     mutable std::mutex mutex_;
     bool is_downloading_{};
     int progress_{};
+    OcrDependencyState state_{OcrDependencyState::checking};
+    std::wstring message_;
+    std::size_t completed_files_{};
+    std::size_t total_files_{};
+    std::uint64_t completed_bytes_{};
+    std::uint64_t total_bytes_{};
+    bool cancellable_{true};
+    bool cancelled_{};
     std::wstring error_;
+    std::optional<OcrDependencyStatus> terminal_status_;
     std::vector<Subscription> subscribers_;
     UINT_PTR next_subscription_{};
     std::jthread worker_;
 };
 
 OcrDownloadContext g_ocr_download;
+
+[[nodiscard]] bool ocr_dependency_actionable(
+    const OcrDependencyStatus& status) noexcept {
+    return status.can_download || status.retryable ||
+           status.recommended_action == OcrRecoveryAction::repair;
+}
+
+[[nodiscard]] std::wstring ocr_dependency_action_label(
+    const OcrDependencyStatus& status,
+    bool has_error) {
+    if (status.recommended_action == OcrRecoveryAction::repair) {
+        return L"修复并重装";
+    }
+    if (has_error || status.retryable) {
+        return L"重试准备";
+    }
+    return L"准备依赖";
+}
 
 void refresh_ocr_download_state(
     SettingsState* state,
@@ -559,11 +770,32 @@ void refresh_ocr_download_state(
     OcrDownloadSnapshot snapshot = g_ocr_download.snapshot();
     state->is_downloading = snapshot.is_downloading;
     state->download_progress = snapshot.progress;
+    state->download_state = snapshot.state;
+    state->download_message = std::move(snapshot.message);
+    state->download_completed_files = snapshot.completed_files;
+    state->download_total_files = snapshot.total_files;
+    state->download_completed_bytes = snapshot.completed_bytes;
+    state->download_total_bytes = snapshot.total_bytes;
+    state->download_cancellable = snapshot.cancellable;
+    state->download_cancelled = snapshot.cancelled;
     state->download_error = std::move(snapshot.error);
     if (force_dependency_refresh ||
         (was_downloading && !state->is_downloading)) {
-        state->ocr_dependency =
-            ocr_dependency_status(state->config.ocr_engine);
+        const bool terminal_cancelled =
+            snapshot.cancelled ||
+            (snapshot.terminal_status &&
+             snapshot.terminal_status->state ==
+                 OcrDependencyState::cancelled);
+        if (settings_detail::settings_use_terminal_ocr_status(
+                snapshot.terminal_status.has_value(),
+                snapshot.terminal_status &&
+                    snapshot.terminal_status->ready,
+                terminal_cancelled)) {
+            state->ocr_dependency = *snapshot.terminal_status;
+        } else {
+            state->ocr_dependency =
+                ocr_dependency_status(state->config.ocr_engine);
+        }
     }
 }
 
@@ -1448,9 +1680,11 @@ std::vector<SettingsFocusTarget> settings_focus_targets(const SettingsState* sta
             for (int index = 0; index < static_cast<int>(kOcrEngineButtons.size()); ++index) {
                 targets.push_back({SettingsFocusKind::ocr_engine, index});
             }
-            if (state->ocr_dependency.can_download) {
-                targets.push_back({SettingsFocusKind::download_ocr});
-            }
+        }
+        if (state->config.ocr_enabled &&
+            (state->is_downloading ||
+             ocr_dependency_actionable(state->ocr_dependency))) {
+            targets.push_back({SettingsFocusKind::download_ocr});
         }
         targets.push_back({SettingsFocusKind::font_family});
         targets.push_back({SettingsFocusKind::text_bold});
@@ -1813,12 +2047,24 @@ bool activate_settings_focus(
             }
             break;
         case SettingsFocusKind::download_ocr: {
+            if (state->is_downloading) {
+                if (!state->download_cancellable) {
+                    break;
+                }
+                if (!g_ocr_download.cancel()) {
+                    state->download_error = L"OCR 准备任务已经结束。";
+                }
+                break;
+            }
             const OcrDependencyStatus status =
                 ocr_dependency_status(state->config.ocr_engine);
             state->ocr_dependency = status;
-            if (status.can_download && !state->is_downloading) {
+            if (ocr_dependency_actionable(status) &&
+                !state->is_downloading) {
                 const bool started =
-                    g_ocr_download.start(state->config.ocr_download_url);
+                    g_ocr_download.start(
+                        state->config.ocr_engine,
+                        state->config.ocr_download_url);
                 refresh_ocr_download_state(state);
                 if (!started && state->download_error.empty()) {
                     state->download_error = L"OCR 下载任务已在运行。";
@@ -2337,8 +2583,37 @@ void draw_ocr_page(SettingsState* state) {
 
     std::wstring dependency_status = state->ocr_dependency.message;
     if (state->is_downloading) {
-        dependency_status =
-            std::format(L"正在下载并校验本地模型 · {}%", state->download_progress);
+        dependency_status = state->download_message.empty()
+                                ? L"正在准备并安全校验 OCR 组件…"
+                                : state->download_message;
+        if (state->download_progress > 0 &&
+            dependency_status.find(L'%') == std::wstring::npos) {
+            dependency_status += std::format(
+                L" · {}%",
+                state->download_progress);
+        }
+        if (state->download_total_files > 0) {
+            dependency_status += std::format(
+                L" · {}/{} 文件",
+                std::min(
+                    state->download_completed_files,
+                    state->download_total_files),
+                state->download_total_files);
+        }
+        if (state->download_total_bytes > 0) {
+            constexpr double bytes_per_megabyte = 1024.0 * 1024.0;
+            dependency_status += std::format(
+                L" · {:.1f}/{:.1f} MB",
+                static_cast<double>(std::min(
+                    state->download_completed_bytes,
+                    state->download_total_bytes)) /
+                    bytes_per_megabyte,
+                static_cast<double>(state->download_total_bytes) /
+                    bytes_per_megabyte);
+        }
+    } else if (state->download_cancelled &&
+               !state->download_message.empty()) {
+        dependency_status = state->download_message;
     } else if (!state->download_error.empty()) {
         dependency_status = state->download_error;
     }
@@ -2355,25 +2630,43 @@ void draw_ocr_page(SettingsState* state) {
         const float progress =
             static_cast<float>(std::clamp(state->download_progress, 0, 100)) / 100.0f;
         const auto track = D2D1::RoundedRect(
-            D2D1::RectF(690.0f, 306.0f, 870.0f, 314.0f), 4.0f, 4.0f);
+            D2D1::RectF(690.0f, 306.0f, 798.0f, 314.0f), 4.0f, 4.0f);
         state->render_target->FillRoundedRectangle(
             track, state->disabled_bg_brush.Get());
         state->render_target->FillRoundedRectangle(
             D2D1::RoundedRect(
-                D2D1::RectF(690.0f, 306.0f, 690.0f + 180.0f * progress, 314.0f),
+                D2D1::RectF(690.0f, 306.0f, 690.0f + 108.0f * progress, 314.0f),
                 4.0f,
                 4.0f),
             state->blue_brush.Get());
-    } else if (state->config.ocr_enabled && state->ocr_dependency.can_download) {
+        const bool cancel_hovered =
+            state->download_cancellable &&
+            point_in_rect(state->mouse_pos, 806.0f, 294.0f, 870.0f, 330.0f);
+        draw_button(
+            state,
+            806,
+            294,
+            870,
+            330,
+            state->download_cancellable ? L"取消" : L"正在收尾",
+            cancel_hovered,
+            btn_secondary,
+            state->download_cancellable);
+    } else if (state->config.ocr_enabled &&
+               ocr_dependency_actionable(state->ocr_dependency)) {
         const bool hovered =
             point_in_rect(state->mouse_pos, 746.0f, 294.0f, 870.0f, 330.0f);
+        const std::wstring action_label =
+            ocr_dependency_action_label(
+                state->ocr_dependency,
+                !state->download_error.empty());
         draw_button(
             state,
             746,
             294,
             870,
             330,
-            state->download_error.empty() ? L"下载依赖" : L"重新下载",
+            action_label.c_str(),
             hovered,
             btn_primary);
     } else if (state->config.ocr_enabled && state->ocr_dependency.ready) {
@@ -3323,10 +3616,14 @@ std::optional<SettingsFocusTarget> hit_test_settings(
                         SettingsFocusKind::ocr_engine, index};
                 }
             }
-            if (state->ocr_dependency.can_download &&
+            if (ocr_dependency_actionable(state->ocr_dependency) &&
                 point_in_rect(point, 746.0f, 294.0f, 870.0f, 330.0f)) {
                 return SettingsFocusTarget{SettingsFocusKind::download_ocr};
             }
+        } else if (state->config.ocr_enabled &&
+                   state->is_downloading &&
+                   point_in_rect(point, 806.0f, 294.0f, 870.0f, 330.0f)) {
+            return SettingsFocusTarget{SettingsFocusKind::download_ocr};
         }
         if (point_in_rect(point, 630.0f, 428.0f, 870.0f, 464.0f)) {
             return SettingsFocusTarget{SettingsFocusKind::font_family};

@@ -75,11 +75,61 @@ struct SelectionSizeParseResult {
     }
 };
 
+enum class SelectionGeometryParseError {
+    none,
+    invalid_limits,
+    invalid_x,
+    invalid_y,
+    invalid_width,
+    invalid_height,
+    width_out_of_range,
+    height_out_of_range,
+    horizontal_out_of_range,
+    vertical_out_of_range,
+};
+
+struct SelectionGeometryParseResult {
+    SelectionGeometryParseError error{SelectionGeometryParseError::none};
+    int x{};
+    int y{};
+    int width{};
+    int height{};
+    RectI bounds;
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == SelectionGeometryParseError::none;
+    }
+};
+
 [[nodiscard]] SelectionSizeParseResult parse_selection_size(
     std::wstring_view width,
     std::wstring_view height,
     int maximum_width,
     int maximum_height) noexcept;
+
+// Parses a complete virtual-desktop selection geometry. X and Y are signed
+// desktop coordinates, so monitors positioned left or above the primary
+// display are supported. When center anchoring is selected, an unchanged X or
+// Y keeps the current center on that axis; an explicitly changed coordinate
+// always wins. The returned rectangle is rejected instead of silently clamped
+// when any edge would leave desktop_bounds.
+[[nodiscard]] SelectionGeometryParseResult parse_selection_geometry(
+    std::wstring_view x,
+    std::wstring_view y,
+    std::wstring_view width,
+    std::wstring_view height,
+    RectI current,
+    RectI desktop_bounds,
+    SelectionSizeAnchor anchor) noexcept;
+
+[[nodiscard]] std::optional<RectI> resolve_selection_geometry(
+    RectI current,
+    int x,
+    int y,
+    int width,
+    int height,
+    RectI desktop_bounds,
+    SelectionSizeAnchor anchor) noexcept;
 
 [[nodiscard]] std::optional<RectI> resize_selection_to_size(
     RectI current,

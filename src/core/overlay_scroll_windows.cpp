@@ -10,7 +10,7 @@ namespace airshot::overlay_detail {
 
 namespace {
 
-constexpr int kScrollControlWidthDip = 328;
+constexpr int kScrollControlWidthDip = 640;
 constexpr int kScrollControlHeightDip = 52;
 
 struct ScrollControlLayout {
@@ -42,11 +42,11 @@ struct ScrollControlLayout {
     layout.width = s(kScrollControlWidthDip);
     layout.height = s(kScrollControlHeightDip);
     layout.radius = std::max(2, s(7));
-    layout.status = {s(27), 0, s(104), layout.height};
+    layout.status = {s(27), 0, s(316), layout.height};
     layout.buttons = {
-        RECT{s(108), s(10), s(174), s(42)},
-        RECT{s(180), s(10), s(246), s(42)},
-        RECT{s(252), s(10), s(318), s(42)},
+        RECT{s(324), s(10), s(426), s(42)},
+        RECT{s(432), s(10), s(534), s(42)},
+        RECT{s(540), s(10), s(630), s(42)},
     };
     return layout;
 }
@@ -380,15 +380,31 @@ LRESULT CALLBACK scroll_control_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 SelectObject(mem_dc, old_pen);
                 DeleteObject(border_pen);
 
-                if (state->paused || state->blink_counter % 2 == 0) {
-                    const COLORREF dot_color =
-                        state->paused
-                            ? (high_contrast
-                                   ? GetSysColor(COLOR_HIGHLIGHT)
-                                   : RGB(242, 174, 68))
-                            : (high_contrast
-                                   ? GetSysColor(COLOR_HIGHLIGHT)
-                                   : RGB(66, 213, 221));
+                const bool waiting_for_scroll =
+                    state->progress.match_quality ==
+                    ScrollMatchQuality::waiting;
+                if (!waiting_for_scroll || state->paused ||
+                    state->blink_counter % 2 == 0) {
+                    COLORREF dot_color =
+                        high_contrast
+                            ? GetSysColor(COLOR_HIGHLIGHT)
+                            : RGB(66, 213, 221);
+                    if (!high_contrast) {
+                        switch (state->progress.match_quality) {
+                            case ScrollMatchQuality::waiting:
+                                dot_color = RGB(66, 213, 221);
+                                break;
+                            case ScrollMatchQuality::success:
+                                dot_color = RGB(72, 205, 145);
+                                break;
+                            case ScrollMatchQuality::low_confidence:
+                                dot_color = RGB(242, 174, 68);
+                                break;
+                            case ScrollMatchQuality::failed:
+                                dot_color = RGB(242, 103, 103);
+                                break;
+                        }
+                    }
                     HBRUSH dot_brush = CreateSolidBrush(dot_color);
                     HPEN dot_pen = CreatePen(PS_SOLID, 1, dot_color);
                     HGDIOBJ prev_brush = SelectObject(mem_dc, dot_brush);
@@ -518,11 +534,11 @@ LRESULT CALLBACK scroll_control_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 
                 draw_button(
                     1,
-                    state->paused ? L"继续" : L"暂停",
+                    state->paused ? L"P/空格 继续" : L"P/空格 暂停",
                     false,
                     pause_button_enabled(*state));
-                draw_button(2, L"完成", true, true);
-                draw_button(3, L"取消", false, true);
+                draw_button(2, L"Enter 完成", true, true);
+                draw_button(3, L"Esc 取消", false, true);
 
                 SelectObject(mem_dc, old_font);
                 DeleteObject(font);

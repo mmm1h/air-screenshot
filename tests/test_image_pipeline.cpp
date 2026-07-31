@@ -75,6 +75,52 @@ void test_bitmap_invariants() {
     expect(!bitmap.valid() && bitmap.row(0).empty(), L"mismatched compatibility fields rejected");
 }
 
+void test_rounded_corner_alpha_mask() {
+    airshot::Bitmap bitmap = solid_bitmap(12, 8, RGB(12, 34, 56));
+    airshot::apply_rounded_corner_mask(bitmap, 4);
+
+    expect(channel(bitmap, 0, 0, 3) == 0,
+           L"rounded output clears the extreme corner");
+    expect(channel(bitmap, 1, 1, 3) > 0 && channel(bitmap, 1, 1, 3) < 255,
+           L"rounded output antialiases the curved edge");
+    expect(channel(bitmap, 5, 0, 3) == 255 && channel(bitmap, 5, 4, 3) == 255,
+           L"rounded output preserves straight edges and the center");
+    expect(channel(bitmap, 11, 0, 3) == channel(bitmap, 0, 0, 3) &&
+               channel(bitmap, 11, 7, 3) == channel(bitmap, 0, 0, 3),
+           L"rounded output is symmetric across all corners");
+
+    airshot::Bitmap unchanged = solid_bitmap(5, 3, RGB(1, 2, 3));
+    airshot::apply_rounded_corner_mask(unchanged, 0);
+    expect(channel(unchanged, 0, 0, 3) == 255,
+           L"zero corner radius preserves opaque output");
+
+    airshot::Bitmap clamped = solid_bitmap(4, 2, RGB(1, 2, 3));
+    airshot::apply_rounded_corner_mask(clamped, 200);
+    expect(channel(clamped, 0, 0, 3) < 255 &&
+               channel(clamped, 1, 0, 3) == 255,
+           L"oversized corner radius is safely clamped");
+}
+
+void test_alpha_compositing_for_legacy_outputs() {
+    airshot::Bitmap bitmap(2, 1);
+    bitmap.pixels = {
+        20, 40, 60, 0,
+        10, 30, 50, 128,
+    };
+    airshot::composite_onto_background(bitmap, 255, 255, 255);
+
+    expect(channel(bitmap, 0, 0, 0) == 255 &&
+               channel(bitmap, 0, 0, 1) == 255 &&
+               channel(bitmap, 0, 0, 2) == 255 &&
+               channel(bitmap, 0, 0, 3) == 255,
+           L"fully transparent legacy pixels become the background");
+    expect(channel(bitmap, 1, 0, 0) == 132 &&
+               channel(bitmap, 1, 0, 1) == 142 &&
+               channel(bitmap, 1, 0, 2) == 152 &&
+               channel(bitmap, 1, 0, 3) == 255,
+           L"partial alpha is composited instead of discarded");
+}
+
 void test_blit_and_holes() {
     airshot::Bitmap left(2, 2);
     airshot::Bitmap right(2, 2);
@@ -793,10 +839,11 @@ void test_selection_size_prompt_validates_without_side_effects() {
         airshot::overlay_detail::show_selection_size_prompt(
             nullptr,
             POINT{20, 20},
-            320,
-            180,
-            1920,
-            1080,
+            {-320, -20, 0, 160},
+            {-1920, -200, 1920, 1080},
+            airshot::SelectionSizeAnchor::center,
+            false,
+            0,
             true,
             [&](std::optional<
                     airshot::overlay_detail::SelectionSizeInput> input) {
@@ -810,41 +857,102 @@ void test_selection_size_prompt_validates_without_side_effects() {
         return;
     }
 
+    const HWND x = GetDlgItem(prompt, 205);
+    const HWND y = GetDlgItem(prompt, 206);
     const HWND width = GetDlgItem(prompt, 201);
     const HWND height = GetDlgItem(prompt, 202);
     const HWND center = GetDlgItem(prompt, 203);
     const HWND error = GetDlgItem(prompt, 204);
+    const HWND aspect = GetDlgItem(prompt, 207);
+    const HWND rounded = GetDlgItem(prompt, 208);
+    const HWND corner_radius = GetDlgItem(prompt, 209);
     expect(
-        width && height && center && error &&
-            SendMessageW(center, BM_GETCHECK, 0, 0) == BST_CHECKED,
-        L"selection size prompt exposes numeric inputs and defaults to center anchoring");
+        x && y && width && height && center && error && aspect &&
+            rounded && corner_radius &&
+            SendMessageW(center, BM_GETCHECK, 0, 0) == BST_CHECKED &&
+            SendMessageW(aspect, BM_GETCHECK, 0, 0) == BST_UNCHECKED &&
+            SendMessageW(rounded, BM_GETCHECK, 0, 0) == BST_UNCHECKED &&
+            !IsWindowEnabled(corner_radius),
+        L"selection geometry prompt exposes geometry, aspect, and output-corner controls");
 
-    if (width) {
-        SetWindowTextW(width, L"1");
+    if (width && x) {
+        SetWindowTextW(width, L"640");
+        std::array<wchar_t, 16> centered_x{};
+        GetWindowTextW(
+            x,
+            centered_x.data(),
+            static_cast<int>(centered_x.size()));
+        expect(
+            std::wstring_view(centered_x.data()) == L"-480",
+            L"center anchoring immediately exposes the resolved X coordinate");
+        SetWindowTextW(width, L"320");
+    }
+
+    if (x && y) {
+        SetFocus(x);
+        SendMessageW(x, WM_KEYDOWN, VK_TAB, 0);
+        expect(
+            GetFocus() == y,
+            L"Tab reaches every geometry field without a mouse");
+        SetWindowTextW(x, L"left");
     }
     SendMessageW(prompt, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
     expect(
         IsWindow(prompt) && !completed &&
             error && GetWindowTextLengthW(error) > 0,
-        L"invalid dimensions keep the prompt open and do not commit a selection change");
+        L"invalid signed coordinates keep the prompt open without side effects");
 
+    if (x) {
+        SetWindowTextW(x, L"-800");
+    }
+    if (y) {
+        SetWindowTextW(y, L"-100");
+    }
+    if (aspect) {
+        SendMessageW(aspect, BM_CLICK, 0, 0);
+    }
     if (width) {
         SetWindowTextW(width, L"640");
     }
+    std::array<wchar_t, 16> linked_height{};
     if (height) {
-        SetWindowTextW(height, L"480");
+        GetWindowTextW(
+            height,
+            linked_height.data(),
+            static_cast<int>(linked_height.size()));
     }
+    expect(
+        std::wstring_view(linked_height.data()) == L"360",
+        L"locked aspect ratio updates height from width immediately");
+    if (height) {
+        SetWindowTextW(height, L"540");
+    }
+    std::array<wchar_t, 16> linked_width{};
+    if (width) {
+        GetWindowTextW(
+            width,
+            linked_width.data(),
+            static_cast<int>(linked_width.size()));
+    }
+    expect(
+        std::wstring_view(linked_width.data()) == L"960",
+        L"locked aspect ratio updates width from height immediately");
     if (center) {
         SendMessageW(center, BM_SETCHECK, BST_UNCHECKED, 0);
     }
+    if (rounded && corner_radius) {
+        SendMessageW(rounded, BM_CLICK, 0, 0);
+        SetWindowTextW(corner_radius, L"24");
+    }
     SendMessageW(prompt, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
     expect(
-        completed && result && result->width == 640 &&
-            result->height == 480 &&
+        completed && result && result->x == -800 && result->y == -100 &&
+            result->width == 960 && result->height == 540 &&
             result->anchor ==
                 airshot::SelectionSizeAnchor::top_left &&
+            result->aspect_ratio_locked && result->corner_radius == 24 &&
             !IsWindow(prompt),
-        L"valid dimensions commit once with the selected top-left anchor");
+        L"valid negative coordinates and linked dimensions commit once");
     if (IsWindow(prompt)) {
         DestroyWindow(prompt);
     }
@@ -855,10 +963,11 @@ void test_selection_size_prompt_validates_without_side_effects() {
         airshot::overlay_detail::show_selection_size_prompt(
             nullptr,
             POINT{20, 20},
-            100,
-            100,
-            1920,
-            1080,
+            {0, 0, 100, 100},
+            {-1920, -200, 1920, 1080},
+            airshot::SelectionSizeAnchor::top_left,
+            true,
+            0,
             false,
             [&](std::optional<
                     airshot::overlay_detail::SelectionSizeInput> input) {
@@ -869,6 +978,10 @@ void test_selection_size_prompt_validates_without_side_effects() {
         cancel_prompt != nullptr,
         L"selection size prompt is created for cancellation testing");
     if (cancel_prompt) {
+        expect(
+            SendMessageW(GetDlgItem(cancel_prompt, 203), BM_GETCHECK, 0, 0) ==
+                BST_UNCHECKED,
+            L"selection size prompt remembers the previous anchor mode");
         SendMessageW(
             cancel_prompt,
             WM_COMMAND,
@@ -1018,6 +1131,8 @@ void test_atomic_png_output() {
 
 int wmain() {
     test_bitmap_invariants();
+    test_rounded_corner_alpha_mask();
+    test_alpha_compositing_for_legacy_outputs();
     test_blit_and_holes();
     test_linear_blur();
     test_ordered_annotation_rendering();

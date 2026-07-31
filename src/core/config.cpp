@@ -910,6 +910,8 @@ bool validate_current_config(const JsonNode& root, std::wstring* error) {
                 *capture, L"capture", L"defaultOutput", JsonKind::string, error) ||
             !validate_optional_kind(
                 *capture, L"capture", L"includeCursor", JsonKind::boolean, error) ||
+            !validate_optional_integer(
+                *capture, L"capture", L"cornerRadius", error) ||
             !validate_optional_kind(*capture, L"capture", L"customColor", JsonKind::string, error) ||
             !validate_optional_kind(*capture, L"capture", L"theme", JsonKind::string, error)) {
             return false;
@@ -1672,6 +1674,22 @@ std::optional<Hotkey> parse_hotkey(std::wstring_view value) {
     return hotkey;
 }
 
+std::optional<std::wstring_view> capture_editor_reserved_shortcut(
+    const Hotkey& hotkey) {
+    constexpr UINT comparable_modifiers =
+        MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN;
+    for (const auto shortcut : capture_editor_shortcuts::reserved) {
+        const auto reserved = parse_hotkey(shortcut);
+        if (reserved &&
+            reserved->virtual_key == hotkey.virtual_key &&
+            (reserved->modifiers & comparable_modifiers) ==
+                (hotkey.modifiers & comparable_modifiers)) {
+            return shortcut;
+        }
+    }
+    return std::nullopt;
+}
+
 namespace {
 
 constexpr UINT kGlobalHotkeyModifiers = MOD_CONTROL | MOD_ALT | MOD_WIN;
@@ -1979,6 +1997,8 @@ std::wstring known_config_to_json(const AppConfig& config) {
     result += L",\"capture\":{\"defaultOutput\":" + quote_json(config.default_output);
     result += L",\"includeCursor\":" +
               std::wstring(json_boolean(config.capture_cursor));
+    result += L",\"cornerRadius\":" +
+              std::to_wstring(std::clamp(config.capture_corner_radius, 0, 512));
     result += L",\"lastRegion\":";
     if (config.last_region_capture) {
         const RectI bounds = config.last_region_capture->bounds;
@@ -2137,6 +2157,8 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text, std::wstr
         config.default_output = named_string(*capture, L"defaultOutput", L"clipboard");
         config.capture_cursor =
             named_boolean(*capture, L"includeCursor", false);
+        config.capture_corner_radius =
+            named_clamped_integer(*capture, L"cornerRadius", 0, 0, 512);
         if (config.schema_version <= kCurrentConfigSchemaVersion) {
             if (const auto* last_region = member(*capture, L"lastRegion");
                 last_region && last_region->kind != JsonKind::null_value) {

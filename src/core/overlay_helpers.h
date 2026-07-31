@@ -51,9 +51,13 @@ using TextPromptCompletion = std::function<void(std::optional<std::wstring>)>;
 [[nodiscard]] std::optional<std::wstring> prompt_text(HWND owner, POINT position, COLORREF color, float text_size, bool is_light_theme);
 
 struct SelectionSizeInput {
+    int x{};
+    int y{};
     int width{};
     int height{};
     SelectionSizeAnchor anchor{SelectionSizeAnchor::center};
+    bool aspect_ratio_locked{};
+    int corner_radius{};
 };
 
 using SelectionSizeCompletion =
@@ -62,10 +66,11 @@ using SelectionSizeCompletion =
 [[nodiscard]] HWND show_selection_size_prompt(
     HWND owner,
     POINT position,
-    int current_width,
-    int current_height,
-    int maximum_width,
-    int maximum_height,
+    RectI current_selection,
+    RectI desktop_bounds,
+    SelectionSizeAnchor current_anchor,
+    bool aspect_ratio_locked,
+    int current_corner_radius,
     bool is_light_theme,
     SelectionSizeCompletion completion);
 
@@ -77,11 +82,101 @@ struct ScrollControlState {
     int hover_button{};
     int pressed_button{};
     int blink_counter{};
+    enum class MatchQuality {
+        waiting,
+        success,
+        low_confidence,
+        failed,
+    };
+    struct Progress {
+        int capture_width{};
+        int stitched_height{};
+        int stitched_frames{};
+        MatchQuality match_quality{MatchQuality::waiting};
+    } progress;
     std::function<void()> on_tick;
     std::function<void()> on_toggle_pause;
     std::function<void()> on_finish;
     std::function<void()> on_cancel;
 };
+
+using ScrollMatchQuality = ScrollControlState::MatchQuality;
+
+enum class ScrollMatchOutcome {
+    success,
+    unchanged,
+    mismatch,
+    hard_failure,
+};
+
+struct ScrollMatchFeedback {
+    ScrollMatchQuality quality{ScrollMatchQuality::waiting};
+    int consecutive_failures{};
+    bool safe_pause{};
+};
+
+inline constexpr int kScrollMatchFailurePauseThreshold = 4;
+
+// Converts capture outcomes into one product-level feedback policy. Transient
+// mismatches are reported as low confidence; the fourth consecutive mismatch
+// becomes a safe pause. A successful/unchanged frame resets the streak.
+[[nodiscard]] constexpr ScrollMatchFeedback advance_scroll_match_feedback(
+    int consecutive_failures,
+    ScrollMatchOutcome outcome) noexcept {
+    const int normalized_failures =
+        consecutive_failures > 0 ? consecutive_failures : 0;
+    switch (outcome) {
+        case ScrollMatchOutcome::success:
+            return {ScrollMatchQuality::success, 0, false};
+        case ScrollMatchOutcome::unchanged:
+            return {ScrollMatchQuality::waiting, 0, false};
+        case ScrollMatchOutcome::mismatch: {
+            const int next_failures =
+                normalized_failures >= kScrollMatchFailurePauseThreshold
+                    ? kScrollMatchFailurePauseThreshold
+                    : normalized_failures + 1;
+            return {
+                next_failures >= kScrollMatchFailurePauseThreshold
+                    ? ScrollMatchQuality::failed
+                    : ScrollMatchQuality::low_confidence,
+                next_failures,
+                next_failures >= kScrollMatchFailurePauseThreshold};
+        }
+        case ScrollMatchOutcome::hard_failure:
+            return {
+                ScrollMatchQuality::failed,
+                normalized_failures,
+                true};
+    }
+    return {ScrollMatchQuality::failed, normalized_failures, true};
+}
+
+[[nodiscard]] constexpr bool scroll_capture_bounds_match(
+    const RectI& expected,
+    const RectI& current) noexcept {
+    return expected.left == current.left &&
+           expected.top == current.top &&
+           expected.right == current.right &&
+           expected.bottom == current.bottom &&
+           expected.right > expected.left &&
+           expected.bottom > expected.top;
+}
+
+[[nodiscard]] constexpr bool scroll_target_frame_is_stable(
+    bool identity_matches,
+    const RectI& expected,
+    const RectI& before_capture,
+    const RectI& after_capture) noexcept {
+    return identity_matches &&
+           scroll_capture_bounds_match(expected, before_capture) &&
+           scroll_capture_bounds_match(expected, after_capture);
+}
+
+[[nodiscard]] constexpr bool scroll_frame_commit_allowed(
+    bool stop_requested,
+    bool target_stable) noexcept {
+    return !stop_requested && target_stable;
+}
 
 inline constexpr UINT_PTR kScrollBlinkTimer = 1;
 inline constexpr UINT_PTR kScrollCaptureTimer = 2;
@@ -176,6 +271,7 @@ public:
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] int width() const noexcept;
     [[nodiscard]] int height() const noexcept;
+    [[nodiscard]] int frame_count() const noexcept;
     [[nodiscard]] int direction() const noexcept;
 
     [[nodiscard]] StitchStatus append(const Bitmap& new_frame, int offset);

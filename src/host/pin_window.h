@@ -72,6 +72,11 @@ private:
     [[nodiscard]] bool resize_to_scale(double scale, POINT anchor_screen) noexcept;
     void fit_to_work_area();
     [[nodiscard]] bool rebuild_native_bitmap();
+    [[nodiscard]] bool refresh_window_presentation() noexcept;
+    [[nodiscard]] bool update_window_presentation(
+        int alpha,
+        bool click_through,
+        bool source_has_transparency) noexcept;
     [[nodiscard]] bool replace_bitmap(Bitmap bitmap);
     [[nodiscard]] std::optional<SIZE> scaled_size(double scale) const noexcept;
 
@@ -82,6 +87,8 @@ private:
     double scale_{1.0};
     int alpha_{255};
     bool smooth_scaling_{true};
+    bool source_has_transparency_{};
+    bool per_pixel_presentation_active_{};
     PinVisualEffects visual_effects_{};
     bool topmost_{true};
     bool click_through_available_{true};

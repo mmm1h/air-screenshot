@@ -1435,7 +1435,8 @@ std::optional<std::wstring> HostApp::sync_region_config(const RegionResult& resu
         config_.annotation_locked_tool != next.annotation_locked_tool ||
         config_.annotation_hidden_tools != next.annotation_hidden_tools ||
         config_.annotation_highlight_alpha != next.annotation_highlight_alpha ||
-        config_.annotation_tool_styles != next.annotation_tool_styles;
+        config_.annotation_tool_styles != next.annotation_tool_styles ||
+        config_.capture_corner_radius != next.capture_corner_radius;
     std::optional<LastRegionCapture> last_region =
         config_.last_region_capture;
     if (result.code == ExitCode::success &&
@@ -1469,6 +1470,7 @@ std::optional<std::wstring> HostApp::sync_region_config(const RegionResult& resu
     updated.annotation_hidden_tools = next.annotation_hidden_tools;
     updated.annotation_highlight_alpha = next.annotation_highlight_alpha;
     updated.annotation_tool_styles = next.annotation_tool_styles;
+    updated.capture_corner_radius = next.capture_corner_radius;
     updated.last_region_capture = std::move(last_region);
 
     std::wstring error;

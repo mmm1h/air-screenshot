@@ -648,6 +648,12 @@ int wmain() {
     for (std::size_t index = 0; index < source.pixels.size(); ++index) {
         source.pixels[index] = 255;
     }
+    // Ensure the preferred PNG/CF_DIBV5 round trip keeps straight alpha;
+    // legacy CF_DIB/CF_BITMAP remain separately checked for availability.
+    source.pixels[0] = 0x21;
+    source.pixels[1] = 0x43;
+    source.pixels[2] = 0x65;
+    source.pixels[3] = 0x80;
 
     std::wstring copy_error;
     std::atomic_uint sta_callbacks{};
@@ -1067,10 +1073,10 @@ int wmain() {
             dib_visual->bitmap.height != 2 ||
             dib_visual->bitmap.pixels.size() < 4 ||
             (dib_format == CF_DIBV5 &&
-             (dib_visual->bitmap.pixels[0] != 149 ||
-              dib_visual->bitmap.pixels[1] != 175 ||
-              dib_visual->bitmap.pixels[2] != 200 ||
-              dib_visual->bitmap.pixels[3] != 0xFF)) ||
+             (dib_visual->bitmap.pixels[0] != 0x33 ||
+              dib_visual->bitmap.pixels[1] != 0x66 ||
+              dib_visual->bitmap.pixels[2] != 0x99 ||
+              dib_visual->bitmap.pixels[3] != 0x80)) ||
             (dib_format == CF_DIB &&
              (dib_visual->bitmap.pixels[0] != 0x10 ||
               dib_visual->bitmap.pixels[1] != 0x70 ||

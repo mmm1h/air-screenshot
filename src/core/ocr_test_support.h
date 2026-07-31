@@ -102,4 +102,8 @@ parse_warm_worker_response(
     bool directory,
     std::wstring* error = nullptr);
 
+[[nodiscard]] OcrDependencyStatus classify_preparation_failure(
+    std::wstring error,
+    bool cancelled = false);
+
 }  // namespace airshot::ocr_test_support

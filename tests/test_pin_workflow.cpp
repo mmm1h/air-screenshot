@@ -194,6 +194,92 @@ void test_visual_effects_and_scale_policy() {
         source.pixels == original_pixels,
         "rendering display effects never mutates the current source bitmap");
 
+    Bitmap fully_transparent(2, 1);
+    fully_transparent.pixels = {
+        10, 20, 30, 0,
+        40, 50, 60, 0,
+    };
+    const Bitmap preserved_transparency =
+        render_pin_visual_bitmap(fully_transparent, {});
+    expect(
+        preserved_transparency.valid() &&
+            preserved_transparency.pixels == fully_transparent.pixels &&
+            summarize_pin_bitmap_alpha(fully_transparent) ==
+                PinBitmapAlphaSummary{true, true},
+        "PinWindow treats normalized all-zero alpha as intentional transparency");
+
+    Bitmap opaque(2, 1);
+    opaque.pixels = {
+        10, 20, 30, 255,
+        40, 50, 60, 255,
+    };
+    expect(
+        summarize_pin_bitmap_alpha(opaque) ==
+            PinBitmapAlphaSummary{true, false} &&
+            summarize_pin_bitmap_alpha(Bitmap{}) ==
+                PinBitmapAlphaSummary{},
+        "alpha summary separates opaque, transparent, and invalid sources");
+
+    const Bitmap premultiplied = render_pin_layered_bitmap(
+        source,
+        {},
+        source.width,
+        source.height,
+        false);
+    expect(
+        premultiplied.valid() &&
+            premultiplied.pixels == std::vector<std::uint8_t>({
+                10, 20, 30, 255,
+                100, 50, 0, 128,
+            }),
+        "layered presentation produces exact premultiplied BGRA pixels");
+    const Bitmap nearest_scaled = render_pin_layered_bitmap(
+        source,
+        {},
+        4,
+        1,
+        false);
+    expect(
+        nearest_scaled.valid() &&
+            nearest_scaled.pixels[3] == 255 &&
+            nearest_scaled.pixels[7] == 255 &&
+            nearest_scaled.pixels[11] == 128 &&
+            nearest_scaled.pixels[15] == 128,
+        "nearest layered scaling refreshes alpha at the actual window size");
+    const Bitmap smooth_scaled = render_pin_layered_bitmap(
+        source,
+        {},
+        3,
+        1,
+        true);
+    expect(
+        smooth_scaled.valid() &&
+            smooth_scaled.pixels[3] == 255 &&
+            smooth_scaled.pixels[7] == 192 &&
+            smooth_scaled.pixels[11] == 128 &&
+            smooth_scaled.pixels[4] <= smooth_scaled.pixels[7] &&
+            smooth_scaled.pixels[5] <= smooth_scaled.pixels[7] &&
+            smooth_scaled.pixels[6] <= smooth_scaled.pixels[7],
+        "smooth layered scaling interpolates premultiplied color and alpha");
+
+    expect(
+        plan_pin_window_style(false, 255, false) ==
+                PinWindowStylePlan{false, false} &&
+            plan_pin_window_style(false, 128, false) ==
+                PinWindowStylePlan{true, false} &&
+            plan_pin_window_style(false, 255, true) ==
+                PinWindowStylePlan{true, false} &&
+            plan_pin_window_style(true, 255, false) ==
+                PinWindowStylePlan{true, true} &&
+            plan_pin_window_style(true, 128, true) ==
+                PinWindowStylePlan{true, true},
+        "style matrix reserves per-pixel layering for transparent sources");
+    expect(
+        !pin_window_needs_layered_style(255, false) &&
+            pin_window_needs_layered_style(254, false) &&
+            pin_window_needs_layered_style(255, true),
+        "an opaque interactive pin starts on the reliable non-layered paint path");
+
     PinVisualEffects effects;
     effects = transition_pin_visual_effects(
         effects,

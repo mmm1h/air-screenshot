@@ -94,10 +94,88 @@ struct OcrManifestSignature {
     std::array<std::uint8_t, 64> value{};
 };
 
+// Stable product-facing states for dependency preparation. UI code should use
+// these values instead of parsing localized status/error strings.
+enum class OcrDependencyState : std::uint8_t {
+    checking,
+    ready,
+    download_required,
+    offline,
+    downloading_manifest,
+    verifying_manifest,
+    downloading_files,
+    installing,
+    verifying_installation,
+    cancelled,
+    retryable_error,
+    repair_required,
+    unavailable,
+};
+
+enum class OcrRecoveryAction : std::uint8_t {
+    none,
+    download,
+    retry,
+    go_online,
+    repair,
+    check_system_time,
+    configure_build,
+    contact_support,
+};
+
 struct OcrDependencyStatus {
     bool ready{};
     bool can_download{};
     std::wstring message;
+    OcrDependencyState state{OcrDependencyState::unavailable};
+    OcrRecoveryAction recommended_action{OcrRecoveryAction::none};
+    bool usable_offline{};
+    bool requires_network{};
+    bool retryable{};
+    bool security_blocked{};
+    std::wstring detail;
+};
+
+struct OcrPreparationProgress {
+    OcrDependencyState state{OcrDependencyState::checking};
+    // Monotonic for one prepare call. Payload byte/file counters become known
+    // after the signed manifest has been accepted.
+    int percent{};
+    std::size_t completed_files{};
+    std::size_t total_files{};
+    std::uint64_t downloaded_bytes{};
+    std::uint64_t total_bytes{};
+    bool cancellable{true};
+    std::wstring message;
+};
+
+using OcrPreparationProgressCallback =
+    std::function<void(const OcrPreparationProgress&)>;
+
+struct OcrPreparationOptions {
+    std::wstring engine;
+    std::wstring manifest_url;
+    // Set false when the caller knows it is offline. An already verified local
+    // installation remains usable; missing dependencies fail without network
+    // I/O and return go_online as the recommended action.
+    bool allow_network{true};
+};
+
+struct OcrPreparationResult {
+    OcrDependencyStatus status;
+    bool used_existing{};
+    bool cancelled{};
+};
+
+struct OcrRepairResult {
+    // ok means the repair operation itself completed without a filesystem or
+    // cancellation error. The resulting availability is always represented by
+    // status because a packaged read-only component may still need support.
+    bool ok{};
+    bool changed{};
+    std::filesystem::path preserved_path;
+    OcrDependencyStatus status;
+    std::wstring error;
 };
 
 class OcrDependencyLease {
@@ -157,7 +235,29 @@ private:
     std::span<const std::uint8_t> signature,
     std::span<const std::uint8_t> public_key_xy,
     std::wstring* error = nullptr);
+// Lightweight display status. Call prepare_ocr_dependencies before recognition
+// when a security-authoritative, full-hash readiness decision is required.
 [[nodiscard]] OcrDependencyStatus ocr_dependency_status(std::wstring_view engine);
+// Idempotent first-use preparation entry point. It reuses a verified local
+// package when available and otherwise performs the existing signed-manifest,
+// anti-rollback, per-file SHA256, staged-install and post-install verification
+// pipeline. Retry by calling this function again with the same options.
+[[nodiscard]] OcrPreparationResult prepare_ocr_dependencies(
+    const OcrPreparationOptions& options,
+    const OcrPreparationProgressCallback& progress_callback = {},
+    std::stop_token stop_token = {});
+[[nodiscard]] OcrPreparationResult prepare_ocr_dependencies(
+    const AppConfig& config,
+    bool allow_network,
+    const OcrPreparationProgressCallback& progress_callback = {},
+    std::stop_token stop_token = {});
+// Explicit repair action for a failed local installation. Invalid user-local
+// data is moved into a private quarantine directory and preserved for
+// diagnostics; it is never silently deleted and packaged read-only data is
+// never modified.
+[[nodiscard]] OcrRepairResult repair_ocr_dependencies(
+    std::wstring_view engine,
+    std::stop_token stop_token = {});
 bool download_ocr_dependencies(
     std::wstring_view manifest_url,
     const std::function<void(int)>& progress_callback,

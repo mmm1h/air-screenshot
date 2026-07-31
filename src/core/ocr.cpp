@@ -1560,6 +1560,7 @@ bool download_file_attempt(
     std::uint64_t maximum_size,
     ULONGLONG operation_deadline,
     std::stop_token stop_token,
+    const std::function<void(std::uint64_t)>& progress_callback,
     bool* retryable_timeout,
     std::wstring* error) {
     if (retryable_timeout) {
@@ -1893,6 +1894,14 @@ bool download_file_attempt(
                 windows_error_message(GetLastError()));
         }
         total_bytes += bytes_read;
+        if (progress_callback) {
+            try {
+                progress_callback(total_bytes);
+            } catch (...) {
+                // Progress is advisory. A UI callback must never weaken or
+                // abort the signed dependency transaction.
+            }
+        }
     }
 
     if (total_bytes == 0 || !FlushFileBuffers(output_file.get())) {
@@ -1920,6 +1929,7 @@ bool download_file(
     std::uint64_t maximum_size,
     ULONGLONG operation_deadline,
     std::stop_token stop_token,
+    const std::function<void(std::uint64_t)>& progress_callback,
     std::wstring* error) {
     const ULONGLONG file_deadline =
         std::min(
@@ -1946,6 +1956,12 @@ bool download_file(
 
         bool retryable_timeout = false;
         std::wstring attempt_error;
+        if (progress_callback) {
+            try {
+                progress_callback(0);
+            } catch (...) {
+            }
+        }
         if (download_file_attempt(
                 context,
                 url,
@@ -1953,6 +1969,7 @@ bool download_file(
                 maximum_size,
                 file_deadline,
                 stop_token,
+                progress_callback,
                 &retryable_timeout,
                 &attempt_error)) {
             return true;
@@ -2641,12 +2658,14 @@ verify_and_lock_installed_dependency(
 bool verify_installed_manifest(
     const std::filesystem::path& root,
     bool verify_hashes,
-    std::wstring* error) {
+    std::wstring* error,
+    std::stop_token stop_token = {}) {
     return acquire_ocr_dependency_lease(
                root,
                verify_hashes,
                false,
-               error)
+               error,
+               stop_token)
         .has_value();
 }
 
@@ -2654,7 +2673,8 @@ bool dependency_directory_ready(
     const std::filesystem::path& root,
     const OcrEngineSpec& spec,
     std::wstring* missing_file = nullptr,
-    bool verify_hashes = false) {
+    bool verify_hashes = false,
+    std::stop_token stop_token = {}) {
     if (!is_directory_without_reparse(root)) {
         return false;
     }
@@ -2670,7 +2690,11 @@ bool dependency_directory_ready(
     }
 
     std::wstring verification_error;
-    if (!verify_installed_manifest(root, verify_hashes, &verification_error)) {
+    if (!verify_installed_manifest(
+            root,
+            verify_hashes,
+            &verification_error,
+            stop_token)) {
         if (missing_file) {
             *missing_file =
                 verification_error.empty() ? L"签名或哈希校验失败" : verification_error;
@@ -5586,49 +5610,198 @@ int run_ocr_manifest_verifier(
     return static_cast<int>(ExitCode::success);
 }
 
-OcrDependencyStatus ocr_dependency_status(std::wstring_view engine) {
+static OcrDependencyStatus inspect_ocr_dependency_status(
+    std::wstring_view engine,
+    bool verify_hashes,
+    std::stop_token stop_token = {}) {
     const auto& spec = ocr_engine_spec(engine);
+    const auto repairable_root = rapid_ocr_dependency_directory();
     std::wstring first_problem;
     bool saw_partial_directory = false;
+    bool first_problem_is_repairable = false;
     for (const auto& root : ocr_dependency_roots()) {
         std::wstring problem;
-        if (dependency_directory_ready(root, spec, &problem)) {
-            return {
-                true,
-                false,
-                L"状态: " + std::wstring(spec.label) + L" 就绪",
-            };
+        if (dependency_directory_ready(
+                root,
+                spec,
+                &problem,
+                verify_hashes,
+                stop_token)) {
+            OcrDependencyStatus status;
+            status.ready = true;
+            status.message =
+                L"状态: " + std::wstring(spec.label) + L" 就绪（可离线使用）";
+            status.state = OcrDependencyState::ready;
+            status.usable_offline = true;
+            return status;
         }
         if (!saw_partial_directory &&
             GetFileAttributesW(root.c_str()) != INVALID_FILE_ATTRIBUTES) {
             saw_partial_directory = true;
             first_problem = problem;
+            first_problem_is_repairable = root == repairable_root;
         }
     }
     if (saw_partial_directory) {
-        return {
-            false,
-            false,
-            L"状态: 现有 OCR 依赖不可信，需先人工移除：" +
-                (first_problem.empty()
-                     ? std::wstring(L"安全校验失败")
-                     : first_problem),
-        };
+        OcrDependencyStatus status;
+        if (first_problem_is_repairable) {
+            status.message =
+                L"状态: OCR 组件安全校验未通过；修复后可重新准备。";
+            status.state = OcrDependencyState::repair_required;
+            status.recommended_action = OcrRecoveryAction::repair;
+            status.retryable = true;
+        } else {
+            status.message =
+                L"状态: 随程序发布的 OCR 组件未通过安全校验，已停止使用。";
+            status.state = OcrDependencyState::unavailable;
+            status.recommended_action = OcrRecoveryAction::contact_support;
+        }
+        status.security_blocked = true;
+        status.detail = first_problem.empty()
+                            ? std::wstring(L"安全校验失败")
+                            : std::move(first_problem);
+        return status;
     }
     if (configured_manifest_key_id().empty() ||
         !configured_manifest_public_key()) {
-        return {
-            false,
-            false,
-            L"状态: 此构建未配置 OCR 清单公钥",
-        };
+        OcrDependencyStatus status;
+        status.message = L"状态: 此版本未配置 OCR 组件签名公钥，无法安全准备。";
+        status.state = OcrDependencyState::unavailable;
+        status.recommended_action = OcrRecoveryAction::configure_build;
+        status.security_blocked = true;
+        status.detail = L"此构建未配置 OCR 清单公钥。";
+        return status;
     }
-    return {false, true, L"状态: 未下载 RapidOCR ONNX 依赖"};
+    OcrDependencyStatus status;
+    status.can_download = true;
+    status.message = L"状态: OCR 组件尚未准备，首次使用时可自动下载。";
+    status.state = OcrDependencyState::download_required;
+    status.recommended_action = OcrRecoveryAction::download;
+    status.requires_network = true;
+    status.retryable = true;
+    return status;
 }
 
-bool download_ocr_dependencies(
+OcrDependencyStatus ocr_dependency_status(std::wstring_view engine) {
+    return inspect_ocr_dependency_status(engine, false, {});
+}
+
+static void publish_ocr_preparation_progress(
+    const OcrPreparationProgressCallback& callback,
+    OcrPreparationProgress progress) noexcept {
+    if (!callback) {
+        return;
+    }
+    progress.percent = std::clamp(progress.percent, 0, 100);
+    try {
+        callback(progress);
+    } catch (...) {
+        // Observers are advisory and cannot interrupt or weaken verification.
+    }
+}
+
+static bool preparation_error_contains(
+    std::wstring_view error,
+    std::wstring_view value) noexcept {
+    return error.find(value) != std::wstring_view::npos;
+}
+
+static OcrDependencyStatus failed_preparation_status(
+    std::wstring error,
+    bool cancelled) {
+    OcrDependencyStatus status;
+    status.detail = error;
+    if (cancelled) {
+        status.message = L"OCR 组件准备已取消；未完成内容已清理，可随时重试。";
+        status.state = OcrDependencyState::cancelled;
+        status.recommended_action = OcrRecoveryAction::retry;
+        status.retryable = true;
+        return status;
+    }
+
+    if (preparation_error_contains(error, L"公钥")) {
+        status.message = L"此版本无法验证 OCR 组件，已停止准备。";
+        status.state = OcrDependencyState::unavailable;
+        status.recommended_action = OcrRecoveryAction::configure_build;
+        status.security_blocked = true;
+        return status;
+    }
+    if (preparation_error_contains(error, L"现有 OCR 依赖") ||
+        preparation_error_contains(error, L"已安装") ||
+        preparation_error_contains(error, L"完成移动后复验") ||
+        preparation_error_contains(error, L"安装后状态复核失败")) {
+        status.message = L"现有 OCR 组件未通过安全校验，需要修复后重试。";
+        status.state = OcrDependencyState::repair_required;
+        status.recommended_action = OcrRecoveryAction::repair;
+        status.retryable = true;
+        status.security_blocked = true;
+        return status;
+    }
+    if (preparation_error_contains(error, L"系统时间无效") ||
+        preparation_error_contains(error, L"签发时间晚于")) {
+        status.message = L"系统时间无法通过 OCR 组件安全校验；校准时间后重试。";
+        status.state = OcrDependencyState::unavailable;
+        status.recommended_action = OcrRecoveryAction::check_system_time;
+        status.retryable = true;
+        status.security_blocked = true;
+        return status;
+    }
+    if (preparation_error_contains(error, L"清单地址必须") ||
+        preparation_error_contains(error, L"下载地址必须") ||
+        preparation_error_contains(error, L"重定向目标") ||
+        preparation_error_contains(error, L"下载安全策略") ||
+        preparation_error_contains(error, L"响应大小超出允许范围") ||
+        preparation_error_contains(error, L"清单路径无法安全创建") ||
+        preparation_error_contains(error, L"下载目标不是常规文件") ||
+        preparation_error_contains(error, L"清单不是有效") ||
+        preparation_error_contains(error, L"清单格式无效") ||
+        preparation_error_contains(error, L"清单已过期") ||
+        preparation_error_contains(error, L"keyId") ||
+        preparation_error_contains(error, L"序列")) {
+        status.message = L"OCR 组件来源或安全策略校验失败，已拒绝安装。";
+        status.state = OcrDependencyState::unavailable;
+        status.recommended_action = OcrRecoveryAction::contact_support;
+        status.security_blocked = true;
+        return status;
+    }
+    if (preparation_error_contains(error, L"下载 OCR 依赖清单或签名失败") ||
+        preparation_error_contains(error, L"下载请求") ||
+        preparation_error_contains(error, L"下载服务器") ||
+        preparation_error_contains(error, L"下载响应") ||
+        preparation_error_contains(error, L"WinHTTP") ||
+        preparation_error_contains(error, L"连接 OCR") ||
+        preparation_error_contains(error, L"时间预算")) {
+        status.message = L"OCR 组件下载未完成；检查网络后可直接重试。";
+        status.state = OcrDependencyState::retryable_error;
+        status.recommended_action = OcrRecoveryAction::retry;
+        status.requires_network = true;
+        status.retryable = true;
+        return status;
+    }
+    if (preparation_error_contains(error, L"签名") ||
+        preparation_error_contains(error, L"SHA256") ||
+        preparation_error_contains(error, L"哈希") ||
+        preparation_error_contains(error, L"回滚") ||
+        preparation_error_contains(error, L"reparse") ||
+        preparation_error_contains(error, L"清单内容不同")) {
+        status.message = L"下载的 OCR 组件未通过安全校验，已拒绝安装。";
+        status.state = OcrDependencyState::unavailable;
+        status.recommended_action = OcrRecoveryAction::contact_support;
+        status.security_blocked = true;
+        return status;
+    }
+
+    status.message = L"OCR 组件准备失败，可直接重试；原有可用版本未被替换。";
+    status.state = OcrDependencyState::retryable_error;
+    status.recommended_action = OcrRecoveryAction::retry;
+    status.retryable = true;
+    return status;
+}
+
+static bool download_ocr_dependencies_impl(
     std::wstring_view manifest_url,
     const std::function<void(int)>& progress_callback,
+    const OcrPreparationProgressCallback& detailed_progress_callback,
     std::wstring* error,
     std::stop_token stop_token) try {
     stop_warm_ocr_worker();
@@ -5640,6 +5813,18 @@ bool download_ocr_dependencies(
         }
         return false;
     }
+
+    const auto publish_legacy_progress =
+        [&progress_callback](int progress) noexcept {
+            if (!progress_callback) {
+                return;
+            }
+            try {
+                progress_callback(std::clamp(progress, 0, 100));
+            } catch (...) {
+                // Keep the transaction independent from presentation code.
+            }
+        };
     if (stop_token.stop_requested()) {
         if (error) {
             *error = L"OCR 依赖下载已取消。";
@@ -5657,7 +5842,8 @@ bool download_ocr_dependencies(
     auto install_mutex =
         acquire_named_mutex(
             kInstallMutexName,
-            error);
+            error,
+            stop_token);
     if (!install_mutex) {
         return false;
     }
@@ -5669,9 +5855,19 @@ bool download_ocr_dependencies(
 
     const ULONGLONG operation_deadline =
         GetTickCount64() + kDownloadOperationDeadlineMs;
-    if (progress_callback) {
-        progress_callback(0);
-    }
+    publish_legacy_progress(0);
+    publish_ocr_preparation_progress(
+        detailed_progress_callback,
+        {
+            OcrDependencyState::downloading_manifest,
+            1,
+            0,
+            0,
+            0,
+            0,
+            true,
+            L"正在获取 OCR 组件清单和签名…",
+        });
 
     const auto root = config_directory() / L"ocr";
     const auto working_directory =
@@ -5691,6 +5887,7 @@ bool download_ocr_dependencies(
             kMaxManifestBytes,
             operation_deadline,
             stop_token,
+            {},
             &download_error) ||
         !download_file(
             download_context,
@@ -5699,15 +5896,26 @@ bool download_ocr_dependencies(
             64U * 1024U,
             operation_deadline,
             stop_token,
+            {},
             &download_error)) {
         if (error) {
             *error = L"下载 OCR 依赖清单或签名失败：" + download_error;
         }
         return false;
     }
-    if (progress_callback) {
-        progress_callback(5);
-    }
+    publish_legacy_progress(5);
+    publish_ocr_preparation_progress(
+        detailed_progress_callback,
+        {
+            OcrDependencyState::verifying_manifest,
+            5,
+            0,
+            0,
+            0,
+            0,
+            true,
+            L"正在验证 OCR 组件签名与版本策略…",
+        });
 
     const auto manifest_bytes =
         read_binary_file(manifest_path, kMaxManifestBytes, error);
@@ -5760,7 +5968,8 @@ bool download_ocr_dependencies(
                 existing_root,
                 false,
                 false,
-                &existing_error);
+                &existing_error,
+                stop_token);
         if (!existing_lease) {
             if (error) {
                 *error =
@@ -5826,6 +6035,25 @@ bool download_ocr_dependencies(
         return false;
     }
 
+    std::uint64_t total_download_bytes = 0;
+    for (const auto& file : manifest.files) {
+        total_download_bytes += file.size;
+    }
+    std::uint64_t completed_download_bytes = 0;
+    int detailed_percent = 5;
+    publish_ocr_preparation_progress(
+        detailed_progress_callback,
+        {
+            OcrDependencyState::downloading_files,
+            detailed_percent,
+            0,
+            manifest.files.size(),
+            0,
+            total_download_bytes,
+            true,
+            L"正在下载 OCR 组件…",
+        });
+
     const auto staging_directory = *working_directory / L"payload";
     std::error_code filesystem_error;
     std::filesystem::create_directory(staging_directory, filesystem_error);
@@ -5867,6 +6095,37 @@ bool download_ocr_dependencies(
 
         const auto temporary =
             target.parent_path() / (target.filename().wstring() + L".download");
+        const auto file_progress =
+            [&, i](std::uint64_t current_file_bytes) {
+                const std::uint64_t bounded_file_bytes =
+                    std::min(current_file_bytes, file.size);
+                const std::uint64_t downloaded =
+                    completed_download_bytes + bounded_file_bytes;
+                const int percent = total_download_bytes == 0
+                                        ? 5
+                                        : 5 + static_cast<int>(
+                                                  (downloaded * 85) /
+                                                  total_download_bytes);
+                if (percent <= detailed_percent) {
+                    return;
+                }
+                detailed_percent = percent;
+                publish_ocr_preparation_progress(
+                    detailed_progress_callback,
+                    {
+                        OcrDependencyState::downloading_files,
+                        detailed_percent,
+                        i,
+                        manifest.files.size(),
+                        downloaded,
+                        total_download_bytes,
+                        true,
+                        std::format(
+                            L"正在下载 OCR 组件（{}/{}）…",
+                            i + 1,
+                            manifest.files.size()),
+                    });
+            };
         if (!download_file(
                 download_context,
                 file.url,
@@ -5874,6 +6133,7 @@ bool download_ocr_dependencies(
                 file.size,
                 operation_deadline,
                 stop_token,
+                file_progress,
                 error) ||
             !verify_dependency_file(file, temporary, error)) {
             return false;
@@ -5890,14 +6150,46 @@ bool download_ocr_dependencies(
             }
             return false;
         }
+        completed_download_bytes += file.size;
+        publish_ocr_preparation_progress(
+            detailed_progress_callback,
+            {
+                OcrDependencyState::downloading_files,
+                detailed_percent,
+                i + 1,
+                manifest.files.size(),
+                completed_download_bytes,
+                total_download_bytes,
+                true,
+                std::format(
+                    L"已验证 OCR 组件（{}/{}）",
+                    i + 1,
+                    manifest.files.size()),
+            });
 
-        if (progress_callback) {
-            const int progress =
-                5 + static_cast<int>(((i + 1) * 90) / manifest.files.size());
-            progress_callback(std::clamp(progress, 5, 95));
-        }
+        const int progress =
+            5 + static_cast<int>(((i + 1) * 90) / manifest.files.size());
+        publish_legacy_progress(std::clamp(progress, 5, 95));
     }
 
+    if (stop_token.stop_requested()) {
+        if (error) {
+            *error = L"OCR 依赖下载已取消。";
+        }
+        return false;
+    }
+    publish_ocr_preparation_progress(
+        detailed_progress_callback,
+        {
+            OcrDependencyState::installing,
+            92,
+            manifest.files.size(),
+            manifest.files.size(),
+            completed_download_bytes,
+            total_download_bytes,
+            true,
+            L"正在安装已验证的 OCR 组件…",
+        });
     if (stop_token.stop_requested()) {
         if (error) {
             *error = L"OCR 依赖下载已取消。";
@@ -5979,6 +6271,19 @@ bool download_ocr_dependencies(
         return false;
     }
 
+    publish_ocr_preparation_progress(
+        detailed_progress_callback,
+        {
+            OcrDependencyState::verifying_installation,
+            96,
+            manifest.files.size(),
+            manifest.files.size(),
+            completed_download_bytes,
+            total_download_bytes,
+            true,
+            L"正在复验 OCR 组件并固化安全版本…",
+        });
+
     const auto failed_directory =
         *working_directory / L"failed-installed";
     auto rollback_installed_directory =
@@ -6034,7 +6339,8 @@ bool download_ocr_dependencies(
             final_directory,
             true,
             false,
-            &final_verification_error);
+            &final_verification_error,
+            stop_token);
     if (!final_lease ||
         final_lease->sequence() !=
             manifest.sequence) {
@@ -6055,9 +6361,19 @@ bool download_ocr_dependencies(
             final_verification_error);
     }
 
-    if (progress_callback) {
-        progress_callback(100);
-    }
+    publish_legacy_progress(100);
+    publish_ocr_preparation_progress(
+        detailed_progress_callback,
+        {
+            OcrDependencyState::verifying_installation,
+            99,
+            manifest.files.size(),
+            manifest.files.size(),
+            completed_download_bytes,
+            total_download_bytes,
+            false,
+            L"安装完成，正在确认 OCR 组件可用状态…",
+        });
     return true;
 } catch (const std::bad_alloc&) {
     if (error) {
@@ -6079,6 +6395,316 @@ bool download_ocr_dependencies(
     }
     return false;
 }
+
+bool download_ocr_dependencies(
+    std::wstring_view manifest_url,
+    const std::function<void(int)>& progress_callback,
+    std::wstring* error,
+    std::stop_token stop_token) {
+    return download_ocr_dependencies_impl(
+        manifest_url,
+        progress_callback,
+        {},
+        error,
+        stop_token);
+}
+
+OcrPreparationResult prepare_ocr_dependencies(
+    const OcrPreparationOptions& options,
+    const OcrPreparationProgressCallback& progress_callback,
+    std::stop_token stop_token) {
+    const std::wstring_view engine = options.engine.empty()
+                                         ? kDefaultOcrEngine
+                                         : std::wstring_view(options.engine);
+    publish_ocr_preparation_progress(
+        progress_callback,
+        {
+            OcrDependencyState::checking,
+            0,
+            0,
+            0,
+            0,
+            0,
+            true,
+            L"正在检查本机 OCR 组件…",
+        });
+
+    auto cancelled_result = [&]() {
+        OcrPreparationResult result;
+        result.status = failed_preparation_status(
+            L"OCR 组件准备已取消。",
+            true);
+        result.cancelled = true;
+        publish_ocr_preparation_progress(
+            progress_callback,
+            {
+                OcrDependencyState::cancelled,
+                0,
+                0,
+                0,
+                0,
+                0,
+                false,
+                result.status.message,
+            });
+        return result;
+    };
+    if (stop_token.stop_requested()) {
+        return cancelled_result();
+    }
+
+    OcrDependencyStatus current = inspect_ocr_dependency_status(
+        engine,
+        true,
+        stop_token);
+    if (stop_token.stop_requested()) {
+        return cancelled_result();
+    }
+    if (current.ready) {
+        publish_ocr_preparation_progress(
+            progress_callback,
+            {
+                OcrDependencyState::ready,
+                100,
+                0,
+                0,
+                0,
+                0,
+                false,
+                current.message,
+            });
+        return {std::move(current), true, false};
+    }
+    if (current.security_blocked || !current.can_download) {
+        publish_ocr_preparation_progress(
+            progress_callback,
+            {
+                current.state,
+                0,
+                0,
+                0,
+                0,
+                0,
+                false,
+                current.message,
+            });
+        return {std::move(current), false, false};
+    }
+    if (!options.allow_network) {
+        OcrDependencyStatus offline;
+        offline.can_download = true;
+        offline.message =
+            L"当前处于离线模式，且本机尚未准备 OCR 组件；联网后重试即可。";
+        offline.state = OcrDependencyState::offline;
+        offline.recommended_action = OcrRecoveryAction::go_online;
+        offline.requires_network = true;
+        offline.retryable = true;
+        publish_ocr_preparation_progress(
+            progress_callback,
+            {
+                OcrDependencyState::offline,
+                0,
+                0,
+                0,
+                0,
+                0,
+                false,
+                offline.message,
+            });
+        return {std::move(offline), false, false};
+    }
+
+    OcrPreparationProgress last_progress;
+    int last_percent = 0;
+    const OcrPreparationProgressCallback tracked_progress =
+        [&](const OcrPreparationProgress& progress) {
+            last_percent = std::max(last_percent, progress.percent);
+            last_progress = progress;
+            publish_ocr_preparation_progress(progress_callback, progress);
+        };
+    std::wstring preparation_error;
+    const bool prepared = download_ocr_dependencies_impl(
+        options.manifest_url,
+        {},
+        tracked_progress,
+        &preparation_error,
+        stop_token);
+    if (!prepared) {
+        const bool cancelled = stop_token.stop_requested();
+        OcrDependencyStatus failed = failed_preparation_status(
+            std::move(preparation_error),
+            cancelled);
+        publish_ocr_preparation_progress(
+            progress_callback,
+            {
+                failed.state,
+                last_percent,
+                last_progress.completed_files,
+                last_progress.total_files,
+                last_progress.downloaded_bytes,
+                last_progress.total_bytes,
+                false,
+                failed.message,
+            });
+        return {std::move(failed), false, cancelled};
+    }
+
+    // Re-open and hash the installed package after the transactional installer
+    // reports success. This keeps "ready" equivalent to what recognition will
+    // accept, rather than merely trusting the download result.
+    OcrDependencyStatus installed = inspect_ocr_dependency_status(
+        engine,
+        true,
+        {});
+    if (!installed.ready) {
+        const std::wstring detail = installed.detail.empty()
+                                        ? installed.message
+                                        : installed.detail;
+        installed = failed_preparation_status(
+            L"OCR 组件安装后状态复核失败：" + detail,
+            false);
+        publish_ocr_preparation_progress(
+            progress_callback,
+            {
+                installed.state,
+                last_percent,
+                last_progress.completed_files,
+                last_progress.total_files,
+                last_progress.downloaded_bytes,
+                last_progress.total_bytes,
+                false,
+                installed.message,
+            });
+    } else {
+        publish_ocr_preparation_progress(
+            progress_callback,
+            {
+                OcrDependencyState::ready,
+                100,
+                last_progress.completed_files,
+                last_progress.total_files,
+                last_progress.downloaded_bytes,
+                last_progress.total_bytes,
+                false,
+                installed.message,
+            });
+    }
+    return {std::move(installed), false, false};
+}
+
+OcrPreparationResult prepare_ocr_dependencies(
+    const AppConfig& config,
+    bool allow_network,
+    const OcrPreparationProgressCallback& progress_callback,
+    std::stop_token stop_token) {
+    return prepare_ocr_dependencies(
+        {
+            config.ocr_engine,
+            config.ocr_download_url,
+            allow_network,
+        },
+        progress_callback,
+        stop_token);
+}
+
+OcrRepairResult repair_ocr_dependencies(
+    std::wstring_view engine,
+    std::stop_token stop_token) {
+    OcrRepairResult result;
+    if (stop_token.stop_requested()) {
+        result.error = L"OCR 组件修复已取消。";
+        result.status = failed_preparation_status(result.error, true);
+        return result;
+    }
+
+    stop_warm_ocr_worker();
+    auto install_mutex = acquire_named_mutex(
+        kInstallMutexName,
+        &result.error,
+        stop_token);
+    if (!install_mutex) {
+        result.status = failed_preparation_status(
+            result.error,
+            stop_token.stop_requested());
+        return result;
+    }
+
+    const std::filesystem::path local_root =
+        rapid_ocr_dependency_directory();
+    if (GetFileAttributesW(local_root.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        result.ok = true;
+        result.status = inspect_ocr_dependency_status(engine, true, {});
+        return result;
+    }
+
+    const auto& spec = ocr_engine_spec(engine);
+    std::wstring verification_error;
+    if (dependency_directory_ready(
+            local_root,
+            spec,
+            &verification_error,
+            true,
+            stop_token)) {
+        result.ok = true;
+        result.status = inspect_ocr_dependency_status(engine, true, {});
+        return result;
+    }
+    if (stop_token.stop_requested()) {
+        result.error = L"OCR 组件修复已取消。";
+        result.status = failed_preparation_status(result.error, true);
+        return result;
+    }
+
+    std::wstring quarantine_error;
+    const auto quarantine_directory = create_private_directory(
+        local_root.parent_path(),
+        L".quarantine-",
+        &quarantine_error);
+    if (!quarantine_directory) {
+        result.error =
+            L"无法创建 OCR 组件隔离目录：" + quarantine_error;
+        result.status = failed_preparation_status(result.error, false);
+        return result;
+    }
+    ScopedDirectoryCleanup quarantine_cleanup(*quarantine_directory);
+    if (stop_token.stop_requested()) {
+        result.error = L"OCR 组件修复已取消。";
+        result.status = failed_preparation_status(result.error, true);
+        return result;
+    }
+    const std::filesystem::path preserved_path =
+        *quarantine_directory / local_root.filename();
+    if (!MoveFileExW(
+            local_root.c_str(),
+            preserved_path.c_str(),
+            MOVEFILE_WRITE_THROUGH)) {
+        result.error =
+            L"无法隔离未通过校验的 OCR 组件：" +
+            windows_error_message(GetLastError());
+        result.status = failed_preparation_status(result.error, false);
+        return result;
+    }
+
+    quarantine_cleanup.release();
+    clear_dependency_hash_cache();
+    result.ok = true;
+    result.changed = true;
+    result.preserved_path = preserved_path;
+    result.status = inspect_ocr_dependency_status(engine, true, {});
+    result.status.detail =
+        L"未通过校验的组件已保留在：" + preserved_path.wstring();
+    return result;
+}
+
+namespace ocr_test_support {
+
+OcrDependencyStatus classify_preparation_failure(
+    std::wstring error,
+    bool cancelled) {
+    return failed_preparation_status(std::move(error), cancelled);
+}
+
+}  // namespace ocr_test_support
 
 std::wstring join_ocr_lines(std::span<const std::wstring> lines) {
     std::wstring result;
@@ -6143,9 +6769,9 @@ OcrOutput recognize_text(
             false,
             {},
             dependency_problem.empty()
-                ? L"未找到 OCR 依赖，请在设置中点击“下载依赖”。"
+                ? L"未找到 OCR 组件，请重新发起 OCR 以自动准备。"
                 : L"OCR 依赖校验失败：" + dependency_problem +
-                      L"。请在设置中重新下载依赖。",
+                      L"。请重新发起 OCR，程序会自动修复或重新准备。",
         };
     }
 

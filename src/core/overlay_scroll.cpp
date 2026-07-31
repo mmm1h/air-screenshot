@@ -778,6 +778,15 @@ int ScrollStitcher::height() const noexcept {
     return height_;
 }
 
+int ScrollStitcher::frame_count() const noexcept {
+    if (!valid_) {
+        return 0;
+    }
+    return 1 +
+           static_cast<int>(prepended_strips_.size()) +
+           static_cast<int>(appended_strips_.size());
+}
+
 int ScrollStitcher::direction() const noexcept {
     return direction_;
 }

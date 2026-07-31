@@ -3,6 +3,7 @@
 #include "airshot/bitmap.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -57,6 +58,64 @@ enum class PinSourceChange {
     return true;
 }
 
+[[nodiscard]] constexpr bool pin_window_needs_layered_style(
+    int alpha,
+    bool click_through) noexcept {
+    return click_through || alpha < 255;
+}
+
+[[nodiscard]] constexpr bool pin_bitmap_storage_is_valid(
+    const Bitmap& bitmap) noexcept;
+
+struct PinBitmapAlphaSummary {
+    bool alpha_is_defined{};
+    bool has_transparency{};
+
+    [[nodiscard]] friend constexpr bool operator==(
+        const PinBitmapAlphaSummary&,
+        const PinBitmapAlphaSummary&) noexcept = default;
+};
+
+// PinWindow receives a normalized Bitmap: capture/DIB producers must resolve
+// reserved alpha at their source boundary, while every alpha byte here is real.
+[[nodiscard]] inline PinBitmapAlphaSummary summarize_pin_bitmap_alpha(
+    const Bitmap& bitmap) noexcept {
+    if (!pin_bitmap_storage_is_valid(bitmap)) {
+        return {};
+    }
+    bool any_not_opaque = false;
+    for (std::size_t offset = 3;
+         offset < bitmap.pixels.size();
+         offset += Bitmap::bytes_per_pixel) {
+        const std::uint8_t alpha = bitmap.pixels[offset];
+        any_not_opaque = any_not_opaque || alpha != 255U;
+    }
+    return {
+        true,
+        any_not_opaque,
+    };
+}
+
+struct PinWindowStylePlan {
+    bool layered{};
+    bool per_pixel_alpha{};
+
+    [[nodiscard]] friend constexpr bool operator==(
+        const PinWindowStylePlan&,
+        const PinWindowStylePlan&) noexcept = default;
+};
+
+[[nodiscard]] constexpr PinWindowStylePlan plan_pin_window_style(
+    bool source_has_transparency,
+    int alpha,
+    bool click_through) noexcept {
+    return {
+        source_has_transparency ||
+            pin_window_needs_layered_style(alpha, click_through),
+        source_has_transparency,
+    };
+}
+
 [[nodiscard]] constexpr bool pin_bitmap_storage_is_valid(
     const Bitmap& bitmap) noexcept {
     if (bitmap.width <= 0 || bitmap.height <= 0) {
@@ -81,6 +140,8 @@ enum class PinSourceChange {
         destination.size() != source.pixels.size()) {
         return false;
     }
+    const bool has_defined_alpha =
+        summarize_pin_bitmap_alpha(source).alpha_is_defined;
     for (std::size_t offset = 0;
          offset < source.pixels.size();
          offset += Bitmap::bytes_per_pixel) {
@@ -100,9 +161,200 @@ enum class PinSourceChange {
         destination[offset] = blue;
         destination[offset + 1] = green;
         destination[offset + 2] = red;
-        destination[offset + 3] = source.pixels[offset + 3];
+        destination[offset + 3] =
+            has_defined_alpha ? source.pixels[offset + 3] : 255U;
     }
     return true;
+}
+
+struct PinPremultipliedPixel {
+    std::uint8_t blue{};
+    std::uint8_t green{};
+    std::uint8_t red{};
+    std::uint8_t alpha{};
+};
+
+[[nodiscard]] inline PinPremultipliedPixel pin_premultiplied_visual_pixel(
+    const Bitmap& source,
+    std::size_t offset,
+    PinVisualEffects effects,
+    bool alpha_is_defined) noexcept {
+    std::uint8_t blue = source.pixels[offset];
+    std::uint8_t green = source.pixels[offset + 1];
+    std::uint8_t red = source.pixels[offset + 2];
+    if (effects.grayscale) {
+        const unsigned int gray =
+            (29U * blue + 150U * green + 77U * red + 128U) >> 8U;
+        blue = green = red = static_cast<std::uint8_t>(gray);
+    }
+    if (effects.inverted) {
+        blue = static_cast<std::uint8_t>(255U - blue);
+        green = static_cast<std::uint8_t>(255U - green);
+        red = static_cast<std::uint8_t>(255U - red);
+    }
+    const std::uint8_t alpha =
+        alpha_is_defined ? source.pixels[offset + 3] : 255U;
+    const auto premultiply = [alpha](std::uint8_t channel) noexcept {
+        return static_cast<std::uint8_t>(
+            (static_cast<unsigned int>(channel) * alpha + 127U) / 255U);
+    };
+    return {
+        premultiply(blue),
+        premultiply(green),
+        premultiply(red),
+        alpha,
+    };
+}
+
+inline constexpr std::size_t kMaximumLayeredPinPresentationBytes =
+    256U * 1024U * 1024U;
+
+// UpdateLayeredWindow consumes premultiplied BGRA at the window's actual size.
+// This renderer keeps that platform-specific representation separate from the
+// source Bitmap, which remains straight-alpha and lossless for copy/save.
+[[nodiscard]] inline Bitmap render_pin_layered_bitmap(
+    const Bitmap& source,
+    PinVisualEffects effects,
+    int target_width,
+    int target_height,
+    bool smooth_scaling) {
+    if (!pin_bitmap_storage_is_valid(source)) {
+        return {};
+    }
+    const auto target_bytes =
+        Bitmap::checked_byte_size(target_width, target_height);
+    if (!target_bytes ||
+        *target_bytes > kMaximumLayeredPinPresentationBytes) {
+        return {};
+    }
+    Bitmap target(target_width, target_height);
+    if (!target.valid()) {
+        return {};
+    }
+
+    const bool alpha_is_defined =
+        summarize_pin_bitmap_alpha(source).alpha_is_defined;
+    const auto sample = [&](int x, int y) noexcept {
+        const std::size_t offset =
+            (static_cast<std::size_t>(y) *
+                 static_cast<std::size_t>(source.width) +
+             static_cast<std::size_t>(x)) *
+            Bitmap::bytes_per_pixel;
+        return pin_premultiplied_visual_pixel(
+            source,
+            offset,
+            effects,
+            alpha_is_defined);
+    };
+    const auto store = [&](int x,
+                           int y,
+                           PinPremultipliedPixel pixel) noexcept {
+        auto row = target.row(y);
+        const std::size_t offset =
+            static_cast<std::size_t>(x) * Bitmap::bytes_per_pixel;
+        row[offset] = pixel.blue;
+        row[offset + 1] = pixel.green;
+        row[offset + 2] = pixel.red;
+        row[offset + 3] = pixel.alpha;
+    };
+
+    if (!smooth_scaling) {
+        for (int y = 0; y < target_height; ++y) {
+            const int source_y = std::min(
+                source.height - 1,
+                static_cast<int>(
+                    ((static_cast<long long>(y) * 2LL + 1LL) *
+                     source.height) /
+                    (static_cast<long long>(target_height) * 2LL)));
+            for (int x = 0; x < target_width; ++x) {
+                const int source_x = std::min(
+                    source.width - 1,
+                    static_cast<int>(
+                        ((static_cast<long long>(x) * 2LL + 1LL) *
+                         source.width) /
+                        (static_cast<long long>(target_width) * 2LL)));
+                store(x, y, sample(source_x, source_y));
+            }
+        }
+        return target;
+    }
+
+    for (int y = 0; y < target_height; ++y) {
+        const double source_y =
+            (static_cast<double>(y) + 0.5) * source.height /
+                target_height -
+            0.5;
+        int y0 = static_cast<int>(std::floor(source_y));
+        double fy = source_y - y0;
+        if (y0 < 0) {
+            y0 = 0;
+            fy = 0.0;
+        }
+        const int y1 = std::min(source.height - 1, y0 + 1);
+        if (y0 >= source.height - 1) {
+            y0 = source.height - 1;
+            fy = 0.0;
+        }
+        for (int x = 0; x < target_width; ++x) {
+            const double source_x =
+                (static_cast<double>(x) + 0.5) * source.width /
+                    target_width -
+                0.5;
+            int x0 = static_cast<int>(std::floor(source_x));
+            double fx = source_x - x0;
+            if (x0 < 0) {
+                x0 = 0;
+                fx = 0.0;
+            }
+            const int x1 = std::min(source.width - 1, x0 + 1);
+            if (x0 >= source.width - 1) {
+                x0 = source.width - 1;
+                fx = 0.0;
+            }
+
+            const PinPremultipliedPixel top_left = sample(x0, y0);
+            const PinPremultipliedPixel top_right = sample(x1, y0);
+            const PinPremultipliedPixel bottom_left = sample(x0, y1);
+            const PinPremultipliedPixel bottom_right = sample(x1, y1);
+            const auto interpolate = [&](std::uint8_t tl,
+                                         std::uint8_t tr,
+                                         std::uint8_t bl,
+                                         std::uint8_t br) noexcept {
+                const double top = tl + (tr - tl) * fx;
+                const double bottom = bl + (br - bl) * fx;
+                return static_cast<std::uint8_t>(std::clamp(
+                    std::lround(top + (bottom - top) * fy),
+                    0L,
+                    255L));
+            };
+            store(
+                x,
+                y,
+                {
+                    interpolate(
+                        top_left.blue,
+                        top_right.blue,
+                        bottom_left.blue,
+                        bottom_right.blue),
+                    interpolate(
+                        top_left.green,
+                        top_right.green,
+                        bottom_left.green,
+                        bottom_right.green),
+                    interpolate(
+                        top_left.red,
+                        top_right.red,
+                        bottom_left.red,
+                        bottom_right.red),
+                    interpolate(
+                        top_left.alpha,
+                        top_right.alpha,
+                        bottom_left.alpha,
+                        bottom_right.alpha),
+                });
+        }
+    }
+    return target;
 }
 
 [[nodiscard]] inline Bitmap render_pin_visual_bitmap(
