@@ -83,7 +83,7 @@ function Resolve-Python311 {
     if ($launcher) {
         try {
             $version = & $launcher.Source -3.11 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"
-            if ($LASTEXITCODE -eq 0 -and $version.Trim() -eq "3.11.15") {
+            if ($LASTEXITCODE -eq 0 -and $version.Trim() -eq "3.11.9") {
                 return @{
                     Executable = $launcher.Source
                     Prefix = @("-3.11")
@@ -198,8 +198,8 @@ $pythonCommand = Resolve-Python311
 $pythonVersion = & $pythonCommand.Executable @($pythonCommand.Prefix) -c (
     "import platform,sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{platform.machine()}')"
 )
-if ($LASTEXITCODE -ne 0 -or $pythonVersion.Trim() -ne "3.11.15|AMD64") {
-    throw "OCR dependency build requires CPython 3.11.15 x64; found '$($pythonVersion.Trim())'."
+if ($LASTEXITCODE -ne 0 -or $pythonVersion.Trim() -ne "3.11.9|AMD64") {
+    throw "OCR dependency build requires CPython 3.11.9 x64; found '$($pythonVersion.Trim())'."
 }
 $runnerBuildFingerprint = [Convert]::ToHexString(
     [Security.Cryptography.SHA256]::HashData(
