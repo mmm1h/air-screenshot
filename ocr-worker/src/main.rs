@@ -3,9 +3,11 @@ use air_screenshot_ocr_worker::{
     MAX_WORKER_RESPONSE_BYTES, OcrBlock, OcrProtocol, OcrTimings, PreprocessMetadata, TILE_OVERLAP,
     block_owned_by_tile, clean_text, deduplicate_blocks, encode_worker_frame, make_tiles,
     make_worker_response, parse_worker_request, profile_settings, read_png_dimensions,
-    round_milliseconds, validate_image_metadata,
+    retry_result_is_better, round_milliseconds, session_thread_plan, should_retry_recognition,
+    validate_image_metadata,
 };
 use image::RgbImage;
+use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use paddle_ocr_rs::ocr_lite::OcrLite;
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -13,6 +15,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,6 +26,18 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 const REQUIRED_MODEL_FILES: [&str; 4] = ["det.onnx", "rec.onnx", "cls.onnx", "dict.txt"];
 const WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+static OCR_SESSION_THREADS: AtomicUsize = AtomicUsize::new(1);
+
+fn build_ocr_session(builder: SessionBuilder) -> Result<SessionBuilder, ort::Error> {
+    let plan = session_thread_plan(OCR_SESSION_THREADS.load(Ordering::Relaxed));
+    // The three OCR sessions execute sequentially. Giving each one a second
+    // inter-op pool multiplies runnable threads without exposing parallel
+    // model branches, so reserve parallelism for operators inside a session.
+    builder
+        .with_optimization_level(GraphOptimizationLevel::Level3)?
+        .with_inter_threads(plan.inter_threads)?
+        .with_intra_threads(plan.intra_threads)
+}
 
 #[derive(Debug)]
 struct Arguments {
@@ -61,7 +76,11 @@ impl NativeOcrEngine {
         // RapidOCR's published ONNX recognition models carry their character
         // table as model metadata. Using it avoids maintaining a second,
         // potentially mismatched decoder implementation in this worker.
-        ocr.init_models(&det, &cls, &rec, thread_count)
+        OCR_SESSION_THREADS.store(
+            session_thread_plan(thread_count).intra_threads,
+            Ordering::Relaxed,
+        );
+        ocr.init_models_custom(&det, &cls, &rec, build_ocr_session)
             .map_err(|error| format!("Unable to initialize native OCR models: {error:?}"))?;
         Ok(Self {
             ocr,
@@ -69,13 +88,14 @@ impl NativeOcrEngine {
         })
     }
 
-    fn recognize_tile(
+    fn recognize_tile_pass(
         &mut self,
         image: &RgbImage,
         offset_x: u32,
         offset_y: u32,
         image_width: u32,
         image_height: u32,
+        detect_angle: bool,
     ) -> Result<Vec<OcrBlock>, String> {
         let settings = profile_settings(&self.profile)
             .ok_or_else(|| "OCR profile is unsupported.".to_string())?;
@@ -83,14 +103,14 @@ impl NativeOcrEngine {
             .ocr
             .detect_angle_rollback(
                 image,
-                50,
+                settings.padding,
                 settings.detection_limit,
-                0.50,
-                0.30,
-                1.60,
-                true,
+                settings.box_score_threshold,
+                settings.box_threshold,
+                settings.unclip_ratio,
+                detect_angle,
                 false,
-                0.80,
+                settings.angle_rollback_threshold,
             )
             .map_err(|error| format!("Native OCR inference failed: {error:?}"))?;
 
@@ -122,6 +142,48 @@ impl NativeOcrEngine {
             }
         }
         Ok(blocks)
+    }
+
+    fn recognize_tile(
+        &mut self,
+        image: &RgbImage,
+        offset_x: u32,
+        offset_y: u32,
+        image_width: u32,
+        image_height: u32,
+    ) -> Result<Vec<OcrBlock>, String> {
+        let settings = profile_settings(&self.profile)
+            .ok_or_else(|| "OCR profile is unsupported.".to_string())?;
+        let mut primary = self.recognize_tile_pass(
+            image,
+            offset_x,
+            offset_y,
+            image_width,
+            image_height,
+            settings.initial_angle_detection,
+        )?;
+        if !should_retry_recognition(&primary, settings) {
+            return Ok(primary);
+        }
+
+        // Empty accurate results get one bounded contrast pass; low-confidence
+        // results keep the original pixels and only enable 180-degree angle
+        // classification. No retry runs on the default fast profile.
+        let enhanced = (primary.is_empty() && settings.retry_contrast > 0.0)
+            .then(|| image::imageops::contrast(image, settings.retry_contrast));
+        let retry_image = enhanced.as_ref().unwrap_or(image);
+        let retry = self.recognize_tile_pass(
+            retry_image,
+            offset_x,
+            offset_y,
+            image_width,
+            image_height,
+            settings.retry_angle_detection,
+        )?;
+        if retry_result_is_better(&primary, &retry, settings) {
+            primary = retry;
+        }
+        Ok(primary)
     }
 
     fn recognize_tiles(&mut self, image: &RgbImage) -> Result<(Vec<OcrBlock>, usize, u32), String> {

@@ -5,8 +5,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,11 +31,30 @@ enum class Tool {
     eraser,
     blur,
     watermark,
+    redact,
 };
+
+enum class EraserMode {
+    object,
+    local_stroke,
+};
+
+[[nodiscard]] constexpr bool tool_is_privacy_effect(Tool tool) noexcept {
+    return tool == Tool::mosaic || tool == Tool::blur ||
+           tool == Tool::redact;
+}
+
+[[nodiscard]] constexpr bool is_compact_palette_color(
+    COLORREF color) noexcept {
+    return color == RGB(245, 34, 45) ||
+           color == RGB(250, 219, 20) ||
+           color == RGB(82, 196, 26) ||
+           color == RGB(0, 102, 255);
+}
 
 [[nodiscard]] constexpr bool tool_uses_bitmap_effect_preview(
     Tool tool) noexcept {
-    return tool == Tool::mosaic || tool == Tool::blur ||
+    return tool_is_privacy_effect(tool) ||
            tool == Tool::highlight;
 }
 
@@ -46,8 +68,7 @@ enum class Tool {
     Tool active_tool,
     Tool style_tool,
     bool has_selected_annotation) noexcept {
-    const bool effect_tool =
-        style_tool == Tool::mosaic || style_tool == Tool::blur;
+    const bool effect_tool = tool_is_privacy_effect(style_tool);
     return effect_tool &&
            !(active_tool == Tool::select && has_selected_annotation);
 }
@@ -64,6 +85,7 @@ enum class Tool {
             return safe_width * 0.5F;
         case Tool::mosaic:
         case Tool::blur:
+        case Tool::redact:
             return std::max(5.0F, safe_width * 3.5F);
         case Tool::highlight:
             return static_cast<float>(std::clamp(
@@ -71,7 +93,11 @@ enum class Tool {
                 4.0,
                 4096.0));
         case Tool::eraser:
-            return std::max(8.0F, safe_width * 0.5F);
+            // Eraser widths use the same 2 / 4 / 8 values as the other
+            // tools, but those values represent size presets rather than a
+            // line diameter. Keep the three presets optically distinct and
+            // use this exact radius for both hit testing and the cursor.
+            return std::clamp(2.0F + safe_width * 2.0F, 4.0F, 128.0F);
         case Tool::serial:
             return 8.0F + safe_width * 1.5F;
         default:
@@ -195,6 +221,11 @@ struct Annotation {
     // bitmap renderer. Keeping the result on the annotation makes selection,
     // hit testing and the live preview agree with the committed image.
     RectI measured_text_bounds{};
+    // Text geometry is expressed in output-image pixels, never UI DIPs. A
+    // zero box width keeps the legacy natural-width/no-soft-wrap behaviour;
+    // a positive width enables automatic wrapping inside that logical box.
+    int text_box_width_px{};
+    RectI measured_text_layout_bounds{};
 };
 
 struct ToolStyleState {
@@ -212,7 +243,7 @@ struct ToolStyleState {
 };
 
 inline constexpr std::size_t kToolStyleCount =
-    static_cast<std::size_t>(Tool::watermark) + 1;
+    static_cast<std::size_t>(Tool::redact) + 1;
 
 [[nodiscard]] constexpr std::size_t tool_style_index(Tool tool) noexcept {
     const auto index = static_cast<std::size_t>(tool);
@@ -228,6 +259,7 @@ public:
             std::clamp(highlight_alpha, 24, 192);
         styles_[tool_style_index(Tool::watermark)].color =
             RGB(255, 150, 150);
+        styles_[tool_style_index(Tool::redact)].color = RGB(0, 0, 0);
     }
 
     [[nodiscard]] ToolStyleState& for_tool(Tool tool) noexcept {
@@ -289,6 +321,89 @@ private:
         return serial_visual_radius(annotation.width, annotation.serial);
     }
     return tool_visual_radius(annotation.tool, annotation.width);
+}
+
+[[nodiscard]] inline double privacy_segment_distance(
+    POINT point,
+    POINT start,
+    POINT end) noexcept {
+    const double delta_x = static_cast<double>(end.x - start.x);
+    const double delta_y = static_cast<double>(end.y - start.y);
+    const double length_squared = delta_x * delta_x + delta_y * delta_y;
+    if (length_squared <= 0.0) {
+        return std::hypot(
+            static_cast<double>(point.x - start.x),
+            static_cast<double>(point.y - start.y));
+    }
+    const double projection = std::clamp(
+        (static_cast<double>(point.x - start.x) * delta_x +
+         static_cast<double>(point.y - start.y) * delta_y) /
+            length_squared,
+        0.0,
+        1.0);
+    return std::hypot(
+        static_cast<double>(point.x) -
+            (static_cast<double>(start.x) + projection * delta_x),
+        static_cast<double>(point.y) -
+            (static_cast<double>(start.y) + projection * delta_y));
+}
+
+// Selection and object editing use the same footprint as privacy rendering:
+// a filled rectangle in box mode, or a round-capped polyline in brush mode.
+// The small outer margin keeps thin objects operable without making distant
+// annotations steal pointer hits.
+[[nodiscard]] inline bool privacy_annotation_hit_test(
+    const Annotation& annotation,
+    POINT point,
+    double additional_radius = 0.0) noexcept {
+    if (!tool_is_privacy_effect(annotation.tool)) {
+        return false;
+    }
+    const double safe_additional_radius =
+        std::isfinite(additional_radius)
+            ? std::max(0.0, additional_radius)
+            : 0.0;
+    if (annotation.points.empty()) {
+        RectI bounds{
+            annotation.start.x,
+            annotation.start.y,
+            annotation.end.x,
+            annotation.end.y,
+        };
+        bounds = bounds.normalized();
+        if (bounds.empty()) {
+            return false;
+        }
+        const int margin = static_cast<int>(
+            std::ceil(4.0 + safe_additional_radius));
+        bounds.left -= margin;
+        bounds.top -= margin;
+        bounds.right += margin;
+        bounds.bottom += margin;
+        return bounds.contains(point);
+    }
+
+    const double threshold =
+        std::max(
+            8.0,
+            static_cast<double>(annotation_visual_radius(annotation)) +
+                4.0) +
+        safe_additional_radius;
+    if (annotation.points.size() == 1) {
+        return privacy_segment_distance(
+                   point,
+                   annotation.points.front(),
+                   annotation.points.front()) <= threshold;
+    }
+    for (std::size_t index = 1; index < annotation.points.size(); ++index) {
+        if (privacy_segment_distance(
+                point,
+                annotation.points[index - 1],
+                annotation.points[index]) <= threshold) {
+            return true;
+        }
+    }
+    return false;
 }
 
 [[nodiscard]] inline float arrow_head_length(float width) noexcept {
@@ -512,6 +627,12 @@ struct ArrowHeadWings {
                        std::abs(delta_y) >= kMinimumBoxExtent;
             }
             return true;
+        case Tool::redact:
+            if (annotation.points.empty()) {
+                return std::abs(delta_x) >= kMinimumBoxExtent &&
+                       std::abs(delta_y) >= kMinimumBoxExtent;
+            }
+            return true;
         case Tool::pen:
         case Tool::highlight:
             // A click is an intentional dot for freehand tools.
@@ -565,6 +686,108 @@ struct ToolbarButton {
     RectI bounds;
     bool enabled{true};
     std::wstring disabled_reason;
+    bool checked{};
+    bool busy{};
+};
+
+inline constexpr int kToolbarButtonDip = 40;
+inline constexpr int kToolbarSpacingDip = 4;
+inline constexpr int kToolbarPaddingDip = 4;
+inline constexpr int kToolbarIconFrameDip = 24;
+inline constexpr int kToolbarGlyphDip = 20;
+inline constexpr float kToolbarIconStrokeDip = 1.5F;
+inline constexpr int kSubToolbarSpacingDip = 2;
+inline constexpr int kSubToolbarPaddingDip = 6;
+inline constexpr int kSubToolbarSliderDip = 156;
+inline constexpr int kSubToolbarSliderTrackLeftDip = 32;
+inline constexpr int kSubToolbarSliderTrackRightInsetDip = 36;
+inline constexpr int kSubToolbarSliderHitSlopDip = 10;
+
+[[nodiscard]] constexpr std::wstring_view toolbar_group_for_item(
+    std::wstring_view id) noexcept {
+    if (id == L"rect" || id == L"ellipse" || id == L"line" ||
+        id == L"arrow") {
+        return L"group_shape";
+    }
+    if (id == L"pen" || id == L"highlight") {
+        return L"group_brush";
+    }
+    if (id == L"mosaic" || id == L"blur" || id == L"redact") {
+        return L"group_privacy";
+    }
+    if (id == L"text" || id == L"serial" || id == L"watermark") {
+        return L"group_mark";
+    }
+    if (id == L"pin" || id == L"ocr" || id == L"scroll" ||
+        id == L"copy") {
+        return L"group_capture";
+    }
+    return {};
+}
+
+[[nodiscard]] constexpr bool toolbar_is_group_id(
+    std::wstring_view id) noexcept {
+    return id == L"group_shape" || id == L"group_brush" ||
+           id == L"group_privacy" || id == L"group_mark" ||
+           id == L"group_capture";
+}
+
+struct ToolbarActivation {
+    std::wstring id;
+    bool from_sub_toolbar{};
+};
+
+// A toolbar command is armed on pointer-down and is only activated when the
+// same pointer is released inside the original 40-DIP target. Keeping this
+// state as pure geometry makes cancellation behaviour deterministic and easy
+// to exercise without creating native windows.
+struct ToolbarPressState {
+    std::wstring id;
+    RectI bounds;
+    bool from_sub_toolbar{};
+    bool pointer_inside{};
+
+    [[nodiscard]] bool active() const noexcept { return !id.empty(); }
+
+    bool begin(const ToolbarButton& button, bool from_sub) {
+        if (!button.enabled || button.id.empty() || button.id == L"|" ||
+            button.id == L"drag") {
+            return false;
+        }
+        id = button.id;
+        bounds = button.bounds;
+        from_sub_toolbar = from_sub;
+        pointer_inside = true;
+        return true;
+    }
+
+    [[nodiscard]] bool update(POINT point) noexcept {
+        if (!active()) {
+            return false;
+        }
+        const bool next_inside = bounds.contains(point);
+        const bool changed = next_inside != pointer_inside;
+        pointer_inside = next_inside;
+        return changed;
+    }
+
+    [[nodiscard]] std::optional<ToolbarActivation> release(POINT point) {
+        if (!active()) {
+            return std::nullopt;
+        }
+        const bool activate = bounds.contains(point);
+        ToolbarActivation result{id, from_sub_toolbar};
+        cancel();
+        return activate ? std::optional<ToolbarActivation>{std::move(result)}
+                        : std::nullopt;
+    }
+
+    void cancel() noexcept {
+        id.clear();
+        bounds = {};
+        from_sub_toolbar = false;
+        pointer_inside = false;
+    }
 };
 
 inline constexpr unsigned int kOverlayBaseDpi = 96U;
@@ -612,21 +835,73 @@ struct ToolbarRow {
     int width{};
 };
 
+struct ToolbarSingleRowPlan {
+    ToolbarRow row;
+    std::vector<std::pair<std::wstring, std::wstring>> overflow;
+};
+
+[[nodiscard]] inline std::vector<std::pair<std::wstring, std::wstring>>
+collapse_toolbar_groups(
+    const std::vector<std::pair<std::wstring, std::wstring>>& ordered_items) {
+    constexpr std::array<std::wstring_view, 5> groups{
+        L"group_shape",
+        L"group_brush",
+        L"group_privacy",
+        L"group_mark",
+        L"group_capture",
+    };
+    std::array<std::size_t, groups.size()> counts{};
+    for (const auto& item : ordered_items) {
+        const std::wstring_view group = toolbar_group_for_item(item.first);
+        const auto found = std::ranges::find(groups, group);
+        if (found != groups.end()) {
+            ++counts[static_cast<std::size_t>(found - groups.begin())];
+        }
+    }
+
+    std::array<bool, groups.size()> emitted{};
+    std::vector<std::pair<std::wstring, std::wstring>> collapsed;
+    collapsed.reserve(ordered_items.size());
+    for (const auto& item : ordered_items) {
+        const std::wstring_view group = toolbar_group_for_item(item.first);
+        const auto found = std::ranges::find(groups, group);
+        if (found == groups.end()) {
+            collapsed.push_back(item);
+            continue;
+        }
+        const std::size_t index =
+            static_cast<std::size_t>(found - groups.begin());
+        if (counts[index] == 1) {
+            collapsed.push_back(item);
+        } else if (!emitted[index]) {
+            collapsed.push_back({std::wstring(group), {}});
+            emitted[index] = true;
+        }
+    }
+    return collapsed;
+}
+
 [[nodiscard]] inline int toolbar_item_width(
     std::wstring_view id,
     const ToolbarMetrics& metrics) noexcept {
     const OverlayUiMetrics ui{metrics.dpi};
     if (id == L"drag") return ui.px(20);
     if (id == L"|") return ui.px(9);
-    if (id == L"text_size_btn") return ui.px(86);
+    if (id == L"text_size_btn") return ui.px(78);
     if (id == L"mosaic_strength_slider" ||
-        id == L"watermark_opacity_slider") return ui.px(188);
-    if (id == L"watermark_text") return ui.px(122);
-    if (id == L"watermark_apply" || id == L"watermark_clear") return ui.px(54);
-    if (id.starts_with(L"effect_") || id.starts_with(L"mode_")) return ui.px(68);
+        id == L"watermark_opacity_slider") {
+        return ui.px(kSubToolbarSliderDip);
+    }
+    if (id == L"watermark_text") return ui.px(112);
+    if (id == L"watermark_apply" || id == L"watermark_clear") {
+        return metrics.button_width;
+    }
+    if (id.starts_with(L"effect_") || id.starts_with(L"mode_")) {
+        return metrics.button_width;
+    }
     if (id.starts_with(L"fill_") || id.starts_with(L"stroke_") ||
         id.starts_with(L"corner_") || id.starts_with(L"head_")) {
-        return ui.px(58);
+        return metrics.button_width;
     }
     return metrics.button_width;
 }
@@ -691,6 +966,74 @@ inline void trim_toolbar_row(
         rows.push_back(std::move(current));
     }
     return rows;
+}
+
+// The main capture toolbar is deliberately different from the contextual
+// property toolbar: it never wraps. Optional middle commands move to a stable
+// overflow menu while the leading handle and trailing completion commands stay
+// anchored. The caller supplies already-grouped middle commands so saved user
+// ordering remains the source of truth.
+[[nodiscard]] inline ToolbarSingleRowPlan fit_toolbar_single_row(
+    const std::vector<std::pair<std::wstring, std::wstring>>& leading,
+    const std::vector<std::pair<std::wstring, std::wstring>>& middle,
+    const std::vector<std::pair<std::wstring, std::wstring>>& trailing,
+    const ToolbarMetrics& metrics,
+    const RectI& bounds,
+    std::pair<std::wstring, std::wstring> overflow_button = {L"more", L""}) {
+    const int available_width = std::max(
+        metrics.button_width,
+        bounds.width() - 2 * metrics.padding);
+
+    const auto compose = [&](std::size_t middle_count,
+                             bool include_overflow) {
+        ToolbarRow row;
+        row.items = leading;
+        row.items.insert(
+            row.items.end(),
+            middle.begin(),
+            middle.begin() + static_cast<std::ptrdiff_t>(middle_count));
+        if (include_overflow) {
+            row.items.push_back(overflow_button);
+        }
+        if (!trailing.empty()) {
+            if (!row.items.empty() && row.items.back().first != L"|") {
+                row.items.push_back({L"|", L""});
+            }
+            row.items.insert(row.items.end(), trailing.begin(), trailing.end());
+        }
+        trim_toolbar_row(row, metrics);
+        return row;
+    };
+
+    ToolbarSingleRowPlan plan;
+    plan.row = compose(middle.size(), false);
+    if (plan.row.width <= available_width || middle.empty()) {
+        return plan;
+    }
+
+    std::size_t visible_middle = 0;
+    ToolbarRow best = compose(0, true);
+    for (std::size_t count = 1; count <= middle.size(); ++count) {
+        ToolbarRow candidate = compose(count, count < middle.size());
+        if (candidate.width > available_width) {
+            break;
+        }
+        visible_middle = count;
+        best = std::move(candidate);
+    }
+
+    // The overflow button is mandatory whenever any middle command is hidden.
+    // If even the fixed controls exceed a synthetic tiny monitor, keep the
+    // fixed one-row composition intact rather than silently dropping actions.
+    if (visible_middle == middle.size()) {
+        plan.row = compose(middle.size(), false);
+        return plan;
+    }
+    plan.row = std::move(best);
+    plan.overflow.assign(
+        middle.begin() + static_cast<std::ptrdiff_t>(visible_middle),
+        middle.end());
+    return plan;
 }
 
 [[nodiscard]] inline int toolbar_width(
@@ -944,7 +1287,8 @@ struct AnnotationGeometry {
     POINT cursor,
     RectI bounds,
     bool preserve_aspect,
-    bool from_center) noexcept {
+    bool from_center,
+    double locked_aspect_ratio = 0.0) noexcept {
     original = original.normalized();
     bounds = bounds.normalized();
     const bool moves_left =
@@ -977,8 +1321,10 @@ struct AnnotationGeometry {
     long delta_y = cursor.y - anchor.y;
     if (preserve_aspect && original.height() > 0) {
         const double aspect =
-            static_cast<double>(original.width()) /
-            static_cast<double>(original.height());
+            std::isfinite(locked_aspect_ratio) && locked_aspect_ratio > 0.0
+                ? locked_aspect_ratio
+                : static_cast<double>(original.width()) /
+                      static_cast<double>(original.height());
         long absolute_x = std::abs(delta_x);
         long absolute_y = std::abs(delta_y);
         if (static_cast<double>(absolute_x) >=
@@ -1026,6 +1372,166 @@ struct AnnotationGeometry {
         static_cast<int>(geometry.end.x) + bounds.left,
         static_cast<int>(geometry.end.y) + bounds.top,
     }.normalized();
+}
+
+// Resizes one edge while keeping the orthogonal axis centred. This is used by
+// the persistent aspect-ratio lock: unlike a transient Shift gesture, the lock
+// must also remain effective on side handles and pixel-precision keyboard
+// edits. The result is always clipped to the desktop and never becomes smaller
+// than 2 x 2 pixels.
+[[nodiscard]] inline RectI resize_selection_from_edge(
+    RectI original,
+    DragMode mode,
+    POINT cursor,
+    RectI bounds,
+    bool preserve_aspect,
+    double locked_aspect_ratio = 0.0) noexcept {
+    original = original.normalized();
+    bounds = bounds.normalized();
+    if (original.width() < 2 || original.height() < 2 || bounds.empty() ||
+        original.left < bounds.left || original.top < bounds.top ||
+        original.right > bounds.right || original.bottom > bounds.bottom) {
+        return original;
+    }
+
+    const bool horizontal =
+        mode == DragMode::left || mode == DragMode::right;
+    const bool vertical = mode == DragMode::top || mode == DragMode::bottom;
+    if (!horizontal && !vertical) {
+        return original;
+    }
+
+    if (!preserve_aspect) {
+        switch (mode) {
+            case DragMode::left:
+                original.left = std::clamp(
+                    static_cast<int>(cursor.x),
+                    bounds.left,
+                    original.right - 2);
+                break;
+            case DragMode::right:
+                original.right = std::clamp(
+                    static_cast<int>(cursor.x),
+                    original.left + 2,
+                    bounds.right);
+                break;
+            case DragMode::top:
+                original.top = std::clamp(
+                    static_cast<int>(cursor.y),
+                    bounds.top,
+                    original.bottom - 2);
+                break;
+            case DragMode::bottom:
+                original.bottom = std::clamp(
+                    static_cast<int>(cursor.y),
+                    original.top + 2,
+                    bounds.bottom);
+                break;
+            default:
+                break;
+        }
+        return original;
+    }
+
+    const double aspect =
+        std::isfinite(locked_aspect_ratio) && locked_aspect_ratio > 0.0
+            ? locked_aspect_ratio
+            : static_cast<double>(original.width()) /
+                  static_cast<double>(original.height());
+    if (!std::isfinite(aspect) || aspect <= 0.0) {
+        return original;
+    }
+
+    int requested_width = original.width();
+    int requested_height = original.height();
+    int maximum_width = bounds.width();
+    int maximum_height = bounds.height();
+    if (mode == DragMode::left) {
+        requested_width = original.right - static_cast<int>(cursor.x);
+        maximum_width = original.right - bounds.left;
+    } else if (mode == DragMode::right) {
+        requested_width = static_cast<int>(cursor.x) - original.left;
+        maximum_width = bounds.right - original.left;
+    } else if (mode == DragMode::top) {
+        requested_height = original.bottom - static_cast<int>(cursor.y);
+        maximum_height = original.bottom - bounds.top;
+    } else {
+        requested_height = static_cast<int>(cursor.y) - original.top;
+        maximum_height = bounds.bottom - original.top;
+    }
+
+    auto fit_from_width = [&](int width) {
+        int fitted_width = std::clamp(width, 2, maximum_width);
+        int fitted_height = std::max(
+            2,
+            static_cast<int>(std::lround(
+                static_cast<double>(fitted_width) / aspect)));
+        if (fitted_height > maximum_height) {
+            fitted_height = maximum_height;
+            fitted_width = std::max(
+                2,
+                static_cast<int>(std::lround(
+                    static_cast<double>(fitted_height) * aspect)));
+        }
+        if (fitted_width > maximum_width) {
+            fitted_width = maximum_width;
+            fitted_height = std::max(
+                2,
+                static_cast<int>(std::lround(
+                    static_cast<double>(fitted_width) / aspect)));
+        }
+        return std::pair{
+            std::clamp(fitted_width, 2, maximum_width),
+            std::clamp(fitted_height, 2, maximum_height)};
+    };
+    auto fit_from_height = [&](int height) {
+        int fitted_height = std::clamp(height, 2, maximum_height);
+        int fitted_width = std::max(
+            2,
+            static_cast<int>(std::lround(
+                static_cast<double>(fitted_height) * aspect)));
+        if (fitted_width > maximum_width) {
+            fitted_width = maximum_width;
+            fitted_height = std::max(
+                2,
+                static_cast<int>(std::lround(
+                    static_cast<double>(fitted_width) / aspect)));
+        }
+        if (fitted_height > maximum_height) {
+            fitted_height = maximum_height;
+            fitted_width = std::max(
+                2,
+                static_cast<int>(std::lround(
+                    static_cast<double>(fitted_height) * aspect)));
+        }
+        return std::pair{
+            std::clamp(fitted_width, 2, maximum_width),
+            std::clamp(fitted_height, 2, maximum_height)};
+    };
+
+    const auto [width, height] = horizontal
+        ? fit_from_width(requested_width)
+        : fit_from_height(requested_height);
+    const int center_x = original.left + original.width() / 2;
+    const int center_y = original.top + original.height() / 2;
+    int left = std::clamp(
+        center_x - width / 2,
+        bounds.left,
+        bounds.right - width);
+    int top = std::clamp(
+        center_y - height / 2,
+        bounds.top,
+        bounds.bottom - height);
+    if (mode == DragMode::left) {
+        left = original.right - width;
+    } else if (mode == DragMode::right) {
+        left = original.left;
+    } else if (mode == DragMode::top) {
+        top = original.bottom - height;
+    } else if (mode == DragMode::bottom) {
+        top = original.top;
+    }
+    return {left, top, left + width, top + height};
 }
 
 [[nodiscard]] inline RectI translate_selection_within_bounds(
@@ -1163,11 +1669,20 @@ enum class SelectionResizeDirection {
             }
         }
         longest_line = std::max(longest_line, current_line);
-        const int width = std::max(
+        const int natural_width = std::max(
             24,
             static_cast<int>(std::ceil(
                 std::max(1.0, longest_line) *
                 std::max(1.0F, annotation.width) * 0.72F)));
+        const int width = annotation.text_box_width_px > 0
+                              ? std::max(1, annotation.text_box_width_px)
+                              : natural_width;
+        if (annotation.text_box_width_px > 0 && natural_width > width) {
+            line_count = std::max<std::size_t>(
+                line_count,
+                static_cast<std::size_t>(
+                    (natural_width + width - 1) / width));
+        }
         const int height = std::max(
             18,
             static_cast<int>(std::ceil(
@@ -1229,6 +1744,11 @@ enum class SelectionResizeDirection {
 
 [[nodiscard]] inline RectI annotation_control_bounds(
     const Annotation& annotation) noexcept {
+    if (annotation.tool == Tool::text) {
+        return !annotation.measured_text_layout_bounds.empty()
+                   ? annotation.measured_text_layout_bounds
+                   : annotation_bounds(annotation);
+    }
     if (!annotation.points.empty()) {
         RectI bounds{
             annotation.points.front().x,
@@ -1254,6 +1774,7 @@ enum class SelectionResizeDirection {
         case Tool::mosaic:
         case Tool::highlight:
         case Tool::blur:
+        case Tool::redact:
             return RectI{
                 annotation.start.x,
                 annotation.start.y,
@@ -1276,6 +1797,7 @@ enum class SelectionResizeDirection {
             return !annotation.points.empty();
         case Tool::mosaic:
         case Tool::blur:
+        case Tool::redact:
             return !annotation.points.empty() ||
                    annotation.start.x != annotation.end.x ||
                    annotation.start.y != annotation.end.y;
@@ -1291,6 +1813,33 @@ enum class SelectionResizeDirection {
         annotation.tool == Tool::arrow) {
         handles.push_unique(AnnotationHandle::start_point, annotation.start);
         handles.push_unique(AnnotationHandle::end_point, annotation.end);
+        return handles;
+    }
+    if (annotation.tool == Tool::text) {
+        const RectI bounds = annotation_control_bounds(annotation);
+        if (bounds.width() < 2 || bounds.height() < 2) {
+            return handles;
+        }
+        const long middle_y =
+            bounds.top + (bounds.bottom - bounds.top) / 2;
+        handles.push_unique(
+            AnnotationHandle::top_left,
+            {bounds.left, bounds.top});
+        handles.push_unique(
+            AnnotationHandle::top_right,
+            {bounds.right, bounds.top});
+        handles.push_unique(
+            AnnotationHandle::right,
+            {bounds.right, middle_y});
+        handles.push_unique(
+            AnnotationHandle::bottom_right,
+            {bounds.right, bounds.bottom});
+        handles.push_unique(
+            AnnotationHandle::bottom_left,
+            {bounds.left, bounds.bottom});
+        handles.push_unique(
+            AnnotationHandle::left,
+            {bounds.left, middle_y});
         return handles;
     }
     if (!annotation_supports_box_resize(annotation)) {
@@ -1384,6 +1933,12 @@ inline void translate_annotation(
         annotation.measured_text_bounds.top += delta_y;
         annotation.measured_text_bounds.bottom += delta_y;
     }
+    if (!annotation.measured_text_layout_bounds.empty()) {
+        annotation.measured_text_layout_bounds.left += delta_x;
+        annotation.measured_text_layout_bounds.right += delta_x;
+        annotation.measured_text_layout_bounds.top += delta_y;
+        annotation.measured_text_layout_bounds.bottom += delta_y;
+    }
 }
 
 [[nodiscard]] inline POINT clamp_annotation_translation(
@@ -1414,6 +1969,9 @@ inline void translate_annotation(
         first.start.y != second.start.y ||
         first.end.x != second.end.x ||
         first.end.y != second.end.y ||
+        (first.tool == Tool::text &&
+         (first.width != second.width ||
+          first.text_box_width_px != second.text_box_width_px)) ||
         first.points.size() != second.points.size()) {
         return false;
     }
@@ -1424,6 +1982,214 @@ inline void translate_annotation(
         }
     }
     return true;
+}
+
+inline constexpr float kMinimumTextSizePx = 12.0F;
+inline constexpr float kMaximumTextSizePx = 96.0F;
+
+[[nodiscard]] constexpr UINT text_draw_flags(
+    int text_box_width_px,
+    bool calculate = false) noexcept {
+    UINT flags = DT_LEFT | DT_TOP | DT_NOPREFIX;
+    if (text_box_width_px > 0) {
+        flags |= DT_WORDBREAK | DT_EDITCONTROL;
+    }
+    if (calculate) {
+        flags |= DT_CALCRECT;
+    }
+    return flags;
+}
+
+[[nodiscard]] inline std::wstring text_size_label_px(float value) {
+    const float safe = std::isfinite(value)
+                           ? std::clamp(
+                                 value,
+                                 kMinimumTextSizePx,
+                                 kMaximumTextSizePx)
+                           : 18.0F;
+    return std::to_wstring(static_cast<int>(std::lround(safe))) + L"px";
+}
+
+[[nodiscard]] inline int minimum_text_box_width_px(
+    float font_size_px) noexcept {
+    const float safe_size = std::isfinite(font_size_px)
+                                ? std::clamp(
+                                      font_size_px,
+                                      kMinimumTextSizePx,
+                                      kMaximumTextSizePx)
+                                : 18.0F;
+    return std::max(
+        24,
+        static_cast<int>(std::ceil(safe_size * 2.0F)));
+}
+
+struct TextAnnotationResizePlan {
+    bool valid{};
+    POINT start{};
+    float font_size_px{18.0F};
+    int box_width_px{};
+    POINT fixed_anchor{};
+    bool anchor_right{};
+    bool anchor_bottom{};
+};
+
+[[nodiscard]] inline POINT text_resize_anchor_delta(
+    const TextAnnotationResizePlan& plan,
+    RectI measured_layout_bounds) noexcept {
+    if (!plan.valid || measured_layout_bounds.empty()) {
+        return {};
+    }
+    const POINT actual{
+        plan.anchor_right
+            ? measured_layout_bounds.right
+            : measured_layout_bounds.left,
+        plan.anchor_bottom
+            ? measured_layout_bounds.bottom
+            : measured_layout_bounds.top,
+    };
+    return {
+        plan.fixed_anchor.x - actual.x,
+        plan.fixed_anchor.y - actual.y,
+    };
+}
+
+[[nodiscard]] inline TextAnnotationResizePlan
+plan_text_annotation_resize(
+    const Annotation& original,
+    AnnotationHandle handle,
+    POINT cursor,
+    int canvas_width,
+    int canvas_height) noexcept {
+    TextAnnotationResizePlan plan;
+    if (original.tool != Tool::text ||
+        canvas_width <= 0 || canvas_height <= 0) {
+        return plan;
+    }
+    const bool left_edge =
+        handle == AnnotationHandle::left ||
+        handle == AnnotationHandle::top_left ||
+        handle == AnnotationHandle::bottom_left;
+    const bool right_edge =
+        handle == AnnotationHandle::right ||
+        handle == AnnotationHandle::top_right ||
+        handle == AnnotationHandle::bottom_right;
+    const bool top_edge =
+        handle == AnnotationHandle::top_left ||
+        handle == AnnotationHandle::top_right;
+    const bool bottom_edge =
+        handle == AnnotationHandle::bottom_left ||
+        handle == AnnotationHandle::bottom_right;
+    const bool corner =
+        (left_edge || right_edge) && (top_edge || bottom_edge);
+    if ((!left_edge && !right_edge) ||
+        (!corner && handle != AnnotationHandle::left &&
+         handle != AnnotationHandle::right)) {
+        return plan;
+    }
+
+    const RectI source = annotation_control_bounds(original);
+    if (source.width() < 2 || source.height() < 2) {
+        return plan;
+    }
+    cursor.x = std::clamp(
+        cursor.x, 0L, static_cast<long>(canvas_width));
+    cursor.y = std::clamp(
+        cursor.y, 0L, static_cast<long>(canvas_height));
+    const float original_size = std::isfinite(original.width)
+                                    ? std::clamp(
+                                          original.width,
+                                          kMinimumTextSizePx,
+                                          kMaximumTextSizePx)
+                                    : 18.0F;
+
+    plan.valid = true;
+    plan.start = original.start;
+    plan.font_size_px = original_size;
+    if (!corner) {
+        const int fixed_x = left_edge ? source.right : source.left;
+        const int minimum_width = minimum_text_box_width_px(original_size);
+        const int available = left_edge ? fixed_x : canvas_width - fixed_x;
+        if (available < minimum_width) {
+            return {};
+        }
+        plan.box_width_px = std::clamp(
+            std::abs(static_cast<int>(cursor.x) - fixed_x),
+            minimum_width,
+            available);
+        plan.start.x = left_edge
+                           ? fixed_x - plan.box_width_px
+                           : fixed_x;
+        plan.fixed_anchor = {fixed_x, source.top};
+        plan.anchor_right = left_edge;
+        plan.anchor_bottom = false;
+        return plan;
+    }
+
+    const int fixed_x = left_edge ? source.right : source.left;
+    const int fixed_y = top_edge ? source.bottom : source.top;
+    const int horizontal_space = left_edge
+                                     ? fixed_x
+                                     : canvas_width - fixed_x;
+    const int vertical_space = top_edge
+                                   ? fixed_y
+                                   : canvas_height - fixed_y;
+    const int base_width = original.text_box_width_px > 0
+                               ? original.text_box_width_px
+                               : source.width();
+    const double source_width = std::max(1, base_width);
+    const double source_height = std::max(1, source.height());
+    const double requested_width =
+        std::abs(static_cast<double>(cursor.x - fixed_x));
+    const double requested_height =
+        std::abs(static_cast<double>(cursor.y - fixed_y));
+    const double denominator =
+        source_width * source_width + source_height * source_height;
+    const double requested_scale = denominator > 0.0
+                                       ? (requested_width * source_width +
+                                          requested_height * source_height) /
+                                             denominator
+                                       : 1.0;
+    const double minimum_scale = std::max(
+        static_cast<double>(kMinimumTextSizePx / original_size),
+        static_cast<double>(minimum_text_box_width_px(kMinimumTextSizePx)) /
+            source_width);
+    const double maximum_scale = std::min({
+        static_cast<double>(kMaximumTextSizePx / original_size),
+        static_cast<double>(std::max(0, horizontal_space)) / source_width,
+        static_cast<double>(std::max(0, vertical_space)) / source_height,
+    });
+    if (!std::isfinite(requested_scale) || maximum_scale < minimum_scale) {
+        return {};
+    }
+    const double scale = std::clamp(
+        requested_scale,
+        minimum_scale,
+        maximum_scale);
+    plan.font_size_px = std::clamp(
+        static_cast<float>(std::lround(original_size * scale)),
+        kMinimumTextSizePx,
+        kMaximumTextSizePx);
+    const double effective_scale = plan.font_size_px / original_size;
+    const int minimum_box_width =
+        minimum_text_box_width_px(plan.font_size_px);
+    if (horizontal_space < minimum_box_width) {
+        return {};
+    }
+    plan.box_width_px = std::clamp(
+        static_cast<int>(std::lround(source_width * effective_scale)),
+        minimum_box_width,
+        horizontal_space);
+    const int target_height = std::max(
+        1,
+        static_cast<int>(std::lround(source_height * effective_scale)));
+    plan.start = {
+        left_edge ? fixed_x - plan.box_width_px : fixed_x,
+        top_edge ? fixed_y - target_height : fixed_y,
+    };
+    plan.fixed_anchor = {fixed_x, fixed_y};
+    plan.anchor_right = left_edge;
+    plan.anchor_bottom = top_edge;
+    return plan;
 }
 
 [[nodiscard]] inline Annotation resize_annotation_from_handle(
@@ -2005,12 +2771,13 @@ inline void normalize_annotation_stroke(Annotation& annotation) {
     if ((annotation.tool != Tool::pen &&
          annotation.tool != Tool::highlight &&
          annotation.tool != Tool::mosaic &&
-         annotation.tool != Tool::blur) ||
+         annotation.tool != Tool::blur &&
+         annotation.tool != Tool::redact) ||
         annotation.points.size() <= 1) {
         return;
     }
     const double spacing =
-        annotation.tool == Tool::mosaic || annotation.tool == Tool::blur
+        tool_is_privacy_effect(annotation.tool)
             ? std::max(
                   2.0,
                   static_cast<double>(annotation.width) * 1.75)
@@ -2055,6 +2822,953 @@ inline void renumber_serial_annotations(
             ++next;
         }
     }
+}
+
+[[nodiscard]] constexpr bool annotation_supports_local_erase(
+    const Annotation& annotation) noexcept {
+    return !annotation.points.empty() &&
+           (annotation.tool == Tool::pen ||
+            annotation.tool == Tool::highlight ||
+            annotation.tool == Tool::mosaic ||
+            annotation.tool == Tool::blur ||
+            annotation.tool == Tool::redact);
+}
+
+inline constexpr std::size_t kMaximumEraserInputPoints = 200000;
+inline constexpr std::size_t kMaximumEraserOutputPoints = 200000;
+inline constexpr std::size_t kMaximumEraserFragments = 4096;
+inline constexpr std::size_t kMaximumEraserDocumentFragments = 8192;
+inline constexpr std::size_t kMaximumEraserDocumentAnnotations = 65536;
+
+namespace eraser_detail {
+
+struct PointD {
+    double x{};
+    double y{};
+};
+
+[[nodiscard]] inline PointD to_point_d(POINT point) noexcept {
+    return {
+        static_cast<double>(point.x),
+        static_cast<double>(point.y),
+    };
+}
+
+[[nodiscard]] inline PointD interpolate(
+    PointD start,
+    PointD end,
+    double amount) noexcept {
+    return {
+        start.x + (end.x - start.x) * amount,
+        start.y + (end.y - start.y) * amount,
+    };
+}
+
+[[nodiscard]] inline POINT rounded_point(PointD point) noexcept {
+    return {
+        static_cast<long>(std::lround(point.x)),
+        static_cast<long>(std::lround(point.y)),
+    };
+}
+
+inline void append_unique_point(
+    std::vector<POINT>& points,
+    POINT point) {
+    if (points.empty() || points.back().x != point.x ||
+        points.back().y != point.y) {
+        points.push_back(point);
+    }
+}
+
+[[nodiscard]] inline double point_segment_distance(
+    PointD point,
+    PointD start,
+    PointD end) noexcept {
+    const double delta_x = end.x - start.x;
+    const double delta_y = end.y - start.y;
+    const double length_squared =
+        delta_x * delta_x + delta_y * delta_y;
+    if (length_squared <= 1.0e-12) {
+        return std::hypot(point.x - start.x, point.y - start.y);
+    }
+    const double projection = std::clamp(
+        ((point.x - start.x) * delta_x +
+         (point.y - start.y) * delta_y) /
+            length_squared,
+        0.0,
+        1.0);
+    return std::hypot(
+        point.x - (start.x + projection * delta_x),
+        point.y - (start.y + projection * delta_y));
+}
+
+[[nodiscard]] inline double cross(
+    PointD first,
+    PointD second,
+    PointD third) noexcept {
+    return (second.x - first.x) * (third.y - first.y) -
+           (second.y - first.y) * (third.x - first.x);
+}
+
+[[nodiscard]] inline bool within_segment_bounds(
+    PointD point,
+    PointD start,
+    PointD end) noexcept {
+    constexpr double epsilon = 1.0e-9;
+    return point.x >= std::min(start.x, end.x) - epsilon &&
+           point.x <= std::max(start.x, end.x) + epsilon &&
+           point.y >= std::min(start.y, end.y) - epsilon &&
+           point.y <= std::max(start.y, end.y) + epsilon;
+}
+
+[[nodiscard]] inline bool segments_intersect(
+    PointD first_start,
+    PointD first_end,
+    PointD second_start,
+    PointD second_end) noexcept {
+    constexpr double epsilon = 1.0e-9;
+    const double first_a = cross(first_start, first_end, second_start);
+    const double first_b = cross(first_start, first_end, second_end);
+    const double second_a = cross(second_start, second_end, first_start);
+    const double second_b = cross(second_start, second_end, first_end);
+    if (((first_a > epsilon && first_b < -epsilon) ||
+         (first_a < -epsilon && first_b > epsilon)) &&
+        ((second_a > epsilon && second_b < -epsilon) ||
+         (second_a < -epsilon && second_b > epsilon))) {
+        return true;
+    }
+    return (std::abs(first_a) <= epsilon &&
+            within_segment_bounds(second_start, first_start, first_end)) ||
+           (std::abs(first_b) <= epsilon &&
+            within_segment_bounds(second_end, first_start, first_end)) ||
+           (std::abs(second_a) <= epsilon &&
+            within_segment_bounds(first_start, second_start, second_end)) ||
+           (std::abs(second_b) <= epsilon &&
+            within_segment_bounds(first_end, second_start, second_end));
+}
+
+[[nodiscard]] inline double segment_segment_distance(
+    PointD first_start,
+    PointD first_end,
+    PointD second_start,
+    PointD second_end) noexcept {
+    if (segments_intersect(
+            first_start,
+            first_end,
+            second_start,
+            second_end)) {
+        return 0.0;
+    }
+    return std::min({
+        point_segment_distance(first_start, second_start, second_end),
+        point_segment_distance(first_end, second_start, second_end),
+        point_segment_distance(second_start, first_start, first_end),
+        point_segment_distance(second_end, first_start, first_end),
+    });
+}
+
+[[nodiscard]] inline bool point_in_capsule(
+    PointD point,
+    PointD sweep_start,
+    PointD sweep_end,
+    double radius) noexcept {
+    return point_segment_distance(point, sweep_start, sweep_end) <=
+           radius + 1.0e-9;
+}
+
+inline void append_breakpoint(
+    std::vector<double>& breakpoints,
+    double value) {
+    constexpr double epsilon = 1.0e-10;
+    if (!std::isfinite(value) || value < -epsilon ||
+        value > 1.0 + epsilon) {
+        return;
+    }
+    breakpoints.push_back(std::clamp(value, 0.0, 1.0));
+}
+
+inline void append_circle_breakpoints(
+    std::vector<double>& breakpoints,
+    PointD segment_start,
+    PointD segment_end,
+    PointD center,
+    double radius) {
+    const double delta_x = segment_end.x - segment_start.x;
+    const double delta_y = segment_end.y - segment_start.y;
+    const double relative_x = segment_start.x - center.x;
+    const double relative_y = segment_start.y - center.y;
+    const double quadratic = delta_x * delta_x + delta_y * delta_y;
+    if (quadratic <= 1.0e-12) {
+        return;
+    }
+    const double linear =
+        2.0 * (relative_x * delta_x + relative_y * delta_y);
+    const double constant =
+        relative_x * relative_x + relative_y * relative_y -
+        radius * radius;
+    double discriminant =
+        linear * linear - 4.0 * quadratic * constant;
+    if (discriminant < -1.0e-9) {
+        return;
+    }
+    discriminant = std::max(0.0, discriminant);
+    const double root = std::sqrt(discriminant);
+    append_breakpoint(
+        breakpoints,
+        (-linear - root) / (2.0 * quadratic));
+    append_breakpoint(
+        breakpoints,
+        (-linear + root) / (2.0 * quadratic));
+}
+
+// Returns every parameter at which a source segment can enter or leave the
+// swept eraser capsule. Extra candidates from the capsule's primitive
+// boundaries are harmless; midpoint classification determines the retained
+// intervals and keeps tangent contact stable.
+[[nodiscard]] inline std::vector<double> capsule_breakpoints(
+    PointD segment_start,
+    PointD segment_end,
+    PointD sweep_start,
+    PointD sweep_end,
+    double radius) {
+    std::vector<double> breakpoints{0.0, 1.0};
+    append_circle_breakpoints(
+        breakpoints,
+        segment_start,
+        segment_end,
+        sweep_start,
+        radius);
+
+    const double sweep_delta_x = sweep_end.x - sweep_start.x;
+    const double sweep_delta_y = sweep_end.y - sweep_start.y;
+    const double sweep_length =
+        std::hypot(sweep_delta_x, sweep_delta_y);
+    if (sweep_length > 1.0e-9) {
+        append_circle_breakpoints(
+            breakpoints,
+            segment_start,
+            segment_end,
+            sweep_end,
+            radius);
+        const double unit_x = sweep_delta_x / sweep_length;
+        const double unit_y = sweep_delta_y / sweep_length;
+        const auto local_coordinates = [&](PointD point) {
+            const double relative_x = point.x - sweep_start.x;
+            const double relative_y = point.y - sweep_start.y;
+            return PointD{
+                relative_x * unit_x + relative_y * unit_y,
+                -relative_x * unit_y + relative_y * unit_x,
+            };
+        };
+        const PointD local_start = local_coordinates(segment_start);
+        const PointD local_end = local_coordinates(segment_end);
+        const double local_delta_x = local_end.x - local_start.x;
+        const double local_delta_y = local_end.y - local_start.y;
+        if (std::abs(local_delta_x) > 1.0e-12) {
+            append_breakpoint(
+                breakpoints,
+                -local_start.x / local_delta_x);
+            append_breakpoint(
+                breakpoints,
+                (sweep_length - local_start.x) / local_delta_x);
+        }
+        if (std::abs(local_delta_y) > 1.0e-12) {
+            append_breakpoint(
+                breakpoints,
+                (-radius - local_start.y) / local_delta_y);
+            append_breakpoint(
+                breakpoints,
+                (radius - local_start.y) / local_delta_y);
+        }
+    }
+
+    std::ranges::sort(breakpoints);
+    breakpoints.erase(
+        std::unique(
+            breakpoints.begin(),
+            breakpoints.end(),
+            [](double first, double second) {
+                return std::abs(first - second) <= 1.0e-9;
+            }),
+        breakpoints.end());
+    return breakpoints;
+}
+
+[[nodiscard]] inline bool sweep_hits_expanded_rect(
+    PointD sweep_start,
+    PointD sweep_end,
+    RectI bounds,
+    double radius) noexcept {
+    bounds = bounds.normalized();
+    if (bounds.empty()) {
+        return false;
+    }
+    const double left = static_cast<double>(bounds.left) - radius;
+    const double top = static_cast<double>(bounds.top) - radius;
+    const double right = static_cast<double>(bounds.right) + radius;
+    const double bottom = static_cast<double>(bounds.bottom) + radius;
+    const auto inside = [&](PointD point) {
+        return point.x >= left && point.x <= right &&
+               point.y >= top && point.y <= bottom;
+    };
+    if (inside(sweep_start) || inside(sweep_end)) {
+        return true;
+    }
+    const PointD top_left{left, top};
+    const PointD top_right{right, top};
+    const PointD bottom_right{right, bottom};
+    const PointD bottom_left{left, bottom};
+    return segments_intersect(
+               sweep_start, sweep_end, top_left, top_right) ||
+           segments_intersect(
+               sweep_start, sweep_end, top_right, bottom_right) ||
+           segments_intersect(
+               sweep_start, sweep_end, bottom_right, bottom_left) ||
+           segments_intersect(
+               sweep_start, sweep_end, bottom_left, top_left);
+}
+
+}  // namespace eraser_detail
+
+struct LocalEraseResult {
+    // Fragments are populated only when changed is true. Callers retain the
+    // source annotation themselves on a miss, avoiding a deep copy of points
+    // for every WM_MOUSEMOVE.
+    bool changed{};
+    std::vector<Annotation> fragments;
+};
+
+// annotation_bounds already includes the rendered stroke radius. Expanding
+// the swept-segment AABB by the eraser radius provides a cheap rejection
+// before the more expensive per-segment capsule clipping.
+[[nodiscard]] inline bool eraser_sweep_overlaps_annotation_bounds(
+    const Annotation& annotation,
+    POINT sweep_start,
+    POINT sweep_end,
+    double eraser_radius) noexcept {
+    const RectI bounds = annotation_bounds(annotation).normalized();
+    if (bounds.empty()) {
+        return false;
+    }
+    const double safe_radius =
+        std::isfinite(eraser_radius)
+            ? std::max(0.0, eraser_radius)
+            : 0.0;
+    const double sweep_left =
+        static_cast<double>(std::min(sweep_start.x, sweep_end.x)) -
+        safe_radius;
+    const double sweep_top =
+        static_cast<double>(std::min(sweep_start.y, sweep_end.y)) -
+        safe_radius;
+    const double sweep_right =
+        static_cast<double>(std::max(sweep_start.x, sweep_end.x)) +
+        safe_radius;
+    const double sweep_bottom =
+        static_cast<double>(std::max(sweep_start.y, sweep_end.y)) +
+        safe_radius;
+    return sweep_right >= static_cast<double>(bounds.left) &&
+           sweep_bottom >= static_cast<double>(bounds.top) &&
+           sweep_left <= static_cast<double>(bounds.right) &&
+           sweep_top <= static_cast<double>(bounds.bottom);
+}
+
+// Clips the centerline of a freehand annotation against the eraser's swept
+// circle. The annotation's rendered radius is added to the eraser radius, so
+// the visible stroke and the cursor agree. Retained fragments are independent
+// valid annotations with all visual/style properties copied from the source.
+[[nodiscard]] inline LocalEraseResult split_annotation_by_eraser_sweep(
+    const Annotation& annotation,
+    POINT sweep_start,
+    POINT sweep_end,
+    double eraser_radius,
+    bool bounds_already_checked = false) {
+    LocalEraseResult result;
+    if (!annotation_supports_local_erase(annotation)) {
+        return result;
+    }
+    if (annotation.points.size() > kMaximumEraserInputPoints) {
+        // UI-created strokes are already bounded to this same limit. Refuse
+        // to expand a malformed/external annotation beyond the product cap;
+        // object-delete mode remains available for recovery.
+        return result;
+    }
+    if (!bounds_already_checked &&
+        !eraser_sweep_overlaps_annotation_bounds(
+            annotation,
+            sweep_start,
+            sweep_end,
+            eraser_radius)) {
+        return result;
+    }
+
+    const double safe_eraser_radius =
+        std::isfinite(eraser_radius)
+            ? std::max(0.0, eraser_radius)
+            : 0.0;
+    const double combined_radius =
+        safe_eraser_radius +
+        std::max(
+            0.0,
+            static_cast<double>(annotation_visual_radius(annotation)));
+    const eraser_detail::PointD eraser_start =
+        eraser_detail::to_point_d(sweep_start);
+    const eraser_detail::PointD eraser_end =
+        eraser_detail::to_point_d(sweep_end);
+
+    if (annotation.points.size() == 1) {
+        if (eraser_detail::point_in_capsule(
+                eraser_detail::to_point_d(annotation.points.front()),
+                eraser_start,
+                eraser_end,
+                combined_radius)) {
+            result.changed = true;
+        }
+        return result;
+    }
+
+    // Detect a real erased interval before materializing any retained POINT
+    // arrays. Tangent/near-miss WM_MOUSEMOVE events therefore perform geometry
+    // only and never deep-copy the source stroke.
+    bool has_erased_interval = false;
+    for (std::size_t index = 1;
+         index < annotation.points.size() && !has_erased_interval;
+         ++index) {
+        const eraser_detail::PointD source_start =
+            eraser_detail::to_point_d(annotation.points[index - 1]);
+        const eraser_detail::PointD source_end =
+            eraser_detail::to_point_d(annotation.points[index]);
+        const auto breakpoints = eraser_detail::capsule_breakpoints(
+            source_start,
+            source_end,
+            eraser_start,
+            eraser_end,
+            combined_radius);
+        for (std::size_t part = 1; part < breakpoints.size(); ++part) {
+            const double first = breakpoints[part - 1];
+            const double second = breakpoints[part];
+            if (second - first <= 1.0e-10) {
+                continue;
+            }
+            const eraser_detail::PointD midpoint =
+                eraser_detail::interpolate(
+                    source_start,
+                    source_end,
+                    (first + second) * 0.5);
+            if (eraser_detail::point_in_capsule(
+                    midpoint,
+                    eraser_start,
+                    eraser_end,
+                    combined_radius)) {
+                has_erased_interval = true;
+                break;
+            }
+        }
+    }
+    if (!has_erased_interval) {
+        return result;
+    }
+
+    std::vector<std::vector<POINT>> retained_point_sets;
+    retained_point_sets.reserve(std::min(
+        annotation.points.size(),
+        kMaximumEraserFragments));
+    std::vector<POINT> current_points;
+    std::size_t retained_point_count = 0;
+    bool limit_exceeded = false;
+    const auto finish_fragment = [&] {
+        if (!current_points.empty()) {
+            if (retained_point_sets.size() >=
+                    kMaximumEraserFragments ||
+                current_points.size() >
+                    kMaximumEraserOutputPoints -
+                        std::min(
+                            retained_point_count,
+                            kMaximumEraserOutputPoints)) {
+                limit_exceeded = true;
+                current_points.clear();
+                return;
+            }
+            retained_point_count += current_points.size();
+            retained_point_sets.push_back(
+                std::move(current_points));
+            current_points.clear();
+        }
+    };
+
+    bool removed_positive_interval = false;
+    for (std::size_t index = 1; index < annotation.points.size(); ++index) {
+        const eraser_detail::PointD source_start =
+            eraser_detail::to_point_d(annotation.points[index - 1]);
+        const eraser_detail::PointD source_end =
+            eraser_detail::to_point_d(annotation.points[index]);
+        const auto breakpoints = eraser_detail::capsule_breakpoints(
+            source_start,
+            source_end,
+            eraser_start,
+            eraser_end,
+            combined_radius);
+        for (std::size_t part = 1; part < breakpoints.size(); ++part) {
+            if (limit_exceeded) {
+                break;
+            }
+            const double first = breakpoints[part - 1];
+            const double second = breakpoints[part];
+            if (second - first <= 1.0e-10) {
+                continue;
+            }
+            const eraser_detail::PointD midpoint =
+                eraser_detail::interpolate(
+                    source_start,
+                    source_end,
+                    (first + second) * 0.5);
+            if (eraser_detail::point_in_capsule(
+                    midpoint,
+                    eraser_start,
+                    eraser_end,
+                    combined_radius)) {
+                removed_positive_interval = true;
+                finish_fragment();
+                continue;
+            }
+
+            eraser_detail::append_unique_point(
+                current_points,
+                eraser_detail::rounded_point(
+                    eraser_detail::interpolate(
+                        source_start,
+                        source_end,
+                        first)));
+            eraser_detail::append_unique_point(
+                current_points,
+                eraser_detail::rounded_point(
+                    eraser_detail::interpolate(
+                        source_start,
+                        source_end,
+                        second)));
+            if (current_points.size() > kMaximumEraserOutputPoints) {
+                limit_exceeded = true;
+            }
+        }
+        if (limit_exceeded) {
+            break;
+        }
+    }
+    if (!limit_exceeded) {
+        finish_fragment();
+    }
+
+    if (limit_exceeded) {
+        // A pathologically alternating stroke could otherwise turn one
+        // object into hundreds of thousands of tiny allocations. If an erase
+        // interval was already found, bounded degradation is whole-object
+        // deletion; otherwise leave the source untouched.
+        result.changed = removed_positive_interval;
+        return result;
+    }
+
+    if (!removed_positive_interval) {
+        return result;
+    }
+
+    result.changed = true;
+    result.fragments.reserve(retained_point_sets.size());
+    for (auto& points : retained_point_sets) {
+        if (points.empty()) {
+            continue;
+        }
+        Annotation fragment = annotation;
+        fragment.points = std::move(points);
+        fragment.start = fragment.points.front();
+        fragment.end = fragment.points.back();
+        result.fragments.push_back(std::move(fragment));
+    }
+    return result;
+}
+
+[[nodiscard]] inline bool eraser_sweep_hits_annotation(
+    const Annotation& annotation,
+    POINT sweep_start,
+    POINT sweep_end,
+    double eraser_radius,
+    bool bounds_already_checked = false) noexcept {
+    if (!bounds_already_checked &&
+        !eraser_sweep_overlaps_annotation_bounds(
+            annotation,
+            sweep_start,
+            sweep_end,
+            eraser_radius)) {
+        return false;
+    }
+    using eraser_detail::PointD;
+    const double safe_radius =
+        std::isfinite(eraser_radius)
+            ? std::max(0.0, eraser_radius)
+            : 0.0;
+    const PointD eraser_start = eraser_detail::to_point_d(sweep_start);
+    const PointD eraser_end = eraser_detail::to_point_d(sweep_end);
+
+    if (!annotation.points.empty()) {
+        const double radius =
+            safe_radius +
+            std::max(
+                0.0,
+                static_cast<double>(annotation_visual_radius(annotation)));
+        if (annotation.points.size() == 1) {
+            return eraser_detail::point_segment_distance(
+                       eraser_detail::to_point_d(annotation.points.front()),
+                       eraser_start,
+                       eraser_end) <= radius;
+        }
+        for (std::size_t index = 1;
+             index < annotation.points.size();
+             ++index) {
+            if (eraser_detail::segment_segment_distance(
+                    eraser_start,
+                    eraser_end,
+                    eraser_detail::to_point_d(annotation.points[index - 1]),
+                    eraser_detail::to_point_d(annotation.points[index])) <=
+                radius) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (annotation.tool == Tool::line ||
+        annotation.tool == Tool::arrow) {
+        const double stroke_radius =
+            std::max(
+                0.5,
+                static_cast<double>(annotation.width) * 0.5);
+        if (eraser_detail::segment_segment_distance(
+                eraser_start,
+                eraser_end,
+                eraser_detail::to_point_d(annotation.start),
+                eraser_detail::to_point_d(annotation.end)) <=
+            safe_radius + stroke_radius) {
+            return true;
+        }
+        if (annotation.tool == Tool::arrow) {
+            const auto hit_head = [&](POINT tip, POINT tail) {
+                const ArrowHeadWings wings =
+                    arrow_head_wings(tip, tail, annotation.width);
+                return eraser_detail::segment_segment_distance(
+                           eraser_start,
+                           eraser_end,
+                           eraser_detail::to_point_d(tip),
+                           eraser_detail::to_point_d(wings.first)) <=
+                           safe_radius + stroke_radius ||
+                       eraser_detail::segment_segment_distance(
+                           eraser_start,
+                           eraser_end,
+                           eraser_detail::to_point_d(tip),
+                           eraser_detail::to_point_d(wings.second)) <=
+                           safe_radius + stroke_radius;
+            };
+            if ((arrow_has_start_head(annotation.arrow_head_style) &&
+                 hit_head(annotation.start, annotation.end)) ||
+                (arrow_has_end_head(annotation.arrow_head_style) &&
+                 hit_head(annotation.end, annotation.start))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (annotation.tool == Tool::serial) {
+        return eraser_detail::point_segment_distance(
+                   eraser_detail::to_point_d(annotation.start),
+                   eraser_start,
+                   eraser_end) <=
+               safe_radius +
+                   static_cast<double>(annotation_visual_radius(annotation));
+    }
+
+    if (annotation.tool == Tool::rectangle) {
+        const RectI bounds = RectI{
+            annotation.start.x,
+            annotation.start.y,
+            annotation.end.x,
+            annotation.end.y,
+        }.normalized();
+        if (annotation.fill_style == ShapeFillStyle::translucent) {
+            return eraser_detail::sweep_hits_expanded_rect(
+                eraser_start,
+                eraser_end,
+                bounds,
+                safe_radius);
+        }
+        const double radius =
+            safe_radius +
+            std::max(
+                0.5,
+                static_cast<double>(annotation.width) * 0.5);
+        const PointD top_left{
+            static_cast<double>(bounds.left),
+            static_cast<double>(bounds.top),
+        };
+        const PointD top_right{
+            static_cast<double>(bounds.right),
+            static_cast<double>(bounds.top),
+        };
+        const PointD bottom_right{
+            static_cast<double>(bounds.right),
+            static_cast<double>(bounds.bottom),
+        };
+        const PointD bottom_left{
+            static_cast<double>(bounds.left),
+            static_cast<double>(bounds.bottom),
+        };
+        return eraser_detail::segment_segment_distance(
+                   eraser_start, eraser_end, top_left, top_right) <= radius ||
+               eraser_detail::segment_segment_distance(
+                   eraser_start, eraser_end, top_right, bottom_right) <= radius ||
+               eraser_detail::segment_segment_distance(
+                   eraser_start, eraser_end, bottom_right, bottom_left) <= radius ||
+               eraser_detail::segment_segment_distance(
+                   eraser_start, eraser_end, bottom_left, top_left) <= radius;
+    }
+
+    if (annotation.tool == Tool::ellipse) {
+        const RectI bounds = RectI{
+            annotation.start.x,
+            annotation.start.y,
+            annotation.end.x,
+            annotation.end.y,
+        }.normalized();
+        if (bounds.empty()) {
+            return false;
+        }
+        const double center_x =
+            (static_cast<double>(bounds.left) + bounds.right) * 0.5;
+        const double center_y =
+            (static_cast<double>(bounds.top) + bounds.bottom) * 0.5;
+        const double radius_x =
+            std::max(0.5, static_cast<double>(bounds.width()) * 0.5);
+        const double radius_y =
+            std::max(0.5, static_cast<double>(bounds.height()) * 0.5);
+        const auto point_inside = [&](PointD point) {
+            const double x = (point.x - center_x) / radius_x;
+            const double y = (point.y - center_y) / radius_y;
+            return x * x + y * y <= 1.0;
+        };
+        if (annotation.fill_style == ShapeFillStyle::translucent &&
+            (point_inside(eraser_start) || point_inside(eraser_end))) {
+            return true;
+        }
+        const double hit_radius =
+            safe_radius +
+            std::max(
+                0.5,
+                static_cast<double>(annotation.width) * 0.5);
+        const double circumference =
+            3.14159265358979323846 *
+            (3.0 * (radius_x + radius_y) -
+             std::sqrt(
+                 std::max(
+                     0.0,
+                     (3.0 * radius_x + radius_y) *
+                         (radius_x + 3.0 * radius_y))));
+        const int segment_count = std::clamp(
+            static_cast<int>(std::ceil(
+                circumference / std::max(1.0, hit_radius * 0.5))),
+            64,
+            512);
+        constexpr double two_pi = 6.28318530717958647692;
+        PointD previous{center_x + radius_x, center_y};
+        for (int index = 1; index <= segment_count; ++index) {
+            const double angle =
+                two_pi * static_cast<double>(index) /
+                static_cast<double>(segment_count);
+            const PointD current{
+                center_x + std::cos(angle) * radius_x,
+                center_y + std::sin(angle) * radius_y,
+            };
+            if (eraser_detail::segment_segment_distance(
+                    eraser_start,
+                    eraser_end,
+                    previous,
+                    current) <= hit_radius) {
+                return true;
+            }
+            previous = current;
+        }
+        return false;
+    }
+
+    return eraser_detail::sweep_hits_expanded_rect(
+        eraser_start,
+        eraser_end,
+        annotation_bounds(annotation),
+        safe_radius);
+}
+
+struct EraserSweepResult {
+    bool changed{};
+    std::size_t affected_annotations{};
+    int selected_annotation_idx{-1};
+    std::size_t bounds_rejected_annotations{};
+    std::size_t local_split_attempts{};
+    std::size_t untouched_annotations_copied{};
+    bool document_materialized{};
+};
+
+// Applies one pointer-move sweep to a complete annotation document. In local
+// mode supported freehand strokes are split, while every other object retains
+// object-delete semantics. Selection is preserved only for an untouched
+// object and is remapped across insertions/deletions.
+[[nodiscard]] inline EraserSweepResult erase_annotations_with_sweep(
+    std::vector<Annotation>& annotations,
+    POINT sweep_start,
+    POINT sweep_end,
+    double eraser_radius,
+    EraserMode mode,
+    int selected_annotation_idx = -1) {
+    EraserSweepResult result;
+    std::vector<Annotation> next;
+    bool document_materialized = false;
+    int mapped_selection = -1;
+    std::size_t local_fragment_count = 0;
+    const std::size_t document_annotation_limit = std::max(
+        annotations.size(),
+        kMaximumEraserDocumentAnnotations);
+
+    const auto materialize_prefix = [&](std::size_t end_index) {
+        if (document_materialized) {
+            return;
+        }
+        next.reserve(annotations.size());
+        next.insert(
+            next.end(),
+            annotations.begin(),
+            annotations.begin() +
+                static_cast<std::ptrdiff_t>(end_index));
+        result.untouched_annotations_copied += end_index;
+        result.document_materialized = true;
+        document_materialized = true;
+        if (selected_annotation_idx >= 0 &&
+            selected_annotation_idx < static_cast<int>(end_index)) {
+            mapped_selection = selected_annotation_idx;
+        }
+    };
+
+    const auto append_untouched = [&](std::size_t index) {
+        if (!document_materialized) {
+            return;
+        }
+        if (static_cast<int>(index) == selected_annotation_idx) {
+            mapped_selection = static_cast<int>(next.size());
+        }
+        next.push_back(annotations[index]);
+        ++result.untouched_annotations_copied;
+    };
+
+    for (std::size_t index = 0; index < annotations.size(); ++index) {
+        const Annotation& annotation = annotations[index];
+        const bool bounds_overlap =
+            eraser_sweep_overlaps_annotation_bounds(
+                annotation,
+                sweep_start,
+                sweep_end,
+                eraser_radius);
+        if (!bounds_overlap) {
+            ++result.bounds_rejected_annotations;
+            append_untouched(index);
+            continue;
+        }
+
+        bool affected = false;
+        LocalEraseResult local;
+        const bool local_candidate =
+            mode == EraserMode::local_stroke &&
+            annotation_supports_local_erase(annotation);
+        if (local_candidate) {
+            ++result.local_split_attempts;
+            local = split_annotation_by_eraser_sweep(
+                annotation,
+                sweep_start,
+                sweep_end,
+                eraser_radius,
+                true);
+            if (local.changed) {
+                affected = true;
+                materialize_prefix(index);
+                const bool fragment_budget_exceeded =
+                    local.fragments.size() >
+                    kMaximumEraserDocumentFragments -
+                        std::min(
+                            local_fragment_count,
+                            kMaximumEraserDocumentFragments);
+                const bool annotation_budget_exceeded =
+                    local.fragments.size() >
+                    document_annotation_limit -
+                        std::min(
+                            next.size(),
+                            document_annotation_limit);
+                if (fragment_budget_exceeded ||
+                    annotation_budget_exceeded) {
+                    // Re-evaluate the untouched source document using the
+                    // bounded object-delete behavior. This is an atomic
+                    // degradation: callers never observe a prefix of local
+                    // fragments followed by a different mode.
+                    return erase_annotations_with_sweep(
+                        annotations,
+                        sweep_start,
+                        sweep_end,
+                        eraser_radius,
+                        EraserMode::object,
+                        selected_annotation_idx);
+                }
+                local_fragment_count += local.fragments.size();
+                next.insert(
+                    next.end(),
+                    std::make_move_iterator(local.fragments.begin()),
+                    std::make_move_iterator(local.fragments.end()));
+            }
+        } else if (eraser_sweep_hits_annotation(
+                       annotation,
+                       sweep_start,
+                       sweep_end,
+                       eraser_radius,
+                       true)) {
+            affected = true;
+            materialize_prefix(index);
+        }
+
+        if (affected) {
+            result.changed = true;
+            ++result.affected_annotations;
+            continue;
+        }
+
+        append_untouched(index);
+    }
+
+    if (mode == EraserMode::local_stroke &&
+        next.size() > document_annotation_limit) {
+        return erase_annotations_with_sweep(
+            annotations,
+            sweep_start,
+            sweep_end,
+            eraser_radius,
+            EraserMode::object,
+            selected_annotation_idx);
+    }
+
+    if (!result.changed) {
+        result.selected_annotation_idx =
+            selected_annotation_idx >= 0 &&
+                    selected_annotation_idx <
+                        static_cast<int>(annotations.size())
+                ? selected_annotation_idx
+                : -1;
+        return result;
+    }
+
+    annotations = std::move(next);
+    renumber_serial_annotations(annotations);
+    result.selected_annotation_idx = mapped_selection;
+    return result;
 }
 
 }  // namespace airshot::overlay_detail

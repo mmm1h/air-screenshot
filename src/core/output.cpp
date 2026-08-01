@@ -45,6 +45,7 @@ std::atomic<DWORD> clipboard_worker_delay_milliseconds{};
 std::atomic<DWORD> clipboard_wait_timeout_override_milliseconds{};
 std::atomic<DWORD> clipboard_pre_flush_delay_milliseconds{};
 std::atomic_bool clipboard_forward_set_pending{};
+std::atomic_bool clipboard_forward_set_gate_blocked{};
 std::atomic_bool clipboard_snapshot_failure_for_testing{};
 std::atomic_uint64_t clipboard_commit_generation_source{1};
 std::atomic_uint64_t clipboard_active_commit_generation{};
@@ -1476,6 +1477,13 @@ void run_clipboard_worker(
         if (pre_flush_delay != 0) {
             wait_for_clipboard_retry(pre_flush_delay);
         }
+        while (clipboard_forward_set_gate_blocked.load(
+            std::memory_order_acquire)) {
+            // This is a test-only synchronization gate. Keep dispatching OLE
+            // sent messages so a concurrent Win32 clipboard publisher cannot
+            // deadlock while it replaces our delayed IDataObject.
+            wait_for_clipboard_retry(1);
+        }
     }
 
     state->outcome.ownership_result =
@@ -2316,6 +2324,12 @@ void set_clipboard_pre_flush_delay_for_testing(
     clipboard_pre_flush_delay_milliseconds.store(
         static_cast<DWORD>(milliseconds),
         std::memory_order_relaxed);
+}
+
+void set_clipboard_forward_set_gate_for_testing(bool blocked) noexcept {
+    clipboard_forward_set_gate_blocked.store(
+        blocked,
+        std::memory_order_release);
 }
 
 void set_clipboard_snapshot_failure_for_testing(bool enabled) noexcept {

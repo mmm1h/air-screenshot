@@ -9,8 +9,9 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Drawing
 
-$script:Ink = [System.Drawing.Color]::FromArgb(255, 9, 20, 38)
-$script:Cobalt = [System.Drawing.Color]::FromArgb(255, 39, 100, 231)
+$script:Ink = [System.Drawing.Color]::FromArgb(255, 23, 25, 30)
+$script:Paper = [System.Drawing.Color]::FromArgb(255, 247, 249, 255)
+$script:Cobalt = [System.Drawing.Color]::FromArgb(255, 77, 124, 254)
 $script:Cyan = [System.Drawing.Color]::FromArgb(255, 26, 175, 181)
 
 function New-RoundedRectanglePath {
@@ -42,7 +43,7 @@ function New-AppIconBitmap {
         [ValidateSet('focus', 'flow', 'pixel')]
         [string]$Style,
         [Parameter(Mandatory)]
-        [ValidateRange(16, 256)]
+        [ValidateRange(16, 512)]
         [int]$Size
     )
 
@@ -62,14 +63,15 @@ function New-AppIconBitmap {
     }
 
     $inkBrush = [System.Drawing.SolidBrush]::new($script:Ink)
+    $paperBrush = [System.Drawing.SolidBrush]::new($script:Paper)
     $cobaltBrush = [System.Drawing.SolidBrush]::new($script:Cobalt)
     $cyanBrush = [System.Drawing.SolidBrush]::new($script:Cyan)
     try {
         switch ($Style) {
             'focus' {
-                $margin = [Math]::Round($Size * 0.125)
+                $margin = [Math]::Max(1, [Math]::Round($Size * 0.09375))
                 $tileSize = $Size - 2 * $margin
-                $radius = [Math]::Max(2.0, $Size * 0.15625)
+                $radius = [Math]::Max(2.0, $Size * 0.1875)
                 $tile = New-RoundedRectanglePath $margin $margin $tileSize $tileSize $radius
                 try {
                     $graphics.FillPath($inkBrush, $tile)
@@ -77,30 +79,38 @@ function New-AppIconBitmap {
                     $tile.Dispose()
                 }
 
-                $stroke = [Math]::Max(1.0, [Math]::Round($Size * 0.0546875))
-                $pen = [System.Drawing.Pen]::new($script:Cobalt, $stroke)
+                $stroke = if ($Size -le 20) {
+                    1.0
+                } elseif ($Size -le 32) {
+                    2.0
+                } else {
+                    [Math]::Max(2.0, [Math]::Round($Size * 0.046875))
+                }
+                $pen = [System.Drawing.Pen]::new($script:Paper, $stroke)
                 try {
-                    $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Square
-                    $pen.EndCap = [System.Drawing.Drawing2D.LineCap]::Square
-                    $pen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Miter
-                    $p0 = [Math]::Round($Size * 0.28125)
-                    $p1 = [Math]::Round($Size * 0.4375)
-                    $p2 = [Math]::Round($Size * 0.5625)
-                    $p3 = [Math]::Round($Size * 0.71875)
+                    $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+                    $pen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+                    $pen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+                    $p0 = [Math]::Round($Size * 0.3046875)
+                    $p1 = [Math]::Round($Size * 0.4453125)
+                    $p2 = [Math]::Round($Size * 0.5546875)
+                    $p3 = [Math]::Round($Size * 0.6953125)
                     $graphics.DrawLine($pen, $p0, $p1, $p0, $p0)
                     $graphics.DrawLine($pen, $p0, $p0, $p1, $p0)
-                    $graphics.DrawLine($pen, $p2, $p0, $p3, $p0)
-                    $graphics.DrawLine($pen, $p3, $p0, $p3, $p1)
-                    $graphics.DrawLine($pen, $p0, $p2, $p0, $p3)
-                    $graphics.DrawLine($pen, $p0, $p3, $p1, $p3)
                     $graphics.DrawLine($pen, $p2, $p3, $p3, $p3)
                     $graphics.DrawLine($pen, $p3, $p2, $p3, $p3)
                 } finally {
                     $pen.Dispose()
                 }
-                $focusSize = [Math]::Max(1, [Math]::Round($Size * 0.0703125))
+                $focusSize = [Math]::Max(2, [Math]::Round($Size * 0.171875))
                 $focusOrigin = [Math]::Floor(($Size - $focusSize) / 2.0)
-                $graphics.FillRectangle($cyanBrush, $focusOrigin, $focusOrigin, $focusSize, $focusSize)
+                $focusRadius = [Math]::Max(1.0, $focusSize * 0.22)
+                $focus = New-RoundedRectanglePath $focusOrigin $focusOrigin $focusSize $focusSize $focusRadius
+                try {
+                    $graphics.FillPath($cobaltBrush, $focus)
+                } finally {
+                    $focus.Dispose()
+                }
             }
             'flow' {
                 $margin = [Math]::Round($Size * 0.125)
@@ -171,6 +181,7 @@ function New-AppIconBitmap {
         }
     } finally {
         $inkBrush.Dispose()
+        $paperBrush.Dispose()
         $cobaltBrush.Dispose()
         $cyanBrush.Dispose()
         $graphics.Dispose()
@@ -242,6 +253,14 @@ function Write-MultiImageIcon {
 Write-MultiImageIcon -Style focus -Path (Join-Path $OutputDirectory 'app.ico')
 Write-MultiImageIcon -Style flow -Path (Join-Path $OutputDirectory 'app-flow.ico')
 Write-MultiImageIcon -Style pixel -Path (Join-Path $OutputDirectory 'app-pixel.ico')
+$logo = New-AppIconBitmap -Style focus -Size 512
+try {
+    $logo.Save(
+        (Join-Path $OutputDirectory 'logo.png'),
+        [System.Drawing.Imaging.ImageFormat]::Png)
+} finally {
+    $logo.Dispose()
+}
 
 if (-not [string]::IsNullOrWhiteSpace($PreviewPath)) {
     [System.IO.Directory]::CreateDirectory((Split-Path -Parent $PreviewPath)) | Out-Null
@@ -306,4 +325,4 @@ if (-not [string]::IsNullOrWhiteSpace($PreviewPath)) {
     }
 }
 
-Write-Host "Generated Focus Frame, Flow Lens, and Pixel Console multi-image icons in $OutputDirectory"
+Write-Host "Generated Focus Frame, Flow Lens, Pixel Console, and the 512 px logo in $OutputDirectory"

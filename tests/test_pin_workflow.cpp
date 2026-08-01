@@ -1,4 +1,5 @@
 #include "airshot/pin_workflow.h"
+#include "airshot/pin_lifecycle_policy.h"
 
 #include <array>
 #include <iostream>
@@ -50,6 +51,102 @@ void test_lifecycle_semantics() {
         transition_pin_lifecycle(destroyed, PinLifecycleAction::show) ==
             PinLifecycleState::destroyed,
         "destroyed pins cannot be revived as hidden pins");
+}
+
+void test_escape_and_recoverable_runtime_state() {
+    using namespace airshot;
+
+    expect(
+        pin_escape_action(false) == PinEscapeAction::hide,
+        "Esc hides a pin instead of destroying it");
+    expect(
+        pin_escape_action(true) == PinEscapeAction::confirm_destroy,
+        "Shift+Esc is the explicit permanent-destroy gesture");
+
+    PinRuntimeState state;
+    state.presentation = {
+        1.75,
+        143,
+        false,
+        PinVisualEffects{true, true},
+        false,
+        true,
+    };
+    const PinPresentationState retained = state.presentation;
+
+    state = transition_pin_runtime_state(
+        state,
+        PinLifecycleAction::hide,
+        41);
+    expect(
+        state.lifecycle == PinLifecycleState::hidden &&
+            state.hidden_order == 41 &&
+            state.presentation == retained,
+        "Esc hide retains scale, alpha, filters, topmost and click-through state");
+
+    state = transition_pin_runtime_state(
+        state,
+        PinLifecycleAction::hide,
+        99);
+    expect(
+        state.hidden_order == 41 && state.presentation == retained,
+        "repeated hide is idempotent and keeps the original recovery order");
+
+    state = transition_pin_runtime_state(
+        state,
+        PinLifecycleAction::show);
+    expect(
+        state.lifecycle == PinLifecycleState::visible &&
+            state.hidden_order == 0 &&
+            state.presentation == retained,
+        "restoring a hidden pin preserves all presentation state");
+
+    state = transition_pin_runtime_state(
+        state,
+        PinLifecycleAction::hide,
+        100);
+    state = transition_pin_runtime_state(
+        state,
+        PinLifecycleAction::show);
+    expect(
+        state.lifecycle == PinLifecycleState::visible &&
+            state.presentation == retained,
+        "repeated hide and restore cycles do not degrade state");
+
+    state = transition_pin_runtime_state(
+        state,
+        PinLifecycleAction::destroy);
+    const PinRuntimeState after_destroy = transition_pin_runtime_state(
+        state,
+        PinLifecycleAction::show);
+    expect(
+        after_destroy.lifecycle == PinLifecycleState::destroyed &&
+            after_destroy.hidden_order == 0 &&
+            after_destroy.presentation == retained,
+        "permanently destroyed pins cannot be restored");
+}
+
+void test_bulk_destroy_snapshot_policy() {
+    using namespace airshot;
+
+    expect(
+        can_begin_pin_bulk_destroy(false, 2),
+        "bulk destroy begins when pins exist and no confirmation is active");
+    expect(
+        !can_begin_pin_bulk_destroy(true, 2),
+        "bulk destroy rejects a nested confirmation");
+    expect(
+        !can_begin_pin_bulk_destroy(false, 0),
+        "bulk destroy skips an empty snapshot");
+
+    constexpr std::array<std::uint64_t, 2> confirmed_identifiers{11, 19};
+    expect(
+        pin_destroy_snapshot_contains(confirmed_identifiers, 11) &&
+            pin_destroy_snapshot_contains(confirmed_identifiers, 19),
+        "bulk destroy includes every pin present at confirmation time");
+    expect(
+        !pin_destroy_snapshot_contains(confirmed_identifiers, 23),
+        "pins created while confirmation is open are excluded from destruction");
 }
 
 void test_budget_transactions() {
@@ -352,6 +449,8 @@ void test_visual_effects_and_scale_policy() {
 
 int main() {
     test_lifecycle_semantics();
+    test_escape_and_recoverable_runtime_state();
+    test_bulk_destroy_snapshot_policy();
     test_budget_transactions();
     test_state_counts_and_toggle_plan();
     test_visual_effects_and_scale_policy();

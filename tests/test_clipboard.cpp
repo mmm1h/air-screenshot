@@ -814,7 +814,10 @@ int wmain() {
         L"Air Screenshot newer concurrent clipboard content";
     std::atomic_bool publisher_observed_forward_set{};
     std::atomic_bool publisher_succeeded{};
-    airshot::output_test::set_clipboard_pre_flush_delay_for_testing(300);
+    // Store sequence + 1 so the valid DWORD sequence value zero remains
+    // distinguishable from "the publisher never completed".
+    std::atomic<std::uint64_t> publisher_sequence_marker{};
+    airshot::output_test::set_clipboard_forward_set_gate_for_testing(true);
     std::thread concurrent_publisher([&]() noexcept {
         const ULONGLONG deadline = GetTickCount64() + 2'000;
         while (!airshot::output_test::
@@ -824,14 +827,28 @@ int wmain() {
         }
         if (!airshot::output_test::
                  clipboard_forward_set_pending_for_testing()) {
+            airshot::output_test::set_clipboard_forward_set_gate_for_testing(
+                false);
             return;
         }
         publisher_observed_forward_set.store(
             true,
             std::memory_order_release);
-        publisher_succeeded.store(
-            publish_unicode_clipboard_text(owner.get(), concurrent_sentinel),
-            std::memory_order_release);
+        const bool succeeded = publish_unicode_clipboard_text(
+            owner.get(),
+            concurrent_sentinel);
+        publisher_succeeded.store(succeeded, std::memory_order_release);
+        if (succeeded) {
+            publisher_sequence_marker.store(
+                static_cast<std::uint64_t>(
+                    GetClipboardSequenceNumber()) + 1,
+                std::memory_order_release);
+        }
+        // Release the Air Screenshot worker only after this publication has
+        // either completed or definitively failed. This proves its subsequent
+        // ownership check cannot roll back a fully-published newer value.
+        airshot::output_test::set_clipboard_forward_set_gate_for_testing(
+            false);
     });
     copy_error.clear();
     const bool superseded_copy_rejected =
@@ -840,18 +857,37 @@ int wmain() {
             L"must not replace the concurrent publisher",
             &copy_error);
     concurrent_publisher.join();
-    airshot::output_test::set_clipboard_pre_flush_delay_for_testing(0);
+    airshot::output_test::set_clipboard_forward_set_gate_for_testing(false);
     std::wstring concurrent_text;
+    const bool concurrent_read_succeeded =
+        read_unicode_clipboard_text(owner.get(), concurrent_text);
+    const std::uint64_t published_sequence_marker =
+        publisher_sequence_marker.load(std::memory_order_acquire);
+    const DWORD published_sequence = published_sequence_marker == 0
+                                         ? 0
+                                         : static_cast<DWORD>(
+                                               published_sequence_marker - 1);
+    const DWORD final_sequence = GetClipboardSequenceNumber();
     if (!superseded_copy_rejected ||
         !publisher_observed_forward_set.load(std::memory_order_acquire) ||
         !publisher_succeeded.load(std::memory_order_acquire) ||
         copy_error.find(L"较新") == std::wstring::npos ||
-        !read_unicode_clipboard_text(owner.get(), concurrent_text) ||
+        published_sequence_marker == 0 ||
+        final_sequence != published_sequence ||
+        !concurrent_read_succeeded ||
         concurrent_text != concurrent_sentinel) {
         std::cerr
             << "FAIL: rollback overwrote a newer concurrent clipboard "
                "publisher; error="
-            << airshot::to_utf8(copy_error) << '\n';
+            << airshot::to_utf8(copy_error)
+            << ", observed="
+            << publisher_observed_forward_set.load(std::memory_order_acquire)
+            << ", published="
+            << publisher_succeeded.load(std::memory_order_acquire)
+            << ", read=" << concurrent_read_succeeded
+            << ", publisher sequence=" << published_sequence
+            << ", final sequence=" << final_sequence
+            << ", final text=" << airshot::to_utf8(concurrent_text) << '\n';
         return 1;
     }
 

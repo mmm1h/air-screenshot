@@ -20,32 +20,139 @@ pub const SUPPORTED_PROFILES: [&str; 3] = [
     "rapidocr-v4-compat",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionThreadPlan {
+    pub intra_threads: usize,
+    pub inter_threads: usize,
+}
+
+pub fn session_thread_plan(requested_threads: usize) -> SessionThreadPlan {
+    SessionThreadPlan {
+        intra_threads: requested_threads.clamp(1, 4),
+        // Detection, classification and recognition sessions are invoked
+        // serially, so a second inter-op pool only oversubscribes the CPU.
+        inter_threads: 1,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProfileSettings {
     pub tile_size: u32,
     pub detection_limit: u32,
+    pub padding: u32,
+    pub box_score_threshold: f32,
+    pub box_threshold: f32,
+    pub unclip_ratio: f32,
     pub text_score: f32,
+    pub initial_angle_detection: bool,
+    pub angle_rollback_threshold: f32,
+    pub retry_low_confidence: bool,
+    pub retry_angle_detection: bool,
+    pub retry_score_threshold: f64,
+    pub retry_minimum_score_gain: f64,
+    pub retry_contrast: f32,
 }
 
 pub fn profile_settings(profile: &str) -> Option<ProfileSettings> {
     match profile {
         "rapidocr-v5-fast" => Some(ProfileSettings {
-            tile_size: 2048,
+            // Keep the tile at or below the detector limit. Otherwise
+            // paddle-ocr-rs silently downsizes an image that the host has
+            // already enlarged for small screen text.
+            tile_size: 1536,
             detection_limit: 1536,
+            padding: 50,
+            box_score_threshold: 0.50,
+            box_threshold: 0.30,
+            unclip_ratio: 1.60,
             text_score: 0.50,
+            initial_angle_detection: false,
+            angle_rollback_threshold: 0.90,
+            retry_low_confidence: false,
+            retry_angle_detection: false,
+            retry_score_threshold: 0.0,
+            retry_minimum_score_gain: 0.0,
+            retry_contrast: 0.0,
         }),
         "rapidocr-v5-accurate" => Some(ProfileSettings {
-            tile_size: 3072,
+            tile_size: 2048,
             detection_limit: 2048,
-            text_score: 0.50,
+            padding: 64,
+            // The accurate profile deliberately favors recall. These values
+            // are isolated here so a checked-in OCR corpus can calibrate them
+            // without changing the inference pipeline.
+            box_score_threshold: 0.45,
+            box_threshold: 0.25,
+            unclip_ratio: 1.70,
+            text_score: 0.45,
+            initial_angle_detection: false,
+            angle_rollback_threshold: 0.90,
+            retry_low_confidence: true,
+            retry_angle_detection: true,
+            retry_score_threshold: 0.80,
+            retry_minimum_score_gain: 0.03,
+            retry_contrast: 18.0,
         }),
         "rapidocr-v4-compat" => Some(ProfileSettings {
-            tile_size: 2048,
+            tile_size: 1536,
             detection_limit: 1536,
+            padding: 50,
+            box_score_threshold: 0.50,
+            box_threshold: 0.30,
+            unclip_ratio: 1.60,
             text_score: 0.50,
+            // Preserve the previous always-on classifier behavior only in the
+            // compatibility profile. Fast and accurate keep the common
+            // horizontal-screen-text path free of classifier inference.
+            initial_angle_detection: true,
+            angle_rollback_threshold: 0.80,
+            retry_low_confidence: false,
+            retry_angle_detection: false,
+            retry_score_threshold: 0.0,
+            retry_minimum_score_gain: 0.0,
+            retry_contrast: 0.0,
         }),
         _ => None,
     }
+}
+
+pub fn mean_block_score(blocks: &[OcrBlock]) -> Option<f64> {
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(blocks.iter().map(|block| block.score).sum::<f64>() / blocks.len() as f64)
+}
+
+pub fn should_retry_recognition(blocks: &[OcrBlock], settings: ProfileSettings) -> bool {
+    settings.retry_low_confidence
+        && mean_block_score(blocks).is_none_or(|score| score < settings.retry_score_threshold)
+}
+
+pub fn retry_result_is_better(
+    primary: &[OcrBlock],
+    retry: &[OcrBlock],
+    settings: ProfileSettings,
+) -> bool {
+    let Some(retry_score) = mean_block_score(retry) else {
+        return false;
+    };
+    let Some(primary_score) = mean_block_score(primary) else {
+        return retry_score >= f64::from(settings.text_score);
+    };
+
+    // Do not trade most of the recognized content for a marginal confidence
+    // increase. Character coverage and the minimum gain are intentionally
+    // simple, deterministic knobs for later corpus calibration.
+    let primary_characters = primary
+        .iter()
+        .map(|block| block.text.chars().count())
+        .sum::<usize>();
+    let retry_characters = retry
+        .iter()
+        .map(|block| block.text.chars().count())
+        .sum::<usize>();
+    retry_characters.saturating_mul(4) >= primary_characters.saturating_mul(3)
+        && retry_score >= primary_score + settings.retry_minimum_score_gain
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -666,15 +773,63 @@ mod tests {
             profile_settings("rapidocr-v5-fast")
                 .expect("fast")
                 .tile_size,
-            2048
+            1536
         );
-        assert_eq!(
-            profile_settings("rapidocr-v5-accurate")
-                .expect("accurate")
-                .detection_limit,
-            2048
-        );
+        for profile in SUPPORTED_PROFILES {
+            let settings = profile_settings(profile).expect("supported profile");
+            assert_eq!(settings.tile_size, settings.detection_limit);
+            assert!(settings.tile_size > TILE_OVERLAP);
+            assert!(settings.detection_limit <= 2048);
+        }
         assert!(profile_settings("unknown").is_none());
+    }
+
+    #[test]
+    fn session_thread_plan_avoids_inter_op_oversubscription() {
+        assert_eq!(
+            session_thread_plan(0),
+            SessionThreadPlan {
+                intra_threads: 1,
+                inter_threads: 1,
+            }
+        );
+        assert_eq!(session_thread_plan(3).intra_threads, 3);
+        assert_eq!(session_thread_plan(32).intra_threads, 4);
+        assert_eq!(session_thread_plan(32).inter_threads, 1);
+    }
+
+    #[test]
+    fn profiles_keep_angle_and_retry_work_off_the_fast_path() {
+        let fast = profile_settings("rapidocr-v5-fast").expect("fast");
+        let accurate = profile_settings("rapidocr-v5-accurate").expect("accurate");
+        let compat = profile_settings("rapidocr-v4-compat").expect("compat");
+
+        assert!(!fast.initial_angle_detection);
+        assert!(!fast.retry_low_confidence);
+        assert!(accurate.retry_low_confidence);
+        assert!(accurate.retry_angle_detection);
+        assert!(accurate.box_score_threshold < fast.box_score_threshold);
+        assert!(accurate.box_threshold < fast.box_threshold);
+        assert!(compat.initial_angle_detection);
+        assert!(!compat.retry_low_confidence);
+    }
+
+    #[test]
+    fn accurate_retry_is_bounded_by_confidence_and_character_coverage() {
+        let accurate = profile_settings("rapidocr-v5-accurate").expect("accurate");
+        let fast = profile_settings("rapidocr-v5-fast").expect("fast");
+        let weak = vec![block(0.0, 0.0, 100.0, 20.0, "abcdefgh", 0.60)];
+        let strong = vec![block(0.0, 0.0, 100.0, 20.0, "abcdefgh", 0.90)];
+        let truncated = vec![block(0.0, 0.0, 40.0, 20.0, "abc", 0.95)];
+
+        assert!(should_retry_recognition(&[], accurate));
+        assert!(should_retry_recognition(&weak, accurate));
+        assert!(!should_retry_recognition(&strong, accurate));
+        assert!(!should_retry_recognition(&weak, fast));
+        assert!(retry_result_is_better(&[], &strong, accurate));
+        assert!(retry_result_is_better(&weak, &strong, accurate));
+        assert!(!retry_result_is_better(&weak, &truncated, accurate));
+        assert!(!retry_result_is_better(&strong, &weak, accurate));
     }
 
     #[test]

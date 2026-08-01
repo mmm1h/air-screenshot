@@ -63,6 +63,7 @@ constexpr UINT kMenuPinFile = 2010;
 constexpr UINT kMenuHideAllPins = 2011;
 constexpr UINT kMenuShowAllPins = 2012;
 constexpr UINT kMenuRepeatCapture = 2013;
+constexpr UINT kMenuShowRecentPin = 2014;
 constexpr UINT_PTR kShutdownDrainTimer = 1;
 constexpr UINT_PTR kTransientIdleTimer = 2;
 constexpr UINT_PTR kUpdateTimer = 3;
@@ -696,6 +697,12 @@ bool HostApp::commit_config(AppConfig next, std::wstring* error) {
 
     config_ = std::move(next);
     apply_app_icon_to_window(window_, config_.app_icon);
+    for (const auto& pin : pin_windows_) {
+        if (pin) {
+            pin->set_click_through_available(
+                config_.tray_icon_visible);
+        }
+    }
     return true;
 }
 
@@ -1116,9 +1123,25 @@ void HostApp::show_tray_menu() {
             AppendMenuW(menu, MF_STRING, kMenuHideAllPins, L"隐藏所有贴图");
         }
         if (counts.hidden > 0) {
-            AppendMenuW(menu, MF_STRING, kMenuShowAllPins, L"显示所有隐藏贴图");
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                kMenuShowRecentPin,
+                L"显示最近隐藏的贴图");
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                kMenuShowAllPins,
+                L"显示所有隐藏贴图");
         }
-        AppendMenuW(menu, MF_STRING, kMenuCloseAllPins, L"销毁所有贴图");
+        AppendMenuW(
+            menu,
+            MF_STRING |
+                (pin_bulk_destroy_confirmation_active_
+                     ? MF_GRAYED
+                     : 0U),
+            kMenuCloseAllPins,
+            L"永久销毁所有贴图…");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuExit, strings::tray_exit.data());
@@ -1165,12 +1188,6 @@ bool HostApp::show_settings() {
                 return;
             }
 
-            for (const auto& pin : pin_windows_) {
-                if (pin) {
-                    pin->set_click_through_available(
-                        config_.tray_icon_visible);
-                }
-            }
             mode_ = UiMode::idle;
             if (transient_.load(std::memory_order_acquire)) {
                 if (config_.shell_enabled) {
@@ -2605,12 +2622,22 @@ CommandResponse HostApp::toggle_pin_interaction() {
     }
 
     const int restored = restore_pin_interaction();
+    const int shown = show_most_recent_hidden_pin();
     CommandResponse response;
-    response.message = restored > 0
-                           ? std::format(
-                                 L"光标下没有贴图，已恢复 {} 张贴图的鼠标交互。",
-                                 restored)
-                           : L"光标下没有贴图，也没有需要恢复交互的贴图。";
+    if (restored > 0 && shown > 0) {
+        response.message = std::format(
+            L"光标下没有贴图，已恢复 {} 张贴图的鼠标交互，并显示最近隐藏的贴图。",
+            restored);
+    } else if (restored > 0) {
+        response.message = std::format(
+            L"光标下没有贴图，已恢复 {} 张贴图的鼠标交互。",
+            restored);
+    } else if (shown > 0) {
+        response.message = L"光标下没有贴图，已显示最近隐藏的贴图。";
+    } else {
+        response.message =
+            L"光标下没有贴图，也没有需要恢复的贴图。";
+    }
     return response;
 }
 
@@ -2640,6 +2667,26 @@ int HostApp::hide_all_pins() {
     return hidden_count;
 }
 
+int HostApp::show_most_recent_hidden_pin() {
+    prune_closed_pin_windows();
+    PinWindow* most_recent = nullptr;
+    std::uint64_t most_recent_order = 0;
+    for (const auto& pin : pin_windows_) {
+        if (!pin || !pin->hidden()) {
+            continue;
+        }
+        if (!most_recent || pin->hidden_order() > most_recent_order) {
+            most_recent = pin.get();
+            most_recent_order = pin->hidden_order();
+        }
+    }
+    if (!most_recent) {
+        return 0;
+    }
+    most_recent->request_show();
+    return 1;
+}
+
 int HostApp::show_all_pins() {
     prune_closed_pin_windows();
     int shown_count = 0;
@@ -2650,6 +2697,21 @@ int HostApp::show_all_pins() {
         }
     }
     return shown_count;
+}
+
+bool HostApp::confirm_destroy_all_pins(std::size_t pin_count) const {
+    if (pin_count == 0) {
+        return false;
+    }
+    const std::wstring message = std::format(
+        L"要永久销毁全部 {} 张贴图吗？\n\n销毁后无法从托盘恢复。",
+        pin_count);
+    return MessageBoxW(
+               window_,
+               message.c_str(),
+               L"永久销毁全部贴图",
+               MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 |
+                   MB_SETFOREGROUND) == IDYES;
 }
 
 CommandResponse HostApp::output_bitmap(Bitmap bitmap,
@@ -2699,9 +2761,10 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
         return 0;
     }
     if (message == WM_PIN_WINDOW_CLOSED) {
-        auto* pin_ptr = reinterpret_cast<PinWindow*>(l_param);
-        std::erase_if(pin_windows_, [pin_ptr](const auto& pin) {
-            return pin.get() == pin_ptr;
+        const std::uint64_t pin_identifier =
+            static_cast<std::uint64_t>(l_param);
+        std::erase_if(pin_windows_, [pin_identifier](const auto& pin) {
+            return pin && pin->identifier() == pin_identifier;
         });
         maybe_finish_shutdown();
         return 0;
@@ -2874,14 +2937,49 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
                 }
                 break;
             case kMenuAbout: (void)show_about(); break;
-            case kMenuCloseAllPins:
-                for (const auto& pin : pin_windows_) {
-                    pin->request_close();
-                }
+            case kMenuCloseAllPins: {
                 prune_closed_pin_windows();
+                if (!can_begin_pin_bulk_destroy(
+                        pin_bulk_destroy_confirmation_active_,
+                        pin_windows_.size())) {
+                    break;
+                }
+                std::vector<std::uint64_t> identifiers;
+                identifiers.reserve(pin_windows_.size());
+                for (const auto& pin : pin_windows_) {
+                    if (pin) {
+                        identifiers.push_back(pin->identifier());
+                    }
+                }
+
+                pin_bulk_destroy_confirmation_active_ = true;
+                bool confirmed = false;
+                try {
+                    confirmed = confirm_destroy_all_pins(
+                        identifiers.size());
+                } catch (...) {
+                    pin_bulk_destroy_confirmation_active_ = false;
+                    throw;
+                }
+                pin_bulk_destroy_confirmation_active_ = false;
+
+                if (confirmed) {
+                    for (const auto& pin : pin_windows_) {
+                        if (pin && pin_destroy_snapshot_contains(
+                                       identifiers,
+                                       pin->identifier())) {
+                            pin->request_close();
+                        }
+                    }
+                    prune_closed_pin_windows();
+                }
                 break;
+            }
             case kMenuHideAllPins:
                 (void)hide_all_pins();
+                break;
+            case kMenuShowRecentPin:
+                (void)show_most_recent_hidden_pin();
                 break;
             case kMenuShowAllPins:
                 (void)show_all_pins();

@@ -10,6 +10,7 @@
 
 #include "../src/core/overlay_types.h"
 #include "../src/core/overlay_annotation_history.h"
+#include "../src/core/overlay_refresh.h"
 
 #include <winrt/base.h>
 
@@ -98,6 +99,46 @@ void test_rect_and_bitmap() {
 bool same_rect(const airshot::RectI& first, const airshot::RectI& second) {
     return first.left == second.left && first.top == second.top &&
            first.right == second.right && first.bottom == second.bottom;
+}
+
+bool same_annotation(
+    const airshot::overlay_detail::Annotation& first,
+    const airshot::overlay_detail::Annotation& second) {
+    if (first.tool != second.tool ||
+        first.start.x != second.start.x || first.start.y != second.start.y ||
+        first.end.x != second.end.x || first.end.y != second.end.y ||
+        first.text != second.text || first.color != second.color ||
+        first.width != second.width || first.alpha != second.alpha ||
+        first.serial != second.serial ||
+        first.text_style != second.text_style ||
+        first.fill_style != second.fill_style ||
+        first.stroke_pattern != second.stroke_pattern ||
+        first.arrow_head_style != second.arrow_head_style ||
+        first.rounded_rectangle != second.rounded_rectangle ||
+        !same_rect(
+            first.measured_text_bounds,
+            second.measured_text_bounds) ||
+        first.points.size() != second.points.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < first.points.size(); ++index) {
+        if (first.points[index].x != second.points[index].x ||
+            first.points[index].y != second.points[index].y) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool same_annotations(
+    const std::vector<airshot::overlay_detail::Annotation>& first,
+    const std::vector<airshot::overlay_detail::Annotation>& second) {
+    return first.size() == second.size() &&
+           std::equal(
+               first.begin(),
+               first.end(),
+               second.begin(),
+               same_annotation);
 }
 
 void test_window_candidate_hierarchy() {
@@ -237,6 +278,9 @@ void test_annotation_geometry_and_history() {
             12.0F) == 6.0F &&
             airshot::overlay_detail::tool_cursor_radius(
                 Tool::mosaic,
+                12.0F) == 42.0F &&
+            airshot::overlay_detail::tool_cursor_radius(
+                Tool::redact,
                 12.0F) == 42.0F &&
             airshot::overlay_detail::tool_cursor_radius(
                 Tool::highlight,
@@ -430,6 +474,68 @@ void test_annotation_geometry_and_history() {
         centered_resize.left == 10 && centered_resize.top == 15 &&
             centered_resize.right == 70 && centered_resize.bottom == 45,
         L"Alt resizes an existing capture corner around the selection center");
+
+    const auto locked_side_resize =
+        airshot::overlay_detail::resize_selection_from_edge(
+            airshot::RectI{10, 10, 50, 30},
+            airshot::overlay_detail::DragMode::right,
+            POINT{70, 20},
+            airshot::RectI{0, 0, 100, 100},
+            true);
+    expect(
+        locked_side_resize.left == 10 && locked_side_resize.top == 5 &&
+            locked_side_resize.right == 70 &&
+            locked_side_resize.bottom == 35,
+        L"persistent ratio lock applies to capture side handles");
+
+    const auto locked_top_resize =
+        airshot::overlay_detail::resize_selection_from_edge(
+            airshot::RectI{10, 10, 50, 30},
+            airshot::overlay_detail::DragMode::top,
+            POINT{30, 0},
+            airshot::RectI{0, 0, 100, 100},
+            true);
+    expect(
+        locked_top_resize.left == 0 && locked_top_resize.top == 0 &&
+            locked_top_resize.right == 60 &&
+            locked_top_resize.bottom == 30,
+        L"persistent ratio lock centres the orthogonal edge axis");
+
+    const auto free_side_resize =
+        airshot::overlay_detail::resize_selection_from_edge(
+            airshot::RectI{10, 10, 50, 30},
+            airshot::overlay_detail::DragMode::right,
+            POINT{80, 20},
+            airshot::RectI{0, 0, 100, 100},
+            false);
+    expect(
+        free_side_resize.left == 10 && free_side_resize.top == 10 &&
+            free_side_resize.right == 80 &&
+            free_side_resize.bottom == 30,
+        L"unlocked side handles preserve their original one-axis behaviour");
+
+    const double locked_ratio = 16.0 / 9.0;
+    const auto first_precise_ratio_resize =
+        airshot::overlay_detail::resize_selection_from_edge(
+            airshot::RectI{10, 10, 170, 100},
+            airshot::overlay_detail::DragMode::right,
+            POINT{171, 55},
+            airshot::RectI{0, 0, 400, 300},
+            true,
+            locked_ratio);
+    const auto second_precise_ratio_resize =
+        airshot::overlay_detail::resize_selection_from_edge(
+            first_precise_ratio_resize,
+            airshot::overlay_detail::DragMode::right,
+            POINT{172, 55},
+            airshot::RectI{0, 0, 400, 300},
+            true,
+            locked_ratio);
+    expect(
+        first_precise_ratio_resize.height() == 91 &&
+            second_precise_ratio_resize.width() == 162 &&
+            second_precise_ratio_resize.height() == 91,
+        L"persistent ratio lock keeps its original ratio across rounded pixel edits");
 
     const std::vector<POINT> long_stroke{{0, 0}, {100, 0}};
     const auto capped_stroke =
@@ -703,6 +809,412 @@ void test_annotation_geometry_and_history() {
         L"annotation duplication uses a visible in-bounds offset");
 }
 
+void test_product_eraser_geometry_and_history() {
+    using airshot::overlay_detail::Annotation;
+    using airshot::overlay_detail::AnnotationHistory;
+    using airshot::overlay_detail::EraserMode;
+    using airshot::overlay_detail::StrokePattern;
+    using airshot::overlay_detail::TextStyle;
+    using airshot::overlay_detail::Tool;
+
+    const float small_radius =
+        airshot::overlay_detail::tool_visual_radius(Tool::eraser, 2.0F);
+    const float medium_radius =
+        airshot::overlay_detail::tool_visual_radius(Tool::eraser, 4.0F);
+    const float large_radius =
+        airshot::overlay_detail::tool_visual_radius(Tool::eraser, 8.0F);
+    expect(
+        small_radius == 6.0F && medium_radius == 10.0F &&
+            large_radius == 18.0F && small_radius < medium_radius &&
+            medium_radius < large_radius &&
+            airshot::overlay_detail::tool_cursor_radius(
+                Tool::eraser, 2.0F) == small_radius &&
+            airshot::overlay_detail::tool_cursor_radius(
+                Tool::eraser, 4.0F) == medium_radius &&
+            airshot::overlay_detail::tool_cursor_radius(
+                Tool::eraser, 8.0F) == large_radius,
+        L"small, medium, and large erasers have distinct matching cursor and hit radii");
+
+    Annotation sparse_pen;
+    sparse_pen.tool = Tool::pen;
+    sparse_pen.start = {0, 0};
+    sparse_pen.end = {100, 0};
+    sparse_pen.points = {{0, 0}, {100, 0}};
+    sparse_pen.color = RGB(12, 34, 56);
+    sparse_pen.width = 2.0F;
+    sparse_pen.alpha = 137;
+    sparse_pen.text_style = TextStyle::outline;
+    sparse_pen.stroke_pattern = StrokePattern::dashed;
+    sparse_pen.rounded_rectangle = true;
+
+    const auto crossed =
+        airshot::overlay_detail::split_annotation_by_eraser_sweep(
+            sparse_pen,
+            POINT{50, -30},
+            POINT{50, 30},
+            5.0);
+    expect(
+        crossed.changed && crossed.fragments.size() == 2 &&
+            crossed.fragments[0].points.front().x == 0 &&
+            crossed.fragments[0].points.back().x == 44 &&
+            crossed.fragments[1].points.front().x == 56 &&
+            crossed.fragments[1].points.back().x == 100,
+        L"a swept circle cuts a sparse long stroke without pointer-sample tunnelling");
+    expect(
+        std::ranges::all_of(
+            crossed.fragments,
+            [&](const Annotation& fragment) {
+                return fragment.tool == sparse_pen.tool &&
+                       fragment.start.x == fragment.points.front().x &&
+                       fragment.start.y == fragment.points.front().y &&
+                       fragment.end.x == fragment.points.back().x &&
+                       fragment.end.y == fragment.points.back().y &&
+                       fragment.color == sparse_pen.color &&
+                       fragment.width == sparse_pen.width &&
+                       fragment.alpha == sparse_pen.alpha &&
+                       fragment.text_style == sparse_pen.text_style &&
+                       fragment.stroke_pattern ==
+                           sparse_pen.stroke_pattern &&
+                       fragment.rounded_rectangle ==
+                           sparse_pen.rounded_rectangle &&
+                       airshot::overlay_detail::annotation_is_committable(
+                           fragment);
+            }),
+        L"every retained eraser fragment keeps valid endpoints and all source styles");
+
+    Annotation tangent_pen = sparse_pen;
+    tangent_pen.start = {0, 6};
+    tangent_pen.end = {100, 6};
+    tangent_pen.points = {{0, 6}, {100, 6}};
+    const auto tangent =
+        airshot::overlay_detail::split_annotation_by_eraser_sweep(
+            tangent_pen,
+            POINT{50, 0},
+            POINT{50, 0},
+            5.0);
+    expect(
+        !tangent.changed && tangent.fragments.empty(),
+        L"a zero-area tangent contact leaves a stroke stable and unsplit");
+
+    std::vector<Annotation> tangent_document{tangent_pen};
+    const Annotation* const tangent_document_data = tangent_document.data();
+    const POINT* const tangent_points_data =
+        tangent_document.front().points.data();
+    const auto tangent_sweep =
+        airshot::overlay_detail::erase_annotations_with_sweep(
+            tangent_document,
+            POINT{50, 0},
+            POINT{50, 0},
+            5.0,
+            EraserMode::local_stroke,
+            0);
+    expect(
+        !tangent_sweep.changed &&
+            !tangent_sweep.document_materialized &&
+            tangent_sweep.untouched_annotations_copied == 0 &&
+            tangent_sweep.bounds_rejected_annotations == 0 &&
+            tangent_sweep.local_split_attempts == 1 &&
+            tangent_sweep.selected_annotation_idx == 0 &&
+            tangent_document.data() == tangent_document_data &&
+            tangent_document.front().points.data() == tangent_points_data,
+        L"a bounds-overlapping no-hit sweep performs geometry without materializing an annotation document");
+
+    const auto endpoint =
+        airshot::overlay_detail::split_annotation_by_eraser_sweep(
+            sparse_pen,
+            POINT{0, 0},
+            POINT{0, 0},
+            5.0);
+    expect(
+        endpoint.changed && endpoint.fragments.size() == 1 &&
+            endpoint.fragments.front().start.x == 6 &&
+            endpoint.fragments.front().end.x == 100,
+        L"erasing a stroke endpoint retains one valid shortened fragment");
+
+    const auto missed =
+        airshot::overlay_detail::split_annotation_by_eraser_sweep(
+            sparse_pen,
+            POINT{0, 30},
+            POINT{100, 30},
+            5.0);
+    expect(
+        !missed.changed && missed.fragments.empty(),
+        L"an empty local-eraser sweep does not rewrite the annotation");
+
+    Annotation dot = sparse_pen;
+    dot.start = {40, 40};
+    dot.end = dot.start;
+    dot.points = {dot.start};
+    const auto erased_dot =
+        airshot::overlay_detail::split_annotation_by_eraser_sweep(
+            dot,
+            POINT{20, 40},
+            POINT{60, 40},
+            2.0);
+    const auto retained_dot =
+        airshot::overlay_detail::split_annotation_by_eraser_sweep(
+            dot,
+            POINT{20, 60},
+            POINT{60, 60},
+            2.0);
+    expect(
+        erased_dot.changed && erased_dot.fragments.empty() &&
+            !retained_dot.changed && retained_dot.fragments.empty(),
+        L"single-point strokes are safely removed or retained by the swept circle");
+
+    Annotation weaving = sparse_pen;
+    weaving.points = {
+        {0, 0}, {100, 0}, {0, 20}, {100, 20}};
+    weaving.start = weaving.points.front();
+    weaving.end = weaving.points.back();
+    const auto repeated_crossings =
+        airshot::overlay_detail::split_annotation_by_eraser_sweep(
+            weaving,
+            POINT{50, -5},
+            POINT{50, 25},
+            3.0);
+    expect(
+        repeated_crossings.changed &&
+            repeated_crossings.fragments.size() == 4 &&
+            std::ranges::all_of(
+                repeated_crossings.fragments,
+                [](const Annotation& fragment) {
+                    return !fragment.points.empty() &&
+                           fragment.start.x == fragment.points.front().x &&
+                           fragment.start.y == fragment.points.front().y &&
+                           fragment.end.x == fragment.points.back().x &&
+                           fragment.end.y == fragment.points.back().y;
+                }),
+        L"one sweep can safely split a repeatedly crossing polyline into multiple valid pieces");
+
+    Annotation pathological = sparse_pen;
+    pathological.points.clear();
+    pathological.points.reserve(
+        airshot::overlay_detail::kMaximumEraserFragments + 100);
+    for (std::size_t index = 0;
+         index < airshot::overlay_detail::kMaximumEraserFragments + 100;
+         ++index) {
+        pathological.points.push_back({
+            index % 2 == 0 ? 0L : 100L,
+            static_cast<long>(index),
+        });
+    }
+    pathological.start = pathological.points.front();
+    pathological.end = pathological.points.back();
+    const auto bounded_fragments =
+        airshot::overlay_detail::split_annotation_by_eraser_sweep(
+            pathological,
+            POINT{50, -10},
+            POINT{
+                50,
+                static_cast<long>(pathological.points.size() + 10)},
+            1.0);
+    expect(
+        bounded_fragments.changed &&
+            bounded_fragments.fragments.size() <=
+                airshot::overlay_detail::kMaximumEraserFragments,
+        L"pathological repeated crossings cannot create an unbounded fragment set");
+
+    std::vector<Annotation> fragment_heavy_document(
+        airshot::overlay_detail::kMaximumEraserDocumentFragments / 2 + 1,
+        sparse_pen);
+    const std::size_t fragment_heavy_source_count =
+        fragment_heavy_document.size();
+    const auto bounded_document =
+        airshot::overlay_detail::erase_annotations_with_sweep(
+            fragment_heavy_document,
+            POINT{50, -20},
+            POINT{50, 20},
+            5.0,
+            EraserMode::local_stroke,
+            static_cast<int>(fragment_heavy_source_count - 1));
+    expect(
+        bounded_document.changed && fragment_heavy_document.empty() &&
+            bounded_document.affected_annotations ==
+                fragment_heavy_source_count &&
+            bounded_document.selected_annotation_idx == -1,
+        L"a document-wide fragment budget atomically falls back to whole-object deletion without a partial result");
+
+    Annotation oversized_input = sparse_pen;
+    oversized_input.points.assign(
+        airshot::overlay_detail::kMaximumEraserInputPoints + 1,
+        POINT{0, 0});
+    oversized_input.start = oversized_input.points.front();
+    oversized_input.end = oversized_input.points.back();
+    const auto bounded_input =
+        airshot::overlay_detail::split_annotation_by_eraser_sweep(
+            oversized_input,
+            POINT{0, 0},
+            POINT{0, 0},
+            5.0);
+    expect(
+        !bounded_input.changed && bounded_input.fragments.empty(),
+        L"local erasing refuses annotation inputs beyond the product point cap");
+
+    Annotation distant_large_stroke = sparse_pen;
+    distant_large_stroke.points.clear();
+    distant_large_stroke.points.reserve(100000);
+    for (long index = 0; index < 100000; ++index) {
+        distant_large_stroke.points.push_back({index, index % 7});
+    }
+    distant_large_stroke.start = distant_large_stroke.points.front();
+    distant_large_stroke.end = distant_large_stroke.points.back();
+    const bool distant_bounds_overlap =
+        airshot::overlay_detail::eraser_sweep_overlaps_annotation_bounds(
+            distant_large_stroke,
+            POINT{0, 1000000},
+            POINT{100000, 1000000},
+            18.0);
+    const auto distant_rejection =
+        airshot::overlay_detail::split_annotation_by_eraser_sweep(
+            distant_large_stroke,
+            POINT{0, 1000000},
+            POINT{100000, 1000000},
+            18.0);
+    expect(
+        !distant_bounds_overlap && !distant_rejection.changed &&
+            distant_rejection.fragments.empty(),
+        L"a distant 100k-point stroke is rejected by bounds before capsule parsing");
+
+    Annotation privacy_box;
+    privacy_box.tool = Tool::blur;
+    privacy_box.start = {10, 10};
+    privacy_box.end = {40, 40};
+    privacy_box.width = 4.0F;
+    privacy_box.alpha = 50;
+    std::vector<Annotation> privacy_document{privacy_box};
+    const auto erased_privacy_box =
+        airshot::overlay_detail::erase_annotations_with_sweep(
+            privacy_document,
+            POINT{25, 25},
+            POINT{25, 25},
+            3.0,
+            EraserMode::local_stroke,
+            0);
+    expect(
+        erased_privacy_box.changed && privacy_document.empty() &&
+            erased_privacy_box.selected_annotation_idx == -1,
+        L"local mode still deletes rectangular effects as complete objects");
+
+    Annotation first_serial;
+    first_serial.tool = Tool::serial;
+    first_serial.start = {0, 50};
+    first_serial.end = first_serial.start;
+    first_serial.width = 4.0F;
+    first_serial.serial = 4;
+    Annotation second_serial = first_serial;
+    second_serial.start = {100, 50};
+    second_serial.end = second_serial.start;
+    second_serial.serial = 9;
+    std::vector<Annotation> indexed_document{
+        first_serial, sparse_pen, second_serial};
+    const auto indexed_erase =
+        airshot::overlay_detail::erase_annotations_with_sweep(
+            indexed_document,
+            POINT{50, -20},
+            POINT{50, 20},
+            5.0,
+            EraserMode::local_stroke,
+            2);
+    expect(
+        indexed_erase.changed && indexed_document.size() == 4 &&
+            indexed_erase.selected_annotation_idx == 3 &&
+            indexed_document[0].serial == 1 &&
+            indexed_document[3].serial == 2,
+        L"fragment insertion remaps an untouched selection and keeps serial numbering continuous");
+
+    Annotation middle_serial = first_serial;
+    middle_serial.start = {20, 50};
+    middle_serial.end = middle_serial.start;
+    middle_serial.serial = 7;
+    second_serial.start = {100, 100};
+    second_serial.end = second_serial.start;
+    std::vector<Annotation> serial_document{
+        first_serial, middle_serial, second_serial};
+    const auto serial_delete =
+        airshot::overlay_detail::erase_annotations_with_sweep(
+            serial_document,
+            POINT{0, 50},
+            POINT{20, 50},
+            1.0,
+            EraserMode::object,
+            2);
+    expect(
+        serial_delete.changed &&
+            serial_delete.affected_annotations == 2 &&
+            serial_document.size() == 1 &&
+            serial_document.front().serial == 1 &&
+            serial_delete.selected_annotation_idx == 0,
+        L"object deletion remaps selection indices and renumbers surviving serial markers");
+
+    Annotation lower_pen = sparse_pen;
+    lower_pen.start = {0, 30};
+    lower_pen.end = {100, 30};
+    lower_pen.points = {{0, 30}, {100, 30}};
+    std::vector<Annotation> gesture_document{sparse_pen, lower_pen};
+    const std::vector<Annotation> gesture_before = gesture_document;
+    bool gesture_changed = false;
+    for (const long x : {30L, 70L}) {
+        const auto sweep =
+            airshot::overlay_detail::erase_annotations_with_sweep(
+                gesture_document,
+                POINT{x, -20},
+                POINT{x, 50},
+                4.0,
+                EraserMode::local_stroke);
+        gesture_changed = gesture_changed || sweep.changed;
+    }
+    const std::vector<Annotation> gesture_after = gesture_document;
+    AnnotationHistory gesture_history;
+    if (gesture_changed) {
+        gesture_history.record(gesture_before);
+    }
+    expect(
+        gesture_changed && gesture_after.size() == 6 &&
+            gesture_history.can_undo() &&
+            gesture_history.undo(gesture_document) &&
+            same_annotations(gesture_document, gesture_before) &&
+            !gesture_history.can_undo() &&
+            gesture_history.redo(gesture_document) &&
+            same_annotations(gesture_document, gesture_after),
+        L"multiple cuts in one press are restored by exactly one undo and redo step");
+
+    AnnotationHistory empty_gesture_history;
+    const std::vector<Annotation> empty_before = gesture_document;
+    const Annotation* const empty_document_data = gesture_document.data();
+    std::vector<const POINT*> empty_point_data;
+    empty_point_data.reserve(gesture_document.size());
+    for (const auto& annotation : gesture_document) {
+        empty_point_data.push_back(annotation.points.data());
+    }
+    const auto empty_sweep =
+        airshot::overlay_detail::erase_annotations_with_sweep(
+            gesture_document,
+            POINT{0, 500},
+            POINT{100, 500},
+            4.0,
+            EraserMode::local_stroke);
+    if (empty_sweep.changed) {
+        empty_gesture_history.record(empty_before);
+    }
+    expect(
+        !empty_sweep.changed && !empty_gesture_history.can_undo() &&
+            !empty_sweep.document_materialized &&
+            empty_sweep.untouched_annotations_copied == 0 &&
+            empty_sweep.bounds_rejected_annotations ==
+                gesture_document.size() &&
+            empty_sweep.local_split_attempts == 0 &&
+            gesture_document.data() == empty_document_data &&
+            std::ranges::equal(
+                gesture_document,
+                empty_point_data,
+                [](const Annotation& annotation, const POINT* points) {
+                    return annotation.points.data() == points;
+                }) &&
+            same_annotations(gesture_document, empty_before),
+        L"an all-bounds-rejected eraser gesture creates no history or annotation/point copies");
+}
+
 void test_repeat_region_and_selection_size_policy() {
     using airshot::DisplayMonitorGeometry;
     using airshot::LastRegionCapture;
@@ -723,6 +1235,59 @@ void test_repeat_region_and_selection_size_policy() {
         airshot::valid_display_topology_signature(signature) &&
             signature == airshot::display_topology_signature(reordered),
         L"display topology signature is valid and monitor-order independent");
+
+    std::vector<airshot::MonitorSnapshot> current_snapshots(2);
+    current_snapshots[0].bounds = {-4, 0, 0, 3};
+    current_snapshots[0].primary = false;
+    current_snapshots[0].device_name = L"LEFT";
+    current_snapshots[0].bitmap = airshot::Bitmap(4, 3);
+    current_snapshots[0].bitmap.pixels[0] = 11;
+    current_snapshots[1].bounds = {0, 0, 4, 3};
+    current_snapshots[1].primary = true;
+    current_snapshots[1].device_name = L"PRIMARY";
+    current_snapshots[1].bitmap = airshot::Bitmap(4, 3);
+    current_snapshots[1].bitmap.pixels[0] = 22;
+
+    std::vector<airshot::MonitorSnapshot> refreshed_snapshots(2);
+    refreshed_snapshots[0].bounds = current_snapshots[1].bounds;
+    refreshed_snapshots[0].primary = current_snapshots[1].primary;
+    refreshed_snapshots[0].device_name = current_snapshots[1].device_name;
+    refreshed_snapshots[0].bitmap = airshot::Bitmap(4, 3);
+    refreshed_snapshots[0].bitmap.pixels[0] = 42;
+    refreshed_snapshots[1].bounds = current_snapshots[0].bounds;
+    refreshed_snapshots[1].primary = current_snapshots[0].primary;
+    refreshed_snapshots[1].device_name = current_snapshots[0].device_name;
+    refreshed_snapshots[1].bitmap = airshot::Bitmap(4, 3);
+    refreshed_snapshots[1].bitmap.pixels[0] = 31;
+    expect(
+        airshot::overlay_detail::validate_snapshot_refresh(
+            current_snapshots,
+            refreshed_snapshots) ==
+            airshot::overlay_detail::SnapshotRefreshStatus::compatible &&
+            airshot::overlay_detail::apply_snapshot_refresh(
+                current_snapshots,
+                refreshed_snapshots) &&
+            current_snapshots[0].bitmap.pixels[0] == 31 &&
+            current_snapshots[1].bitmap.pixels[0] == 42,
+        L"F5 refresh matches monitor frames by identity instead of enumeration order");
+
+    std::vector<airshot::MonitorSnapshot> changed_snapshots(1);
+    changed_snapshots[0].bounds = {0, 0, 1280, 720};
+    changed_snapshots[0].primary = true;
+    changed_snapshots[0].device_name = L"PRIMARY";
+    changed_snapshots[0].bitmap = airshot::Bitmap(1280, 720);
+    const std::uint8_t preserved_pixel =
+        current_snapshots[0].bitmap.pixels[0];
+    expect(
+        airshot::overlay_detail::validate_snapshot_refresh(
+            current_snapshots,
+            changed_snapshots) ==
+            airshot::overlay_detail::SnapshotRefreshStatus::topology_changed &&
+            !airshot::overlay_detail::apply_snapshot_refresh(
+                current_snapshots,
+                changed_snapshots) &&
+            current_snapshots[0].bitmap.pixels[0] == preserved_pixel,
+        L"F5 refresh rejects topology changes without mutating the live screenshot");
     const auto desktop = airshot::display_topology_bounds(monitors);
     expect(
         desktop && same_rect(*desktop, {-1920, 0, 1920, 1080}),
@@ -951,8 +1516,131 @@ void test_repeat_region_and_selection_size_policy() {
         L"selection size badge safely adapts to very small synthetic desktops");
 }
 
+void test_text_box_layout_resize_and_rendering() {
+    using airshot::overlay_detail::Annotation;
+    using airshot::overlay_detail::AnnotationHandle;
+    using airshot::overlay_detail::AnnotationHistory;
+    using airshot::overlay_detail::TextStyle;
+    using airshot::overlay_detail::Tool;
+
+    expect(
+        airshot::overlay_detail::text_size_label_px(18.0F) == L"18px" &&
+            airshot::overlay_detail::text_size_label_px(200.0F) == L"96px",
+        L"text sizes are labelled and clamped as output-image pixels");
+    const UINT auto_flags = airshot::overlay_detail::text_draw_flags(0);
+    const UINT fixed_flags = airshot::overlay_detail::text_draw_flags(96);
+    expect(
+        (auto_flags & DT_WORDBREAK) == 0 &&
+            (fixed_flags & DT_WORDBREAK) != 0 &&
+            (fixed_flags & DT_EDITCONTROL) != 0 &&
+            (fixed_flags & DT_CALCRECT) == 0 &&
+            (airshot::overlay_detail::text_draw_flags(96, true) &
+             DT_CALCRECT) != 0,
+        L"GDI text measurement and rendering share explicit wrap flags");
+
+    Annotation text;
+    text.tool = Tool::text;
+    text.start = {20, 20};
+    text.end = text.start;
+    text.text = L"Air Screenshot";
+    text.width = 18.0F;
+    text.text_box_width_px = 100;
+    text.measured_text_layout_bounds = {20, 20, 120, 70};
+    text.measured_text_bounds = text.measured_text_layout_bounds;
+
+    const auto handles =
+        airshot::overlay_detail::annotation_control_handles(text);
+    bool has_left = false;
+    bool has_right = false;
+    bool has_top = false;
+    bool has_bottom = false;
+    for (const auto& handle : handles) {
+        has_left = has_left || handle.kind == AnnotationHandle::left;
+        has_right = has_right || handle.kind == AnnotationHandle::right;
+        has_top = has_top || handle.kind == AnnotationHandle::top;
+        has_bottom = has_bottom || handle.kind == AnnotationHandle::bottom;
+    }
+    expect(
+        handles.count == 6 && has_left && has_right &&
+            !has_top && !has_bottom,
+        L"selected text exposes side-width and four proportional corner handles");
+
+    const auto right_plan =
+        airshot::overlay_detail::plan_text_annotation_resize(
+            text,
+            AnnotationHandle::right,
+            POINT{170, 45},
+            400,
+            300);
+    expect(
+        right_plan.valid && right_plan.start.x == 20 &&
+            right_plan.font_size_px == 18.0F &&
+            right_plan.box_width_px == 150,
+        L"right text handle changes only the wrapping width");
+    const auto left_plan =
+        airshot::overlay_detail::plan_text_annotation_resize(
+            text,
+            AnnotationHandle::left,
+            POINT{0, 45},
+            400,
+            300);
+    expect(
+        left_plan.valid && left_plan.start.x == 0 &&
+            left_plan.box_width_px == 120 && left_plan.anchor_right,
+        L"left text handle preserves the opposite edge while changing width");
+
+    const auto corner_plan =
+        airshot::overlay_detail::plan_text_annotation_resize(
+            text,
+            AnnotationHandle::bottom_right,
+            POINT{220, 120},
+            400,
+            300);
+    expect(
+        corner_plan.valid && corner_plan.start.x == 20 &&
+            corner_plan.start.y == 20 &&
+            corner_plan.font_size_px == 36.0F &&
+            corner_plan.box_width_px == 200,
+        L"corner text handle proportionally changes font size and box width");
+    const auto capped_plan =
+        airshot::overlay_detail::plan_text_annotation_resize(
+            text,
+            AnnotationHandle::bottom_right,
+            POINT{400, 300},
+            400,
+            300);
+    expect(
+        capped_plan.valid && capped_plan.font_size_px <= 96.0F &&
+            capped_plan.start.x >= 0 &&
+            capped_plan.start.x + capped_plan.box_width_px <= 400,
+        L"text corner scaling respects font and canvas limits");
+
+    Annotation changed = text;
+    changed.width = 20.0F;
+    expect(
+        !airshot::overlay_detail::annotation_geometry_equal(text, changed),
+        L"text-only font changes participate in drag transactions");
+    changed = text;
+    changed.text_box_width_px = 140;
+    expect(
+        !airshot::overlay_detail::annotation_geometry_equal(text, changed),
+        L"text-only box-width changes participate in drag transactions");
+
+    std::vector<Annotation> document{text};
+    AnnotationHistory history;
+    history.record(document);
+    document.front().width = 36.0F;
+    document.front().text_box_width_px = 200;
+    expect(
+        history.undo(document) && document.front().width == 18.0F &&
+            document.front().text_box_width_px == 100,
+        L"one text transform history entry restores font and wrapping width");
+
+}
+
 void test_annotation_product_styles_and_toolbar_layout() {
     using airshot::overlay_detail::Annotation;
+    using airshot::overlay_detail::AnnotationHistory;
     using airshot::overlay_detail::ArrowHeadStyle;
     using airshot::overlay_detail::ShapeFillStyle;
     using airshot::overlay_detail::StrokePattern;
@@ -971,6 +1659,7 @@ void test_annotation_product_styles_and_toolbar_layout() {
     rectangle_style.rounded_rectangle = true;
     const auto& pen_style = styles.for_tool(Tool::pen);
     const auto& highlight_style = styles.for_tool(Tool::highlight);
+    const auto& redaction_style = styles.for_tool(Tool::redact);
     expect(
         rectangle_style.color == RGB(1, 2, 3) &&
             rectangle_style.width == 8.0F &&
@@ -980,7 +1669,8 @@ void test_annotation_product_styles_and_toolbar_layout() {
             pen_style.color == RGB(245, 34, 45) &&
             pen_style.width == 4.0F &&
             highlight_style.color == RGB(250, 219, 20) &&
-            highlight_style.highlight_alpha == 128,
+            highlight_style.highlight_alpha == 128 &&
+            redaction_style.color == RGB(0, 0, 0),
         L"each annotation tool keeps an independent style within one capture");
 
     const auto horizontal = airshot::overlay_detail::orthogonal_endpoint(
@@ -1078,6 +1768,60 @@ void test_annotation_product_styles_and_toolbar_layout() {
         !airshot::overlay_detail::annotation_is_committable(zero_effect),
         L"zero-strength mosaic and blur gestures are not committed");
 
+    Annotation degenerate_redaction;
+    degenerate_redaction.tool = Tool::redact;
+    degenerate_redaction.start = {10, 10};
+    degenerate_redaction.end = {11, 30};
+    Annotation redaction_box = degenerate_redaction;
+    redaction_box.end = {30, 20};
+    redaction_box.color = RGB(0, 0, 0);
+    redaction_box.width = 4.0F;
+    Annotation redaction_brush = redaction_box;
+    redaction_brush.points = {{5, 5}, {25, 5}};
+    redaction_brush.start = redaction_brush.points.front();
+    redaction_brush.end = redaction_brush.points.back();
+    redaction_brush.width = 2.0F;
+    expect(
+        !airshot::overlay_detail::annotation_is_committable(
+            degenerate_redaction) &&
+            airshot::overlay_detail::annotation_is_committable(
+                redaction_box) &&
+            airshot::overlay_detail::annotation_is_committable(
+                redaction_brush),
+        L"solid redaction rejects degenerate boxes and accepts intentional box or brush gestures");
+    expect(
+        airshot::overlay_detail::privacy_annotation_hit_test(
+            redaction_box, POINT{20, 15}) &&
+            airshot::overlay_detail::privacy_annotation_hit_test(
+                redaction_box, POINT{6, 15}) &&
+            !airshot::overlay_detail::privacy_annotation_hit_test(
+                redaction_box, POINT{5, 15}) &&
+            airshot::overlay_detail::privacy_annotation_hit_test(
+                redaction_brush, POINT{15, 16}) &&
+            !airshot::overlay_detail::privacy_annotation_hit_test(
+                redaction_brush, POINT{15, 17}),
+        L"solid redaction hit testing follows filled box and round brush boundaries");
+    expect(
+        airshot::overlay_detail::is_compact_palette_color(
+            RGB(245, 34, 45)) &&
+            !airshot::overlay_detail::is_compact_palette_color(
+                RGB(0, 0, 0)),
+        L"neutral picker colors remain represented by the compact custom swatch");
+
+    std::vector<Annotation> redaction_document;
+    AnnotationHistory redaction_history;
+    redaction_history.record(redaction_document);
+    redaction_document.push_back(redaction_brush);
+    expect(
+        redaction_history.undo(redaction_document) &&
+            redaction_document.empty() &&
+            redaction_history.redo(redaction_document) &&
+            redaction_document.size() == 1 &&
+            redaction_document.front().tool == Tool::redact &&
+            redaction_document.front().color == RGB(0, 0, 0) &&
+            redaction_document.front().points.size() == 2,
+        L"one solid-redaction gesture is restored atomically by undo and redo");
+
     Annotation hollow_rectangle;
     hollow_rectangle.tool = Tool::rectangle;
     hollow_rectangle.start = {10, 10};
@@ -1131,6 +1875,8 @@ void test_annotation_product_styles_and_toolbar_layout() {
             Tool::highlight) &&
             airshot::overlay_detail::tool_uses_bitmap_effect_preview(
                 Tool::mosaic) &&
+            airshot::overlay_detail::tool_uses_bitmap_effect_preview(
+                Tool::redact) &&
             !airshot::overlay_detail::tool_uses_bitmap_effect_preview(
                 Tool::pen),
         L"highlight preview uses the same bitmap effect pipeline as its committed render");
@@ -1145,11 +1891,13 @@ void test_annotation_product_styles_and_toolbar_layout() {
     expect(
         airshot::overlay_detail::effect_geometry_mode_available(
             Tool::mosaic, Tool::mosaic, false) &&
+            airshot::overlay_detail::effect_geometry_mode_available(
+                Tool::redact, Tool::redact, false) &&
             !airshot::overlay_detail::effect_geometry_mode_available(
                 Tool::select, Tool::mosaic, true) &&
             !airshot::overlay_detail::effect_geometry_mode_available(
                 Tool::select, Tool::blur, true),
-        L"existing mosaic and blur objects do not expose a silent no-op geometry mode switch");
+        L"new privacy tools expose geometry modes while selected privacy objects do not expose a silent no-op switch");
 
     Annotation styled_history;
     styled_history.tool = Tool::rectangle;
@@ -1199,18 +1947,17 @@ void test_annotation_product_styles_and_toolbar_layout() {
     const std::vector<std::pair<std::wstring, std::wstring>> rectangle_items{
         {L"width_small", L""}, {L"width_medium", L""},
         {L"width_large", L""}, {L"|", L""},
-        {L"color_red", L""}, {L"color_green", L""},
-        {L"color_blue", L""}, {L"color_yellow", L""},
-        {L"color_black", L""}, {L"color_gray", L""},
-        {L"color_white", L""}, {L"color_custom", L""},
-        {L"|", L""}, {L"fill_outline", L"空心"},
-        {L"fill_translucent", L"填充"}, {L"|", L""},
-        {L"corner_square", L"直角"}, {L"corner_round", L"圆角"},
-        {L"|", L""}, {L"stroke_solid", L"实线"},
-        {L"stroke_dashed", L"虚线"},
+        {L"color_red", L""}, {L"color_yellow", L""},
+        {L"color_green", L""}, {L"color_blue", L""},
+        {L"color_custom", L""}, {L"|", L""},
+        {L"fill_outline", L""}, {L"fill_translucent", L""},
+        {L"|", L""}, {L"corner_square", L""},
+        {L"corner_round", L""}, {L"|", L""},
+        {L"stroke_solid", L""}, {L"stroke_dashed", L""},
     };
     const auto verify_toolbar = [&](airshot::RectI monitor,
                                     ToolbarMetrics metrics,
+                                    bool expect_single_row,
                                     std::wstring_view message) {
         const auto rows = airshot::overlay_detail::wrap_toolbar_items(
             rectangle_items,
@@ -1241,23 +1988,47 @@ void test_annotation_product_styles_and_toolbar_layout() {
                        button.bounds.right <= monitor.right &&
                        button.bounds.bottom <= monitor.bottom;
             });
+        const bool full_hit_targets = std::ranges::all_of(
+            buttons,
+            [&](const ToolbarButton& button) {
+                return button.id == L"|" ||
+                       (button.bounds.width() >= metrics.button_width &&
+                        button.bounds.height() >= metrics.button_height);
+            });
         expect(
             !rows.empty() && !buttons.empty() && width <= monitor.width() &&
-                height <= monitor.height() && all_inside,
+                height <= monitor.height() && all_inside && full_hit_targets &&
+                (!expect_single_row || rows.size() == 1),
             message);
     };
-    verify_toolbar(
-        {0, 0, 1280, 720},
-        {36, 34, 4, 8},
-        L"expanded sub-toolbar fits a 1280 by 720 monitor");
-    verify_toolbar(
-        {-1280, -120, 0, 600},
-        {36, 34, 4, 8},
-        L"expanded sub-toolbar fits a negative-coordinate monitor");
-    verify_toolbar(
-        {0, 0, 1280, 720},
-        {54, 51, 6, 12},
-        L"expanded sub-toolbar remains bounded with 150 percent metrics");
+    for (const unsigned int dpi : {96U, 144U, 192U}) {
+        const airshot::overlay_detail::OverlayUiMetrics ui{dpi};
+        const ToolbarMetrics metrics{
+            ui.px(airshot::overlay_detail::kToolbarButtonDip),
+            ui.px(airshot::overlay_detail::kToolbarButtonDip),
+            ui.px(airshot::overlay_detail::kSubToolbarSpacingDip),
+            ui.px(airshot::overlay_detail::kSubToolbarPaddingDip),
+            dpi};
+        const auto wide_rows = airshot::overlay_detail::wrap_toolbar_items(
+            rectangle_items,
+            metrics,
+            {0, 0, ui.px(1280), ui.px(720)});
+        expect(
+            wide_rows.size() == 1 &&
+                airshot::overlay_detail::toolbar_width(wide_rows, metrics) <=
+                    ui.px(680),
+            L"rectangle property toolbar stays at or below 680 DIP at every supported DPI");
+        verify_toolbar(
+            {0, 0, ui.px(1280), ui.px(720)},
+            metrics,
+            true,
+            L"compact property toolbar keeps one row and 40-DIP hit targets");
+        verify_toolbar(
+            {-ui.px(520), -ui.px(120), 0, ui.px(360)},
+            metrics,
+            false,
+            L"compact property toolbar wraps inside a narrow negative-coordinate monitor");
+    }
 }
 
 void test_config() {
@@ -1318,7 +2089,7 @@ void test_config() {
                future->ocr_engine == airshot::kDefaultOcrEngine,
            L"config accepts unknown future fields and keeps annotation defaults");
     constexpr std::wstring_view normalized_legacy_toolbar_order =
-        L"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,highlight,watermark,text,serial,eraser,undo,redo,ocr,scroll,pin,save,close,copy";
+        L"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,redact,highlight,watermark,text,serial,eraser,undo,redo,ocr,scroll,pin,save,close,copy";
     const auto explicit_legacy_toolbar = airshot::config_from_json(
         LR"({"schemaVersion":2,"annotation":{"toolbarOrder":"lock,select,rect,ellipse,line,arrow,pen,mosaic,blur,highlight,text,serial,eraser,undo,redo,ocr,scroll,pin,save,copy"}})");
     expect(
@@ -1333,8 +2104,8 @@ void test_config() {
     expect(
         only_blur == airshot::kDefaultToolbarOrder &&
             only_mosaic == airshot::kDefaultToolbarOrder &&
-            only_blur.find(L"mosaic,blur") != std::wstring::npos,
-        L"single legacy blur or mosaic layouts regain the unified effect anchors");
+            only_blur.find(L"mosaic,blur,redact") != std::wstring::npos,
+        L"single legacy privacy layouts regain every unified effect anchor");
     const std::wstring customized_toolbar =
         airshot::normalize_toolbar_order(
             L"copy,unknown,RECT,copy,lock");
@@ -1510,7 +2281,9 @@ void test_portable_runtime() {
 
 void test_overlay_ui_dpi_metrics() {
     using airshot::overlay_detail::OverlayUiMetrics;
+    using airshot::overlay_detail::ToolbarButton;
     using airshot::overlay_detail::ToolbarMetrics;
+    using airshot::overlay_detail::ToolbarPressState;
     using airshot::overlay_detail::scale_overlay_ui_px;
     using airshot::overlay_detail::toolbar_item_width;
 
@@ -1530,16 +2303,197 @@ void test_overlay_ui_dpi_metrics() {
                                     int slider) {
         const OverlayUiMetrics ui{dpi};
         const ToolbarMetrics metrics{
-            ui.px(40), ui.px(40), ui.px(4), ui.px(8), dpi};
+            ui.px(airshot::overlay_detail::kToolbarButtonDip),
+            ui.px(airshot::overlay_detail::kToolbarButtonDip),
+            ui.px(airshot::overlay_detail::kToolbarSpacingDip),
+            ui.px(airshot::overlay_detail::kToolbarPaddingDip),
+            dpi};
         expect(metrics.button_width == button &&
                    toolbar_item_width(L"drag", metrics) == drag &&
                    toolbar_item_width(L"|", metrics) == separator &&
                    toolbar_item_width(L"mosaic_strength_slider", metrics) == slider,
                L"toolbar layout and special items share one DPI scale");
     };
-    verify_toolbar(96, 40, 20, 9, 188);
-    verify_toolbar(144, 60, 30, 14, 282);
-    verify_toolbar(192, 80, 40, 18, 376);
+    verify_toolbar(96, 40, 20, 9, 156);
+    verify_toolbar(144, 60, 30, 14, 234);
+    verify_toolbar(192, 80, 40, 18, 312);
+
+    expect(
+        airshot::overlay_detail::kToolbarButtonDip == 40 &&
+            airshot::overlay_detail::kToolbarSpacingDip == 4 &&
+            airshot::overlay_detail::kToolbarPaddingDip == 4 &&
+            airshot::overlay_detail::kToolbarIconFrameDip == 24 &&
+            airshot::overlay_detail::kToolbarGlyphDip == 20 &&
+            airshot::overlay_detail::kToolbarIconStrokeDip == 1.5F &&
+            airshot::overlay_detail::kSubToolbarSpacingDip == 2 &&
+            airshot::overlay_detail::kSubToolbarPaddingDip == 6,
+        L"capture toolbar uses the shared 40/24/20 DIP optical system");
+
+    const std::vector<std::pair<std::wstring, std::wstring>> custom_order{
+        {L"pen", L""},
+        {L"rect", L""},
+        {L"highlight", L""},
+        {L"text", L""},
+        {L"line", L""},
+        {L"pin", L""},
+        {L"copy", L""},
+        {L"eraser", L""},
+    };
+    const auto grouped =
+        airshot::overlay_detail::collapse_toolbar_groups(custom_order);
+    const std::array<std::wstring_view, 5> expected_grouped{
+        L"group_brush",
+        L"group_shape",
+        L"text",
+        L"group_capture",
+        L"eraser",
+    };
+    expect(
+        grouped.size() == expected_grouped.size() &&
+            std::ranges::equal(
+                grouped,
+                expected_grouped,
+                {},
+                [](const auto& item) -> std::wstring_view {
+                    return item.first;
+                }),
+        L"runtime grouping preserves customized first-occurrence and singleton order");
+    expect(
+        airshot::overlay_detail::toolbar_group_for_item(L"redact") ==
+            L"group_privacy",
+        L"solid redaction participates in the privacy group without changing configured ordering");
+
+    const std::vector<std::pair<std::wstring, std::wstring>> leading{
+        {L"drag", L""},
+    };
+    const std::vector<std::pair<std::wstring, std::wstring>> middle{
+        {L"lock", L""},
+        {L"select", L""},
+        {L"group_shape", L""},
+        {L"group_brush", L""},
+        {L"group_privacy", L""},
+        {L"group_mark", L""},
+        {L"eraser", L""},
+        {L"group_capture", L""},
+    };
+    const std::vector<std::pair<std::wstring, std::wstring>> trailing{
+        {L"undo", L""},
+        {L"redo", L""},
+        {L"save", L""},
+        {L"close", L""},
+        {L"done", L""},
+    };
+    std::vector<std::wstring> reference_overflow;
+    for (const unsigned int dpi : {96U, 144U, 192U}) {
+        const OverlayUiMetrics ui{dpi};
+        const ToolbarMetrics metrics{
+            ui.px(airshot::overlay_detail::kToolbarButtonDip),
+            ui.px(airshot::overlay_detail::kToolbarButtonDip),
+            ui.px(airshot::overlay_detail::kToolbarSpacingDip),
+            ui.px(airshot::overlay_detail::kToolbarPaddingDip),
+            dpi};
+        const airshot::RectI narrow_monitor{
+            0,
+            0,
+            ui.px(520),
+            ui.px(360)};
+        const auto plan = airshot::overlay_detail::fit_toolbar_single_row(
+            leading,
+            middle,
+            trailing,
+            metrics,
+            narrow_monitor);
+        const std::vector<airshot::overlay_detail::ToolbarRow> one_row{
+            plan.row,
+        };
+        std::vector<ToolbarButton> buttons;
+        airshot::overlay_detail::place_toolbar_rows(
+            buttons,
+            one_row,
+            metrics,
+            0,
+            0);
+        const bool one_physical_row = std::ranges::all_of(
+            buttons,
+            [&](const ToolbarButton& button) {
+                return button.bounds.top == metrics.padding &&
+                       button.bounds.bottom ==
+                           metrics.padding + metrics.button_height;
+            });
+        const bool fixed_tail =
+            plan.row.items.size() >= trailing.size() &&
+            std::equal(
+                trailing.begin(),
+                trailing.end(),
+                plan.row.items.end() -
+                    static_cast<std::ptrdiff_t>(trailing.size()),
+                [](const auto& expected, const auto& actual) {
+                    return expected.first == actual.first;
+                });
+        const bool has_more = std::ranges::any_of(
+            plan.row.items,
+            [](const auto& item) { return item.first == L"more"; });
+        expect(
+            !plan.overflow.empty() && has_more && fixed_tail &&
+                one_physical_row &&
+                airshot::overlay_detail::toolbar_height(one_row, metrics) ==
+                    ui.px(48) &&
+                airshot::overlay_detail::toolbar_width(one_row, metrics) <=
+                    narrow_monitor.width(),
+            L"narrow main toolbar stays one row with stable trailing actions at every DPI");
+
+        std::vector<std::wstring> overflow_ids;
+        for (const auto& item : plan.overflow) {
+            overflow_ids.push_back(item.first);
+        }
+        if (reference_overflow.empty()) {
+            reference_overflow = overflow_ids;
+        } else {
+            expect(
+                overflow_ids == reference_overflow,
+                L"main toolbar overflow is stable across 96/144/192 DPI");
+        }
+
+        const auto wide_plan =
+            airshot::overlay_detail::fit_toolbar_single_row(
+                leading,
+                middle,
+                trailing,
+                metrics,
+                {0, 0, ui.px(800), ui.px(600)});
+        expect(
+            wide_plan.overflow.empty() &&
+                std::ranges::none_of(
+                    wide_plan.row.items,
+                    [](const auto& item) { return item.first == L"more"; }),
+            L"wide main toolbar keeps all grouped tools visible without overflow");
+    }
+
+    ToolbarButton actionable{L"save", L"", {10, 20, 50, 60}};
+    ToolbarPressState press;
+    expect(
+        press.begin(actionable, false) && press.active() &&
+            press.pointer_inside,
+        L"toolbar press arms an enabled 40-DIP target on pointer down");
+    expect(
+        press.update({60, 30}) && !press.pointer_inside &&
+            !press.release({60, 30}).has_value() && !press.active(),
+        L"dragging outside then releasing cancels a toolbar command");
+    expect(
+        press.begin(actionable, true) &&
+            press.release({49, 59}).has_value() && !press.active(),
+        L"release inside activates the original toolbar command");
+    ToolbarButton disabled{L"undo", L"", {0, 0, 40, 40}, false};
+    expect(
+        !press.begin(disabled, false) && !press.active(),
+        L"disabled toolbar commands cannot enter the pressed state");
+    expect(
+        press.begin(actionable, false),
+        L"toolbar press can be re-armed before capture cancellation");
+    press.cancel();
+    expect(
+        !press.active() && !press.pointer_inside,
+        L"capture loss clears the armed toolbar command without activation");
 
     const airshot::RectI selection{100, 200, 500, 600};
     const airshot::RectI desktop{0, 0, 2000, 1200};
@@ -1568,6 +2522,8 @@ int wmain() {
     test_repeat_region_and_selection_size_policy();
     test_serial_counter_is_scoped_to_capture_session();
     test_annotation_geometry_and_history();
+    test_product_eraser_geometry_and_history();
+    test_text_box_layout_resize_and_rendering();
     test_annotation_product_styles_and_toolbar_layout();
     test_config();
     test_cli();

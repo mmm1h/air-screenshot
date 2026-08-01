@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
-  <rect x="48" y="48" width="50" height="50" fill="#091426"/>
-  <rect x="103" y="48" width="50" height="50" fill="#2764E7"/>
-  <rect x="158" y="48" width="50" height="50" fill="#091426"/>
-  <rect x="48" y="103" width="50" height="50" fill="#2764E7"/>
+  <rect x="48" y="48" width="50" height="50" fill="#17191E"/>
+  <rect x="103" y="48" width="50" height="50" fill="#4D7CFE"/>
+  <rect x="158" y="48" width="50" height="50" fill="#17191E"/>
+  <rect x="48" y="103" width="50" height="50" fill="#4D7CFE"/>
   <rect x="103" y="103" width="50" height="50" fill="#1AAFB5"/>
-  <rect x="158" y="103" width="50" height="50" fill="#2764E7"/>
-  <rect x="48" y="158" width="50" height="50" fill="#091426"/>
-  <rect x="103" y="158" width="50" height="50" fill="#2764E7"/>
-  <rect x="158" y="158" width="50" height="50" fill="#091426"/>
+  <rect x="158" y="103" width="50" height="50" fill="#4D7CFE"/>
+  <rect x="48" y="158" width="50" height="50" fill="#17191E"/>
+  <rect x="103" y="158" width="50" height="50" fill="#4D7CFE"/>
+  <rect x="158" y="158" width="50" height="50" fill="#17191E"/>
 </svg>

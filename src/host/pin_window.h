@@ -1,17 +1,19 @@
 #pragma once
 
 #include "airshot/bitmap.h"
-#include "airshot/pin_workflow.h"
+#include "airshot/pin_lifecycle_policy.h"
 #include <windows.h>
 #include <shellapi.h>
+#include <cstdint>
 #include <functional>
 #include <memory>
 
 namespace airshot {
 
-// Custom message posted to the owner when PinWindow is destroyed
-constexpr UINT WM_PIN_WINDOW_CLOSED = WM_APP + 10;
-constexpr UINT WM_PIN_CLICK_THROUGH_ENABLED = WM_APP + 12;
+// Custom message posted to the owner when PinWindow is destroyed. LPARAM is
+// the stable PinWindow::identifier(), never the object's address.
+constexpr UINT WM_PIN_WINDOW_CLOSED = WM_APP + 32;
+constexpr UINT WM_PIN_CLICK_THROUGH_ENABLED = WM_APP + 33;
 
 class PinWindow {
 public:
@@ -37,7 +39,14 @@ public:
     [[nodiscard]] std::size_t bitmap_bytes() const noexcept {
         return bitmap_.pixels.size();
     }
+    [[nodiscard]] std::uint64_t identifier() const noexcept {
+        return identifier_;
+    }
+    [[nodiscard]] std::uint64_t hidden_order() const noexcept {
+        return state_.hidden_order;
+    }
     void request_close() noexcept;
+    void request_destroy_with_confirmation();
     void request_hide() noexcept;
     void request_show() noexcept;
     [[nodiscard]] bool hidden() const noexcept;
@@ -56,6 +65,7 @@ private:
     LRESULT handle_message(UINT msg, WPARAM wparam, LPARAM lparam);
     void enter_modal() noexcept;
     [[nodiscard]] bool leave_modal() noexcept;
+    [[nodiscard]] bool confirm_destroy();
     void show_message(std::wstring_view message, UINT flags);
     void paint();
     void show_context_menu(POINT screen_pos);
@@ -82,17 +92,13 @@ private:
 
     HWND hwnd_{};
     HWND owner_{};
+    std::uint64_t identifier_{};
     Bitmap bitmap_{};
     HBITMAP hbitmap_{};
-    double scale_{1.0};
-    int alpha_{255};
-    bool smooth_scaling_{true};
+    PinRuntimeState state_{};
     bool source_has_transparency_{};
     bool per_pixel_presentation_active_{};
-    PinVisualEffects visual_effects_{};
-    bool topmost_{true};
     bool click_through_available_{true};
-    PinLifecycleState lifecycle_{PinLifecycleState::visible};
     ReplacementGuard replacement_guard_;
     unsigned int capture_suspend_depth_{};
     bool visible_before_capture_{};

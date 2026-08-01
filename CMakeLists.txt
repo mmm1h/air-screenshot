@@ -171,6 +171,7 @@ add_library(airshot_core STATIC
     src/core/output.cpp
     src/core/overlay.cpp
     src/core/overlay_color_picker.cpp
+    src/core/overlay_ocr_result.cpp
     src/core/overlay_prompt.cpp
     src/core/overlay_scroll.cpp
     src/core/overlay_scroll_windows.cpp
@@ -238,6 +239,8 @@ set_property(
     SOURCE src/host/resources.rc
     APPEND PROPERTY OBJECT_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/src/host/app.ico"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/host/app-flow.ico"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/host/app-pixel.ico"
 )
 
 add_executable(AirScreenshot WIN32
@@ -281,6 +284,9 @@ if(BUILD_TESTING)
     airshot_add_test(airshot_ipc_tests tests/test_ipc.cpp)
     airshot_add_test(airshot_ocr_tests tests/test_ocr.cpp)
     target_include_directories(airshot_ocr_tests PRIVATE src/core)
+    airshot_add_test(airshot_ocr_result_tests tests/test_ocr_result.cpp)
+    target_include_directories(airshot_ocr_result_tests PRIVATE src/core)
+    target_link_libraries(airshot_ocr_result_tests PRIVATE comctl32)
     airshot_add_test(airshot_portable_tests tests/test_portable.cpp)
     target_include_directories(airshot_portable_tests PRIVATE src/core)
     airshot_add_test(airshot_scroll_tests tests/test_scroll.cpp)

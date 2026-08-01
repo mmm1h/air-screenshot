@@ -22,7 +22,7 @@ inline constexpr wchar_t kDefaultOcrDependencyManifestUrl[] =
     L"https://mmm1h.github.io/air-screenshot/ocr-dependencies.json";
 inline constexpr int kCurrentConfigSchemaVersion = 2;
 inline constexpr std::wstring_view kDefaultToolbarOrder =
-    L"lock,rect,ellipse,line,arrow,pen,text,serial,mosaic,blur,highlight,watermark,pin,ocr,select,scroll,eraser,undo,redo,save,close,copy";
+    L"lock,rect,ellipse,line,arrow,pen,text,serial,mosaic,blur,redact,highlight,watermark,pin,ocr,select,scroll,eraser,undo,redo,save,close,copy";
 
 namespace capture_editor_shortcuts {
 inline constexpr std::wstring_view precision_size = L"F2";

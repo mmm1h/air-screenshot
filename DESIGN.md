@@ -295,7 +295,7 @@ components:
 
 The Capture Console treats settings as a native instrument panel for the real screenshot pipeline. A persistent near-black command rail sits beside a cool neutral work canvas; related decisions share open row groups, while individual settings never become a wall of detached cards.
 
-The compact `截图 → 标注 → OCR → 输出` strip keeps cause and result visible before users commit changes. The application-icon family extends the same console identity with three genuinely different silhouettes, and its selection remains part of the draft until Save. Light, dark, and Windows High Contrast modes preserve the same semantic hierarchy: cobalt operates controls, cyan confirms healthy or synchronized state or marks a precise locator, and red identifies a problem that needs recovery.
+The compact `截图 → 标注 → OCR → 输出` strip keeps cause and result visible before users commit changes. The application-icon family extends the same console identity with three genuinely different silhouettes, and its selection remains part of the draft until Save. Light, dark, and Windows High Contrast modes preserve the same semantic hierarchy: cobalt operates controls, cyan confirms healthy or synchronized state, and red identifies a problem that needs recovery.
 
 **Key Characteristics:**
 
@@ -328,9 +328,9 @@ The palette is a semantic light/dark pair rather than a mechanical inversion, wi
 
 ### Named Rules
 
-Application icons reuse Precision Rail ink, Operational Cobalt, and Healthy / Locator Cyan without introducing another palette. Their identity comes from silhouette and geometry, not recoloring.
+Application icons reuse Precision Rail ink, Operational Cobalt, and the light rail foreground without introducing another palette. Cyan is optional and appears only where a variant has a real locator or healthy-state meaning. Their identity comes from silhouette and geometry, not recoloring.
 
-**The Cobalt/Cyan Separation Rule.** Cobalt always means interaction or draft state; cyan only means healthy, ready, synchronized, or a precise locator point.
+**The Cobalt/Cyan Separation Rule.** Cobalt always means interaction or draft state; cyan only means healthy, ready, synchronized, or an explicit locator point.
 
 **The Semantic Pairing Rule.** Choose the named light or dark role directly; never generate one theme by inverting the other.
 
@@ -384,7 +384,7 @@ Geometry follows role rather than one universal radius. Progress tracks and chec
 
 Circular geometry is functional: switch thumbs, health/error dots, drag-grip dots, and icon details. No other control becomes pill-shaped.
 
-The application-icon family shares a centered safe-area system and the same three colors while keeping truly different contours: Focus Frame uses a rounded tile with four targeting corners, Flow Lens uses a circular orbit and horizontal scan axis, and Pixel Console uses a square 3 × 3 module grid. Optical insets may vary at small sizes to preserve apparent weight.
+The application-icon family shares a centered safe-area system and the same semantic palette while keeping truly different contours: Focus Frame reduces the capture gesture to two opposing focus corners and one captured pixel, Flow Lens uses a circular orbit and horizontal scan axis, and Pixel Console uses a square 3 × 3 module grid. Optical insets may vary at small sizes to preserve apparent weight.
 
 ### Named Rules
 
@@ -421,8 +421,8 @@ The application-icon family shares a centered safe-area system and the same thre
 
 ### Application Icon Choices
 
-- The open group contains three 192 × 82-DIP targets: **精准取景 / Focus Frame** (default targeting corners), **流光镜 / Flow Lens** (orbiting lens with scan axis), and **像素舱 / Pixel Console** (modular 3 × 3 grid).
-- Every preview uses the same Precision Rail, Operational Cobalt, and Healthy / Locator Cyan palette and a centered safe-area discipline, while its outer contour and internal construction remain unmistakably different.
+- The open group contains three 192 × 82-DIP targets: **精准取景 / Focus Frame** (two opposing focus corners and one captured pixel), **流光镜 / Flow Lens** (orbiting lens with scan axis), and **像素舱 / Pixel Console** (modular 3 × 3 grid).
+- Every preview uses the same Precision Rail and Operational Cobalt palette, adds light foreground or locator cyan only when semantically required, and keeps a centered safe-area discipline while its outer contour and internal construction remain unmistakably different.
 - Hover uses the normal hover surface. Selection uses soft cobalt, a 1.5-DIP cobalt-hover border, and a visible checked mark so state never depends on color alone; keyboard focus retains the 2-DIP expanded cobalt outline.
 - The three targets form one keyboard choice group. Left/Right and Up/Down arrows wrap across choices, and pointer or keyboard selection changes only the settings draft.
 - Saving applies the chosen resource to the tray and running window/taskbar HICON. The program file remains associated with the default Focus Frame icon in Explorer; the product does not rewrite its executable.
@@ -472,7 +472,7 @@ The application-icon family shares a centered safe-area system and the same thre
 - **Do** pair health, draft, and error colors with explicit text.
 - **Do** include cause and recovery in shortcut conflicts and OCR dependency failures.
 - **Do** test light, dark, Windows High Contrast, keyboard-only use, per-monitor DPI, and the 820 × 640 minimum work area.
-- **Do** preserve all three icon silhouettes, their shared three-color palette, centered safe-area discipline, and visible selected checkmark.
+- **Do** preserve all three icon silhouettes, their shared semantic palette, centered safe-area discipline, and visible selected checkmark.
 - **Do** generate every ICO frame at its target size with optical correction for small pixels.
 
 ### Don't:

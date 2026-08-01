@@ -25,6 +25,11 @@ void set_clipboard_wait_timeout_for_testing(
     std::uint32_t milliseconds) noexcept;
 void set_clipboard_pre_flush_delay_for_testing(
     std::uint32_t milliseconds) noexcept;
+// Closes or opens a test-only gate immediately after OleSetClipboard succeeds
+// and before the worker verifies ownership and flushes. Tests use this to let
+// a concurrent publisher finish deterministically instead of relying on a
+// scheduler-sensitive fixed delay.
+void set_clipboard_forward_set_gate_for_testing(bool blocked) noexcept;
 void set_clipboard_snapshot_failure_for_testing(bool enabled) noexcept;
 [[nodiscard]] bool clipboard_commit_in_flight_for_testing() noexcept;
 [[nodiscard]] bool clipboard_forward_set_pending_for_testing() noexcept;

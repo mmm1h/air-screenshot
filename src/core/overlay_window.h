@@ -8,6 +8,7 @@
 #include <wrl/client.h>
 
 #include <cstdint>
+#include <string_view>
 
 namespace airshot::overlay_detail {
 
@@ -23,6 +24,7 @@ public:
     bool create();
     void destroy();
     void invalidate() const;
+    void refresh_snapshot() noexcept;
     void paint();
     [[nodiscard]] HWND hwnd() const noexcept { return hwnd_; }
     [[nodiscard]] const RectI& bounds() const noexcept { return monitor_.bounds; }
@@ -41,6 +43,13 @@ private:
                     float width,
                     ArrowHeadStyle head_style,
                     ID2D1StrokeStyle* stroke_style);
+    [[nodiscard]] bool draw_toolbar_icon(
+        std::wstring_view id,
+        float center_x,
+        float center_y,
+        ID2D1Brush* brush,
+        bool checked,
+        bool busy);
 
     OverlaySession& session_;
     MonitorSnapshot& monitor_;
@@ -61,7 +70,6 @@ private:
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> hover_bg_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> active_bg_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> disabled_brush_;
-    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> toolbar_shadow_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> danger_hover_bg_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> true_white_brush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> green_brush_;

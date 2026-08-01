@@ -15,15 +15,28 @@ namespace airshot::overlay_detail {
                                         const std::vector<Annotation>& annotations,
                                         const AppConfig& config);
 
+struct TextAnnotationMeasurement {
+    RectI layout_bounds{};
+    RectI visual_bounds{};
+};
+
 // Uses the exact GDI font construction and DrawText flags used by
 // render_annotations. A zero rectangle means the annotation cannot be
 // measured (for example, it is not a non-empty text annotation).
+[[nodiscard]] TextAnnotationMeasurement measure_text_annotation(
+    const Annotation& annotation,
+    const AppConfig& config) noexcept;
 [[nodiscard]] RectI measure_text_annotation_bounds(
     const Annotation& annotation,
     const AppConfig& config) noexcept;
 [[nodiscard]] bool refresh_text_annotation_bounds(
     Annotation& annotation,
     const AppConfig& config) noexcept;
+[[nodiscard]] bool fit_text_annotation_to_canvas(
+    Annotation& annotation,
+    const AppConfig& config,
+    int canvas_width,
+    int canvas_height) noexcept;
 
 [[nodiscard]] COLORREF parse_hex_color(std::wstring_view hex, COLORREF fallback);
 [[nodiscard]] std::wstring format_hex_color(COLORREF color);
@@ -47,7 +60,8 @@ using TextPromptCompletion = std::function<void(std::optional<std::wstring>)>;
                                     std::wstring_view font_family = L"Microsoft YaHei",
                                     bool font_bold = false,
                                     bool font_italic = false,
-                                    TextStyle text_style = TextStyle::normal);
+                                    TextStyle text_style = TextStyle::normal,
+                                    int text_box_width_px = 0);
 [[nodiscard]] std::optional<std::wstring> prompt_text(HWND owner, POINT position, COLORREF color, float text_size, bool is_light_theme);
 
 struct SelectionSizeInput {

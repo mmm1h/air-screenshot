@@ -185,7 +185,9 @@ private:
     [[nodiscard]] CommandResponse toggle_pin_interaction();
     int restore_pin_interaction();
     int hide_all_pins();
+    int show_most_recent_hidden_pin();
     int show_all_pins();
+    [[nodiscard]] bool confirm_destroy_all_pins(std::size_t pin_count) const;
     CommandResponse output_bitmap(
         Bitmap bitmap,
         CaptureOutput output,
@@ -240,6 +242,7 @@ private:
     bool update_ready_{};
     bool update_helper_launched_{};
     bool pins_suspended_for_capture_{};
+    bool pin_bulk_destroy_confirmation_active_{};
     std::vector<std::unique_ptr<PinWindow>> pin_windows_;
 };
 

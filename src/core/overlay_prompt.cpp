@@ -24,11 +24,17 @@ struct PromptState {
     bool font_bold{};
     bool font_italic{};
     TextStyle text_style{TextStyle::normal};
+    int text_box_width_px{};
+    UINT dpi{USER_DEFAULT_SCREEN_DPI};
     HFONT font{};
     HBRUSH bg_brush{};
     bool is_light_theme{};
     TextPromptCompletion completion;
 };
+
+[[nodiscard]] int prompt_scale(const PromptState& state, int dip) noexcept {
+    return MulDiv(dip, static_cast<int>(state.dpi), USER_DEFAULT_SCREEN_DPI);
+}
 
 LRESULT CALLBACK edit_subclass_proc(HWND window, UINT message, WPARAM w_param, LPARAM l_param, UINT_PTR subclass_id, DWORD_PTR ref_data) {
     (void)subclass_id;
@@ -72,19 +78,30 @@ LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPA
     }
     if (message == WM_CREATE) {
         int text_height = static_cast<int>(state->text_size);
-        int window_height = std::clamp(text_height * 3 + 28, 96, 220);
-        int window_width = 360;
+        RECT client{};
+        GetClientRect(window, &client);
+        const int padding = prompt_scale(*state, 6);
+        const DWORD edit_style =
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE |
+            ES_AUTOVSCROLL | ES_WANTRETURN |
+            (state->text_box_width_px == 0
+                 ? (WS_HSCROLL | ES_AUTOHSCROLL)
+                 : 0);
 
         state->edit = CreateWindowExW(0,
                                       L"EDIT",
                                       state->text.c_str(),
-                                      WS_CHILD | WS_VISIBLE | WS_VSCROLL |
-                                          ES_MULTILINE | ES_AUTOVSCROLL |
-                                          ES_WANTRETURN,
-                                      6,
-                                      6,
-                                      window_width - 12,
-                                      window_height - 12,
+                                      edit_style,
+                                      padding,
+                                      padding,
+                                      std::max(
+                                          1,
+                                          static_cast<int>(client.right) -
+                                              padding * 2),
+                                      std::max(
+                                          1,
+                                          static_cast<int>(client.bottom) -
+                                              padding * 2),
                                       window,
                                       reinterpret_cast<HMENU>(100),
                                       nullptr,
@@ -108,6 +125,18 @@ LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPA
                 : state->font_family.c_str()
         );
         SendMessageW(state->edit, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), TRUE);
+        if (state->text_box_width_px > 0) {
+            RECT formatting{};
+            GetClientRect(state->edit, &formatting);
+            formatting.right = std::min(
+                formatting.right,
+                formatting.left + state->text_box_width_px);
+            SendMessageW(
+                state->edit,
+                EM_SETRECTNP,
+                0,
+                reinterpret_cast<LPARAM>(&formatting));
+        }
         SendMessageW(state->edit, EM_SETSEL, 0, -1);
 
         const COLORREF background =
@@ -213,7 +242,8 @@ HWND show_text_prompt(HWND owner,
                       std::wstring_view font_family,
                       bool font_bold,
                       bool font_italic,
-                      TextStyle text_style) {
+                      TextStyle text_style,
+                      int text_box_width_px) {
     static std::once_flag class_flag;
     std::call_once(class_flag, [] {
         WNDCLASSEXW window_class{sizeof(window_class)};
@@ -239,17 +269,33 @@ HWND show_text_prompt(HWND owner,
     state->font_bold = font_bold;
     state->font_italic = font_italic;
     state->text_style = text_style;
+    state->text_box_width_px = std::max(0, text_box_width_px);
     state->is_light_theme = is_light_theme;
     state->completion = std::move(completion);
     state->text = std::move(initial_text);
+    state->dpi = owner && IsWindow(owner)
+                     ? GetDpiForWindow(owner)
+                     : GetDpiForSystem();
+    if (state->dpi == 0) {
+        state->dpi = USER_DEFAULT_SCREEN_DPI;
+    }
 
     if (state->text_style == TextStyle::dark) {
         state->is_light_theme = false;
     }
 
     int text_height = static_cast<int>(text_size);
-    int window_height = std::clamp(text_height * 3 + 28, 96, 220);
-    int window_width = 360;
+    const int window_height = std::max(
+        prompt_scale(*state, 96),
+        std::min(
+            text_height * 3 + prompt_scale(*state, 28),
+            prompt_scale(*state, 220)));
+    int window_width = prompt_scale(*state, 360);
+    if (state->text_box_width_px > 0) {
+        window_width = std::max(
+            window_width,
+            state->text_box_width_px + prompt_scale(*state, 12));
+    }
 
     int x = position.x;
     int y = position.y;
@@ -257,6 +303,9 @@ HWND show_text_prompt(HWND owner,
     MONITORINFO monitorInfo{sizeof(MONITORINFO)};
     if (GetMonitorInfoW(hMonitor, &monitorInfo)) {
         const RECT& area = monitorInfo.rcWork;
+        window_width = std::min(
+            window_width,
+            static_cast<int>(area.right - area.left));
         if (x + window_width > area.right) {
             x = area.right - window_width;
         }

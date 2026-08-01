@@ -5,6 +5,7 @@
 #include <windowsx.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <format>
@@ -16,6 +17,9 @@
 
 namespace airshot {
 namespace {
+
+std::atomic<std::uint64_t> next_pin_identifier{1};
+std::atomic<std::uint64_t> next_pin_hidden_order{1};
 
 class ScreenDc {
 public:
@@ -556,18 +560,19 @@ std::unique_ptr<PinWindow> PinWindow::create(
         MonitorFromPoint(requested_position, MONITOR_DEFAULTTONEAREST);
     MONITORINFO monitor_info{sizeof(monitor_info)};
     if (monitor && GetMonitorInfoW(monitor, &monitor_info)) {
-        pin->scale_ = fit_pin_scale(
+        pin->state_.presentation.scale = fit_pin_scale(
             pin->bitmap_.width,
             pin->bitmap_.height,
             RectI::from_native(monitor_info.rcWork));
     }
-    const auto initial_size = pin->scaled_size(pin->scale_);
+    const auto initial_size = pin->scaled_size(
+        pin->state_.presentation.scale);
     if (!initial_size) {
         return nullptr;
     }
     const PinWindowStylePlan initial_style = plan_pin_window_style(
         pin->source_has_transparency_,
-        pin->alpha_,
+        pin->state_.presentation.alpha,
         false);
     pin->per_pixel_presentation_active_ =
         initial_style.per_pixel_alpha;
@@ -606,7 +611,11 @@ std::unique_ptr<PinWindow> PinWindow::create(
 }
 
 PinWindow::PinWindow(HWND hwnd, Bitmap bitmap)
-    : hwnd_(hwnd), bitmap_(std::move(bitmap)) {}
+    : hwnd_(hwnd),
+      identifier_(next_pin_identifier.fetch_add(
+          1,
+          std::memory_order_relaxed)),
+      bitmap_(std::move(bitmap)) {}
 
 bool PinWindow::rebuild_native_bitmap() {
     if (!bitmap_.valid()) {
@@ -635,7 +644,7 @@ bool PinWindow::rebuild_native_bitmap() {
     }
     if (!write_pin_visual_pixels(
             bitmap_,
-            visual_effects_,
+            state_.presentation.visual_effects,
             std::span<std::uint8_t>(
                 static_cast<std::uint8_t*>(bits),
                 bitmap_.pixels.size()))) {
@@ -653,8 +662,8 @@ bool PinWindow::rebuild_native_bitmap() {
 
 bool PinWindow::refresh_window_presentation() noexcept {
     return update_window_presentation(
-        alpha_,
-        click_through(),
+        state_.presentation.alpha,
+        state_.presentation.click_through,
         source_has_transparency_);
 }
 
@@ -680,10 +689,10 @@ bool PinWindow::update_window_presentation(
         const int height = client.bottom - client.top;
         layered_frame = render_pin_layered_bitmap(
             bitmap_,
-            visual_effects_,
+            state_.presentation.visual_effects,
             width,
             height,
-            smooth_scaling_);
+            state_.presentation.smooth_scaling);
         if (!layered_frame.valid()) {
             return false;
         }
@@ -748,7 +757,7 @@ bool PinWindow::update_window_presentation(
             (void)SetLayeredWindowAttributes(
                 hwnd_,
                 0,
-                static_cast<BYTE>(alpha_),
+                static_cast<BYTE>(state_.presentation.alpha),
                 LWA_ALPHA);
         } else {
             InvalidateRect(hwnd_, nullptr, TRUE);
@@ -790,7 +799,7 @@ bool PinWindow::replace_bitmap(Bitmap bitmap) {
     }
     if (!write_pin_visual_pixels(
             bitmap,
-            visual_effects_,
+            state_.presentation.visual_effects,
             std::span<std::uint8_t>(
                 static_cast<std::uint8_t*>(bits),
                 bitmap.pixels.size()))) {
@@ -855,31 +864,50 @@ void PinWindow::request_close() noexcept {
         close_pending_ = true;
         return;
     }
-    lifecycle_ = transition_pin_lifecycle(
-        lifecycle_,
-        PinLifecycleAction::destroy);
-    DestroyWindow(hwnd_);
+    const HWND window = hwnd_;
+    if (DestroyWindow(window)) {
+        state_ = transition_pin_runtime_state(
+            state_,
+            PinLifecycleAction::destroy);
+    }
+}
+
+void PinWindow::request_destroy_with_confirmation() {
+    if (!hwnd_ || !IsWindow(hwnd_) ||
+        state_.lifecycle == PinLifecycleState::destroyed) {
+        return;
+    }
+    if (confirm_destroy()) {
+        request_close();
+    }
 }
 
 void PinWindow::request_hide() noexcept {
     if (!hwnd_ || !IsWindow(hwnd_) ||
-        lifecycle_ == PinLifecycleState::destroyed) {
+        state_.lifecycle == PinLifecycleState::destroyed) {
         return;
     }
-    lifecycle_ = transition_pin_lifecycle(
-        lifecycle_,
-        PinLifecycleAction::hide);
+    const std::uint64_t order =
+        state_.lifecycle == PinLifecycleState::hidden
+            ? state_.hidden_order
+            : next_pin_hidden_order.fetch_add(
+                  1,
+                  std::memory_order_relaxed);
+    state_ = transition_pin_runtime_state(
+        state_,
+        PinLifecycleAction::hide,
+        order);
     visible_before_capture_ = false;
     ShowWindow(hwnd_, SW_HIDE);
 }
 
 void PinWindow::request_show() noexcept {
     if (!hwnd_ || !IsWindow(hwnd_) ||
-        lifecycle_ == PinLifecycleState::destroyed) {
+        state_.lifecycle == PinLifecycleState::destroyed) {
         return;
     }
-    lifecycle_ = transition_pin_lifecycle(
-        lifecycle_,
+    state_ = transition_pin_runtime_state(
+        state_,
         PinLifecycleAction::show);
     if (capture_suspend_depth_ != 0) {
         visible_before_capture_ = true;
@@ -888,7 +916,7 @@ void PinWindow::request_show() noexcept {
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     SetWindowPos(
         hwnd_,
-        topmost_ ? HWND_TOPMOST : HWND_NOTOPMOST,
+        state_.presentation.topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
         0,
         0,
         0,
@@ -898,14 +926,12 @@ void PinWindow::request_show() noexcept {
 }
 
 bool PinWindow::hidden() const noexcept {
-    return lifecycle_ == PinLifecycleState::hidden;
+    return state_.lifecycle == PinLifecycleState::hidden;
 }
 
 bool PinWindow::click_through() const noexcept {
-    return hwnd_ &&
-           IsWindow(hwnd_) &&
-           (GetWindowLongPtrW(hwnd_, GWL_EXSTYLE) &
-            WS_EX_TRANSPARENT) != 0;
+    return hwnd_ && IsWindow(hwnd_) &&
+           state_.presentation.click_through;
 }
 
 bool PinWindow::set_click_through(bool enabled) noexcept {
@@ -915,10 +941,14 @@ bool PinWindow::set_click_through(bool enabled) noexcept {
     if (enabled && !click_through_available_) {
         return false;
     }
-    return update_window_presentation(
-        alpha_,
-        enabled,
-        source_has_transparency_);
+    if (!update_window_presentation(
+            state_.presentation.alpha,
+            enabled,
+            source_has_transparency_)) {
+        return false;
+    }
+    state_.presentation.click_through = enabled;
+    return true;
 }
 
 void PinWindow::set_click_through_available(bool available) noexcept {
@@ -929,7 +959,8 @@ void PinWindow::set_click_through_available(bool available) noexcept {
 }
 
 bool PinWindow::topmost() const noexcept {
-    return hwnd_ && IsWindow(hwnd_) && topmost_;
+    return hwnd_ && IsWindow(hwnd_) &&
+           state_.presentation.topmost;
 }
 
 bool PinWindow::set_topmost(bool enabled) noexcept {
@@ -946,7 +977,7 @@ bool PinWindow::set_topmost(bool enabled) noexcept {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)) {
         return false;
     }
-    topmost_ = enabled;
+    state_.presentation.topmost = enabled;
     return true;
 }
 
@@ -969,14 +1000,16 @@ void PinWindow::resume_after_capture() noexcept {
     --capture_suspend_depth_;
     if (capture_suspend_depth_ == 0) {
         const bool restore = should_restore_pin_after_capture(
-            lifecycle_,
+            state_.lifecycle,
             visible_before_capture_);
         visible_before_capture_ = false;
         if (restore && hwnd_ && IsWindow(hwnd_)) {
             ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
             SetWindowPos(
                 hwnd_,
-                topmost_ ? HWND_TOPMOST : HWND_NOTOPMOST,
+                state_.presentation.topmost
+                    ? HWND_TOPMOST
+                    : HWND_NOTOPMOST,
                 0,
                 0,
                 0,
@@ -993,11 +1026,11 @@ bool PinWindow::set_alpha(int alpha) noexcept {
     const int candidate = std::clamp(alpha, 30, 255);
     if (!update_window_presentation(
             candidate,
-            click_through(),
+            state_.presentation.click_through,
             source_has_transparency_)) {
         return false;
     }
-    alpha_ = candidate;
+    state_.presentation.alpha = candidate;
     return true;
 }
 
@@ -1010,32 +1043,37 @@ void PinWindow::zoom_by_steps(double steps) {
         rect.left + (rect.right - rect.left) / 2,
         rect.top + (rect.bottom - rect.top) / 2,
     };
-    (void)resize_to_scale(scale_ * std::pow(1.1, steps), center);
+    (void)resize_to_scale(
+        state_.presentation.scale * std::pow(1.1, steps),
+        center);
 }
 
 void PinWindow::toggle_smooth_scaling() noexcept {
-    const bool previous = smooth_scaling_;
-    smooth_scaling_ = !smooth_scaling_;
+    const bool previous = state_.presentation.smooth_scaling;
+    state_.presentation.smooth_scaling = !previous;
     if (hwnd_ && IsWindow(hwnd_) &&
         !refresh_window_presentation()) {
-        smooth_scaling_ = previous;
+        state_.presentation.smooth_scaling = previous;
         (void)refresh_window_presentation();
     }
 }
 
 Bitmap PinWindow::visible_bitmap() const {
-    return render_pin_visual_bitmap(bitmap_, visual_effects_);
+    return render_pin_visual_bitmap(
+        bitmap_,
+        state_.presentation.visual_effects);
 }
 
 void PinWindow::toggle_visual_effect(
     PinVisualEffectAction action) {
-    const PinVisualEffects previous = visual_effects_;
-    visual_effects_ = transition_pin_visual_effects(
-        visual_effects_,
+    const PinVisualEffects previous =
+        state_.presentation.visual_effects;
+    state_.presentation.visual_effects = transition_pin_visual_effects(
+        state_.presentation.visual_effects,
         action);
     if (!rebuild_native_bitmap() ||
         !refresh_window_presentation()) {
-        visual_effects_ = previous;
+        state_.presentation.visual_effects = previous;
         (void)rebuild_native_bitmap();
         (void)refresh_window_presentation();
         show_message(
@@ -1180,7 +1218,7 @@ bool PinWindow::resize_to_scale(
         (void)refresh_window_presentation();
         return false;
     }
-    scale_ = candidate_scale;
+    state_.presentation.scale = candidate_scale;
     ensure_visible();
     return true;
 }
@@ -1227,6 +1265,23 @@ bool PinWindow::leave_modal() noexcept {
         return false;
     }
     return hwnd_ && IsWindow(hwnd_);
+}
+
+bool PinWindow::confirm_destroy() {
+    if (!hwnd_ || !IsWindow(hwnd_)) {
+        return false;
+    }
+    enter_modal();
+    const int response = MessageBoxW(
+        hwnd_,
+        L"要永久销毁这张贴图吗？\n\n销毁后无法从托盘恢复。",
+        L"永久销毁贴图",
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 |
+            MB_SETFOREGROUND);
+    if (!leave_modal()) {
+        return false;
+    }
+    return response == IDYES;
 }
 
 void PinWindow::show_message(std::wstring_view message, UINT flags) {
@@ -1279,22 +1334,25 @@ LRESULT PinWindow::handle_message(UINT msg, WPARAM wparam, LPARAM lparam) {
             return HTCAPTION; // Allow dragging the window
 
         case WM_NCLBUTTONDBLCLK:
-            // A hidden pin remains recoverable from the tray. Destruction is
-            // deliberately reserved for Esc or the explicit menu command.
+            // A hidden pin remains recoverable from the tray. Permanent
+            // destruction requires an explicit confirmed action.
             request_hide();
             return 0;
 
         case WM_MOUSEWHEEL: {
             short delta = GET_WHEEL_DELTA_WPARAM(wparam);
             if (GetKeyState(VK_CONTROL) & 0x8000) {
-                (void)set_alpha(alpha_ + (delta > 0 ? 15 : -15));
+                (void)set_alpha(
+                    state_.presentation.alpha +
+                    (delta > 0 ? 15 : -15));
                 return 0;
             }
             POINT cursor_screen{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
             const double wheel_steps =
                 static_cast<double>(delta) / static_cast<double>(WHEEL_DELTA);
             (void)resize_to_scale(
-                scale_ * std::pow(1.1, wheel_steps),
+                state_.presentation.scale *
+                    std::pow(1.1, wheel_steps),
                 cursor_screen);
             return 0;
         }
@@ -1317,7 +1375,14 @@ LRESULT PinWindow::handle_message(UINT msg, WPARAM wparam, LPARAM lparam) {
                 }
                 return 0;
             } else if (wparam == VK_ESCAPE) {
-                request_close();
+                const bool shift_pressed =
+                    (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                if (pin_escape_action(shift_pressed) ==
+                    PinEscapeAction::confirm_destroy) {
+                    request_destroy_with_confirmation();
+                } else {
+                    request_hide();
+                }
                 return 0;
             } else if (wparam == 'R') {
                 rotate(true);
@@ -1356,14 +1421,14 @@ LRESULT PinWindow::handle_message(UINT msg, WPARAM wparam, LPARAM lparam) {
                 return 0;
             } else if (wparam == VK_ADD || wparam == VK_OEM_PLUS) {
                 if (control) {
-                    (void)set_alpha(alpha_ + 15);
+                    (void)set_alpha(state_.presentation.alpha + 15);
                 } else {
                     zoom_by_steps(1.0);
                 }
                 return 0;
             } else if (wparam == VK_SUBTRACT || wparam == VK_OEM_MINUS) {
                 if (control) {
-                    (void)set_alpha(alpha_ - 15);
+                    (void)set_alpha(state_.presentation.alpha - 15);
                 } else {
                     zoom_by_steps(-1.0);
                 }
@@ -1417,11 +1482,24 @@ LRESULT PinWindow::handle_message(UINT msg, WPARAM wparam, LPARAM lparam) {
             }
             break;
 
+        case WM_CLOSE:
+            // Alt+F4 and shell close requests follow the same recoverable
+            // semantics as Esc. Host shutdown calls request_close() directly.
+            request_hide();
+            return 0;
+
         case WM_DESTROY: {
             close_pending_ = false;
+            state_ = transition_pin_runtime_state(
+                state_,
+                PinLifecycleAction::destroy);
             if (notify_owner_ && owner_ && IsWindow(owner_)) {
                 notify_owner_ = false;
-                PostMessageW(owner_, WM_PIN_WINDOW_CLOSED, 0, reinterpret_cast<LPARAM>(this));
+                PostMessageW(
+                    owner_,
+                    WM_PIN_WINDOW_CLOSED,
+                    0,
+                    static_cast<LPARAM>(identifier_));
             }
             return 0;
         }
@@ -1460,8 +1538,10 @@ void PinWindow::paint() {
         if (mem_dc.get() && selected_bitmap.valid()) {
             SetStretchBltMode(
                 hdc,
-                smooth_scaling_ ? HALFTONE : COLORONCOLOR);
-            if (smooth_scaling_) {
+                state_.presentation.smooth_scaling
+                    ? HALFTONE
+                    : COLORONCOLOR);
+            if (state_.presentation.smooth_scaling) {
                 SetBrushOrgEx(hdc, 0, 0, nullptr);
             }
 
@@ -1521,16 +1601,18 @@ void PinWindow::show_context_menu(POINT screen_pos) {
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     const std::wstring scale_status = std::format(
         L"当前缩放：{}%",
-        static_cast<int>(std::llround(scale_ * 100.0)));
+        static_cast<int>(
+            std::llround(state_.presentation.scale * 100.0)));
     const std::wstring alpha_status = std::format(
         L"当前透明度：{}%",
-        static_cast<int>(std::llround(alpha_ * 100.0 / 255.0)));
+        static_cast<int>(std::llround(
+            state_.presentation.alpha * 100.0 / 255.0)));
     AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 20, scale_status.c_str());
     AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 21, alpha_status.c_str());
     AppendMenuW(menu.get(), MF_STRING, 15, L"放大\t+");
     AppendMenuW(menu.get(), MF_STRING, 16, L"缩小\t-");
     const int rounded_scale = static_cast<int>(
-        std::llround(scale_ * 100.0));
+        std::llround(state_.presentation.scale * 100.0));
     AppendMenuW(
         menu.get(),
         MF_STRING | (rounded_scale == 25 ? MF_CHECKED : MF_UNCHECKED),
@@ -1556,21 +1638,28 @@ void PinWindow::show_context_menu(POINT screen_pos) {
     AppendMenuW(menu.get(), MF_STRING, 14, L"透明度重置 100%\tCtrl+0");
     AppendMenuW(
         menu.get(),
-        MF_STRING | (smooth_scaling_ ? MF_CHECKED : MF_UNCHECKED),
+        MF_STRING |
+            (state_.presentation.smooth_scaling
+                 ? MF_CHECKED
+                 : MF_UNCHECKED),
         13,
-        smooth_scaling_
+        state_.presentation.smooth_scaling
             ? L"平滑缩放：开\tS"
             : L"平滑缩放：关（像素）\tS");
     AppendMenuW(
         menu.get(),
         MF_STRING |
-            (visual_effects_.grayscale ? MF_CHECKED : MF_UNCHECKED),
+            (state_.presentation.visual_effects.grayscale
+                 ? MF_CHECKED
+                 : MF_UNCHECKED),
         17,
         L"灰度显示\tG");
     AppendMenuW(
         menu.get(),
         MF_STRING |
-            (visual_effects_.inverted ? MF_CHECKED : MF_UNCHECKED),
+            (state_.presentation.visual_effects.inverted
+                 ? MF_CHECKED
+                 : MF_UNCHECKED),
         18,
         L"反色显示\tI");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
@@ -1579,8 +1668,16 @@ void PinWindow::show_context_menu(POINT screen_pos) {
     AppendMenuW(menu.get(), MF_STRING, 7, L"水平翻转 (Flip Horizontal)\tH");
     AppendMenuW(menu.get(), MF_STRING, 8, L"垂直翻转 (Flip Vertical)\tV");
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu.get(), MF_STRING, 12, L"隐藏（可从托盘恢复）\t双击");
-    AppendMenuW(menu.get(), MF_STRING, 3, L"销毁\tEsc");
+    AppendMenuW(
+        menu.get(),
+        MF_STRING,
+        12,
+        L"隐藏（可从托盘恢复）\tEsc / 双击");
+    AppendMenuW(
+        menu.get(),
+        MF_STRING,
+        3,
+        L"永久销毁…\tShift+Esc");
 
     int selection = TrackPopupMenu(menu.get(),
                                    TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
@@ -1623,7 +1720,7 @@ void PinWindow::show_context_menu(POINT screen_pos) {
             }
         }
     } else if (selection == 3) {
-        request_close();
+        request_destroy_with_confirmation();
     } else if (selection == 12) {
         request_hide();
     } else if (selection == 4) {
@@ -1669,7 +1766,8 @@ void PinWindow::show_context_menu(POINT screen_pos) {
         const PinScalePromptPlan prompt_plan = plan_pin_scale_prompt(
             prompt_pin_scale_percent(
                 hwnd_,
-                pin_scale_percent_from_factor(scale_)));
+                pin_scale_percent_from_factor(
+                    state_.presentation.scale)));
         if (prompt_plan.apply) {
             set_scale_percent(prompt_plan.percent);
         }
@@ -1747,7 +1845,7 @@ void PinWindow::rotate(bool cw) {
     RECT rect_window{};
     if (GetWindowRect(hwnd_, &rect_window)) {
         const POINT anchor{rect_window.left, rect_window.top};
-        if (!resize_to_scale(scale_, anchor)) {
+        if (!resize_to_scale(state_.presentation.scale, anchor)) {
             show_message(
                 L"贴图已旋转，但无法按新尺寸刷新透明显示。",
                 MB_OK | MB_ICONWARNING);

@@ -32,6 +32,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -77,6 +78,9 @@ constexpr std::uint64_t kMaximumManifestLifetimeSeconds =
     366ULL * 24ULL * 60ULL * 60ULL;
 constexpr std::uint64_t kManifestClockSkewSeconds = 5ULL * 60ULL;
 constexpr DWORD kDownloadPollTimeoutMs = 1'000;
+constexpr DWORD kHttpStatusRequestedRangeNotSatisfiable = 416;
+constexpr DWORD kHttpStatusTooManyRequests = 429;
+constexpr DWORD kHttpStatusInternalServerError = 500;
 constexpr int kMaxDownloadAttempts = 8;
 constexpr ULONGLONG kDownloadFileDeadlineMs = 10ULL * 60ULL * 1'000ULL;
 constexpr ULONGLONG kDownloadOperationDeadlineMs = 30ULL * 60ULL * 1'000ULL;
@@ -89,6 +93,8 @@ constexpr std::size_t kMaxOcrTotalTextCharacters = 2U * 1024U * 1024U;
 constexpr double kMaxOcrProtocolTimingMs = 120'000.0;
 constexpr std::wstring_view kInstalledManifestName = L".airshot-manifest.json";
 constexpr std::wstring_view kInstalledSignatureName = L".airshot-manifest.sig";
+constexpr std::wstring_view kDownloadCacheDirectoryName =
+    L".download-cache-v1";
 constexpr std::wstring_view kSequenceHighWatermarkName =
     L".ocr-sequence-high-watermark";
 constexpr wchar_t kSequenceMutexName[] =
@@ -1558,6 +1564,196 @@ bool write_binary_file(
     }
 }
 
+struct DownloadContentRange {
+    std::uint64_t first{};
+    std::uint64_t last{};
+    std::uint64_t total{};
+};
+
+std::optional<DownloadContentRange> parse_download_content_range(
+    std::wstring_view value) noexcept {
+    while (!value.empty() && std::iswspace(value.front())) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() && std::iswspace(value.back())) {
+        value.remove_suffix(1);
+    }
+    constexpr std::wstring_view prefix = L"bytes ";
+    if (value.size() <= prefix.size()) {
+        return std::nullopt;
+    }
+    for (std::size_t i = 0; i < prefix.size(); ++i) {
+        if (std::towlower(value[i]) != prefix[i]) {
+            return std::nullopt;
+        }
+    }
+    value.remove_prefix(prefix.size());
+
+    const auto parse_number = [&value]() -> std::optional<std::uint64_t> {
+        if (value.empty() || value.front() < L'0' || value.front() > L'9') {
+            return std::nullopt;
+        }
+        std::uint64_t result = 0;
+        std::size_t digits = 0;
+        while (digits < value.size() &&
+               value[digits] >= L'0' && value[digits] <= L'9') {
+            const std::uint64_t digit =
+                static_cast<std::uint64_t>(value[digits] - L'0');
+            if (result >
+                (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+                return std::nullopt;
+            }
+            result = result * 10 + digit;
+            ++digits;
+        }
+        value.remove_prefix(digits);
+        return result;
+    };
+
+    const auto first = parse_number();
+    if (!first || value.empty() || value.front() != L'-') {
+        return std::nullopt;
+    }
+    value.remove_prefix(1);
+    const auto last = parse_number();
+    if (!last || value.empty() || value.front() != L'/') {
+        return std::nullopt;
+    }
+    value.remove_prefix(1);
+    const auto total = parse_number();
+    if (!total || !value.empty() || *first > *last || *last >= *total) {
+        return std::nullopt;
+    }
+    return DownloadContentRange{*first, *last, *total};
+}
+
+bool resume_response_is_usable_impl(
+    DWORD status_code,
+    std::uint64_t existing_bytes,
+    std::uint64_t expected_bytes,
+    std::wstring_view content_range) noexcept {
+    if (existing_bytes == 0 || existing_bytes >= expected_bytes ||
+        status_code != HTTP_STATUS_PARTIAL_CONTENT) {
+        return false;
+    }
+    const auto parsed = parse_download_content_range(content_range);
+    return parsed && parsed->first == existing_bytes &&
+           parsed->total == expected_bytes;
+}
+
+std::wstring dependency_download_cache_name(
+    std::wstring_view sha256,
+    std::uint64_t size) {
+    return normalized_hex(sha256) + L"-" + std::to_wstring(size) + L".part";
+}
+
+std::vector<std::size_t> dependency_download_cache_owner_indices_impl(
+    std::span<const OcrDependencyFile> files) {
+    std::map<std::wstring, std::size_t> owners;
+    std::vector<std::size_t> result;
+    result.reserve(files.size());
+    for (std::size_t index = 0; index < files.size(); ++index) {
+        const std::wstring key = dependency_download_cache_name(
+            files[index].sha256,
+            files[index].size);
+        const auto [entry, inserted] = owners.emplace(key, index);
+        result.push_back(inserted ? index : entry->second);
+    }
+    return result;
+}
+
+void update_dependency_download_cache_alias_progress_impl(
+    std::span<const std::size_t> owner_indices,
+    std::size_t file_index,
+    std::uint64_t current_bytes,
+    std::vector<std::uint64_t>& file_progress_bytes,
+    std::uint64_t& available_bytes) noexcept {
+    if (file_index >= owner_indices.size() ||
+        file_progress_bytes.size() != owner_indices.size()) {
+        return;
+    }
+    const std::size_t owner = owner_indices[file_index];
+    if (owner >= owner_indices.size()) {
+        return;
+    }
+    for (std::size_t index = 0; index < owner_indices.size(); ++index) {
+        if (owner_indices[index] != owner ||
+            current_bytes <= file_progress_bytes[index]) {
+            continue;
+        }
+        available_bytes += current_bytes - file_progress_bytes[index];
+        file_progress_bytes[index] = current_bytes;
+    }
+}
+
+void update_dependency_download_cache_alias_verification_impl(
+    std::span<const std::size_t> owner_indices,
+    std::size_t file_index,
+    bool verified,
+    std::vector<bool>& file_verified) noexcept {
+    if (file_index >= owner_indices.size() ||
+        file_verified.size() != owner_indices.size()) {
+        return;
+    }
+    const std::size_t owner = owner_indices[file_index];
+    if (owner >= owner_indices.size()) {
+        return;
+    }
+    for (std::size_t index = 0; index < owner_indices.size(); ++index) {
+        if (owner_indices[index] == owner) {
+            file_verified[index] = verified;
+        }
+    }
+}
+
+bool dependency_download_cache_is_reusable_impl(
+    std::span<const std::size_t> owner_indices,
+    const std::vector<bool>& file_verified,
+    std::size_t file_index) noexcept {
+    if (file_index >= owner_indices.size() ||
+        file_verified.size() != owner_indices.size()) {
+        return false;
+    }
+    const std::size_t owner = owner_indices[file_index];
+    return owner < file_verified.size() && file_verified[owner];
+}
+
+bool valid_dependency_download_cache_name(std::wstring_view name) noexcept {
+    constexpr std::size_t digest_characters = 64;
+    if (name.size() <= digest_characters + 1 + 5 ||
+        name[digest_characters] != L'-' || !name.ends_with(L".part")) {
+        return false;
+    }
+    for (std::size_t i = 0; i < digest_characters; ++i) {
+        const wchar_t character = name[i];
+        if (!((character >= L'0' && character <= L'9') ||
+              (character >= L'a' && character <= L'f') ||
+              (character >= L'A' && character <= L'F'))) {
+            return false;
+        }
+    }
+    const std::wstring_view size_text = name.substr(
+        digest_characters + 1,
+        name.size() - digest_characters - 1 - 5);
+    return !size_text.empty() &&
+           std::ranges::all_of(size_text, [](wchar_t character) {
+               return character >= L'0' && character <= L'9';
+           });
+}
+
+bool retryable_winhttp_error(DWORD error) noexcept {
+    switch (error) {
+        case ERROR_WINHTTP_TIMEOUT:
+        case ERROR_WINHTTP_RESEND_REQUEST:
+        case ERROR_WINHTTP_CONNECTION_ERROR:
+        case ERROR_WINHTTP_CANNOT_CONNECT:
+        case ERROR_WINHTTP_NAME_NOT_RESOLVED:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool download_file_attempt(
     WinHttpDownloadContext& context,
     std::wstring_view url,
@@ -1566,10 +1762,11 @@ bool download_file_attempt(
     ULONGLONG operation_deadline,
     std::stop_token stop_token,
     const std::function<void(std::uint64_t)>& progress_callback,
-    bool* retryable_timeout,
+    bool resume_existing,
+    bool* retryable_failure,
     std::wstring* error) {
-    if (retryable_timeout) {
-        *retryable_timeout = false;
+    if (retryable_failure) {
+        *retryable_failure = false;
     }
     if (!valid_https_url(url)) {
         if (error) {
@@ -1592,7 +1789,52 @@ bool download_file_attempt(
         }
         return false;
     }
-    std::filesystem::remove(path, filesystem_error);
+
+    std::uint64_t resume_offset = 0;
+    const DWORD existing_attributes = GetFileAttributesW(path.c_str());
+    if (resume_existing &&
+        existing_attributes != INVALID_FILE_ATTRIBUTES) {
+        if ((existing_attributes &
+             (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+            if (error) {
+                *error = L"OCR 断点缓存不是安全的常规文件。";
+            }
+            return false;
+        }
+        const auto existing_size = std::filesystem::file_size(
+            path,
+            filesystem_error);
+        if (filesystem_error) {
+            if (error) {
+                *error = L"无法读取 OCR 断点缓存大小。";
+            }
+            return false;
+        }
+        if (existing_size > 0 && existing_size < maximum_size) {
+            resume_offset = existing_size;
+        } else if (!DeleteFileW(path.c_str())) {
+            if (error) {
+                *error =
+                    L"无法重置无效的 OCR 断点缓存：" +
+                    windows_error_message(GetLastError());
+            }
+            return false;
+        }
+    } else if (existing_attributes != INVALID_FILE_ATTRIBUTES &&
+               !DeleteFileW(path.c_str())) {
+        if (error) {
+            *error =
+                L"无法重置 OCR 下载文件：" +
+                windows_error_message(GetLastError());
+        }
+        return false;
+    }
+    if (progress_callback) {
+        try {
+            progress_callback(resume_offset);
+        } catch (...) {
+        }
+    }
 
     std::wstring url_copy(url);
     URL_COMPONENTS components{};
@@ -1683,6 +1925,22 @@ bool download_file_attempt(
         }
         return false;
     }
+    if (resume_offset > 0) {
+        const std::wstring range_header =
+            std::format(L"Range: bytes={}-\r\n", resume_offset);
+        if (!WinHttpAddRequestHeaders(
+                request.get(),
+                range_header.c_str(),
+                static_cast<DWORD>(-1),
+                WINHTTP_ADDREQ_FLAG_REPLACE | WINHTTP_ADDREQ_FLAG_ADD)) {
+            if (error) {
+                *error =
+                    L"无法配置 OCR 断点续传请求：" +
+                    windows_error_message(GetLastError());
+            }
+            return false;
+        }
+    }
 
     const ULONGLONG request_deadline = std::min(
         operation_deadline,
@@ -1706,12 +1964,9 @@ bool download_file_attempt(
             0,
             0)) {
         request_error = GetLastError();
-        if (retryable_timeout) {
-            *retryable_timeout =
-                request_error ==
-                    ERROR_WINHTTP_TIMEOUT ||
-                request_error ==
-                    ERROR_WINHTTP_RESEND_REQUEST;
+        if (retryable_failure) {
+            *retryable_failure =
+                retryable_winhttp_error(request_error);
         }
         if (error) {
             *error =
@@ -1735,12 +1990,9 @@ bool download_file_attempt(
             request.get(),
             nullptr)) {
         request_error = GetLastError();
-        if (retryable_timeout) {
-            *retryable_timeout =
-                request_error ==
-                    ERROR_WINHTTP_TIMEOUT ||
-                request_error ==
-                    ERROR_WINHTTP_RESEND_REQUEST;
+        if (retryable_failure) {
+            *retryable_failure =
+                retryable_winhttp_error(request_error);
         }
         if (error) {
             *error =
@@ -1761,8 +2013,75 @@ bool download_file_attempt(
             WINHTTP_HEADER_NAME_BY_INDEX,
             &status_code,
             &status_size,
-            WINHTTP_NO_HEADER_INDEX) ||
-        status_code != HTTP_STATUS_OK) {
+            WINHTTP_NO_HEADER_INDEX)) {
+        if (error) {
+            *error = L"无法读取 OCR 下载响应状态。";
+        }
+        return false;
+    }
+
+    bool append_response = false;
+    if (status_code == HTTP_STATUS_PARTIAL_CONTENT && resume_offset > 0) {
+        DWORD range_bytes = 0;
+        WinHttpQueryHeaders(
+            request.get(),
+            WINHTTP_QUERY_CONTENT_RANGE,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            nullptr,
+            &range_bytes,
+            WINHTTP_NO_HEADER_INDEX);
+        std::wstring content_range;
+        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER &&
+            range_bytes >= sizeof(wchar_t)) {
+            std::vector<wchar_t> range_buffer(
+                range_bytes / sizeof(wchar_t) + 1,
+                L'\0');
+            if (WinHttpQueryHeaders(
+                    request.get(),
+                    WINHTTP_QUERY_CONTENT_RANGE,
+                    WINHTTP_HEADER_NAME_BY_INDEX,
+                    range_buffer.data(),
+                    &range_bytes,
+                    WINHTTP_NO_HEADER_INDEX)) {
+                content_range.assign(range_buffer.data());
+            }
+        }
+        if (!resume_response_is_usable_impl(
+                status_code,
+                resume_offset,
+                maximum_size,
+                content_range)) {
+            DeleteFileW(path.c_str());
+            if (retryable_failure) {
+                *retryable_failure = true;
+            }
+            if (error) {
+                *error = L"OCR 服务器返回了无效的断点续传范围，已安全重置缓存。";
+            }
+            return false;
+        }
+        append_response = true;
+    } else if (status_code == HTTP_STATUS_OK) {
+        // Some mirrors intentionally ignore Range. Restarting the same
+        // hash-addressed cache entry is safe; the completed file is still
+        // checked against the signed size and SHA256 before staging.
+        append_response = false;
+    } else {
+        if (retryable_failure) {
+            *retryable_failure =
+                status_code == HTTP_STATUS_REQUEST_TIMEOUT ||
+                status_code == kHttpStatusTooManyRequests ||
+                status_code == kHttpStatusInternalServerError ||
+                status_code == HTTP_STATUS_BAD_GATEWAY ||
+                status_code == HTTP_STATUS_SERVICE_UNAVAIL ||
+                status_code == HTTP_STATUS_GATEWAY_TIMEOUT ||
+                (resume_offset > 0 &&
+                 status_code == kHttpStatusRequestedRangeNotSatisfiable);
+        }
+        if (resume_offset > 0 &&
+            status_code == kHttpStatusRequestedRangeNotSatisfiable) {
+            DeleteFileW(path.c_str());
+        }
         if (error) {
             *error = std::format(
                 L"OCR 下载服务器返回 HTTP {}。",
@@ -1800,6 +2119,8 @@ bool download_file_attempt(
 
     DWORD content_length = 0;
     DWORD content_length_size = sizeof(content_length);
+    const std::uint64_t response_limit =
+        append_response ? maximum_size - resume_offset : maximum_size;
     if (WinHttpQueryHeaders(
             request.get(),
             WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
@@ -1807,7 +2128,7 @@ bool download_file_attempt(
             &content_length,
             &content_length_size,
             WINHTTP_NO_HEADER_INDEX) &&
-        (content_length == 0 || content_length > maximum_size)) {
+        (content_length == 0 || content_length > response_limit)) {
         if (error) {
             *error = L"OCR 下载响应大小超出允许范围。";
         }
@@ -1819,14 +2140,24 @@ bool download_file_attempt(
         nullptr,
         FALSE,
     };
+    if (!append_response &&
+        GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES &&
+        !DeleteFileW(path.c_str())) {
+        if (error) {
+            *error =
+                L"无法重置 OCR 断点缓存：" +
+                windows_error_message(GetLastError());
+        }
+        return false;
+    }
     UniqueHandle output_file(CreateFileW(
         path.c_str(),
-        GENERIC_WRITE,
+        append_response ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_WRITE,
         0,
         &file_security,
-        CREATE_NEW,
+        append_response ? OPEN_EXISTING : CREATE_NEW,
         FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_ATTRIBUTE_TEMPORARY |
-            FILE_FLAG_SEQUENTIAL_SCAN,
+            FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT,
         nullptr));
     if (!output_file.get() || output_file.get() == INVALID_HANDLE_VALUE) {
         if (error) {
@@ -1837,9 +2168,43 @@ bool download_file_attempt(
         return false;
     }
 
-    auto fail_and_remove = [&](std::wstring message) {
+    if (append_response) {
+        FILE_ATTRIBUTE_TAG_INFO attributes{};
+        LARGE_INTEGER existing_size{};
+        LARGE_INTEGER end_offset{};
+        if (!GetFileInformationByHandleEx(
+                output_file.get(),
+                FileAttributeTagInfo,
+                &attributes,
+                sizeof(attributes)) ||
+            (attributes.FileAttributes &
+             (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+            !GetFileSizeEx(output_file.get(), &existing_size) ||
+            existing_size.QuadPart < 0 ||
+            static_cast<std::uint64_t>(existing_size.QuadPart) != resume_offset ||
+            !SetFilePointerEx(
+                output_file.get(),
+                {},
+                &end_offset,
+                FILE_END) ||
+            end_offset.QuadPart != existing_size.QuadPart) {
+            output_file.reset();
+            DeleteFileW(path.c_str());
+            if (error) {
+                *error = L"OCR 断点缓存状态在续传前发生变化，已安全重置。";
+            }
+            if (retryable_failure) {
+                *retryable_failure = true;
+            }
+            return false;
+        }
+    }
+
+    auto fail_download = [&](std::wstring message, bool discard_partial) {
         output_file.reset();
-        std::filesystem::remove(path, filesystem_error);
+        if (discard_partial || !resume_existing) {
+            std::filesystem::remove(path, filesystem_error);
+        }
         if (error) {
             *error = std::move(message);
         }
@@ -1847,13 +2212,13 @@ bool download_file_attempt(
     };
 
     std::array<std::uint8_t, 64U * 1024U> buffer{};
-    std::uint64_t total_bytes = 0;
+    std::uint64_t total_bytes = append_response ? resume_offset : 0;
     for (;;) {
         if (stop_token.stop_requested()) {
-            return fail_and_remove(L"OCR 依赖下载已取消。");
+            return fail_download(L"OCR 依赖下载已取消。", false);
         }
         if (GetTickCount64() >= request_deadline) {
-            return fail_and_remove(L"OCR 依赖下载超过时间预算。");
+            return fail_download(L"OCR 依赖下载超过时间预算。", false);
         }
 
         DWORD bytes_read = 0;
@@ -1864,26 +2229,28 @@ bool download_file_attempt(
                 &bytes_read)) {
             const DWORD read_error =
                 GetLastError();
-            if (retryable_timeout) {
-                *retryable_timeout =
-                    read_error ==
-                    ERROR_WINHTTP_TIMEOUT;
+            if (retryable_failure) {
+                *retryable_failure =
+                    retryable_winhttp_error(read_error);
             }
-            return fail_and_remove(
+            return fail_download(
                 stop_token.stop_requested()
                     ? L"OCR 依赖下载已取消。"
                     : read_error ==
                               ERROR_WINHTTP_TIMEOUT
                           ? L"读取 OCR 下载响应超过时间预算。"
                           : L"读取 OCR 下载响应失败：" +
-                                windows_error_message(read_error));
+                                windows_error_message(read_error),
+                false);
         }
         if (bytes_read == 0) {
             break;
         }
         if (bytes_read > maximum_size ||
             total_bytes > maximum_size - bytes_read) {
-            return fail_and_remove(L"OCR 下载响应大小超出允许范围。");
+            return fail_download(
+                L"OCR 下载响应大小超出允许范围。",
+                true);
         }
 
         DWORD bytes_written = 0;
@@ -1894,9 +2261,10 @@ bool download_file_attempt(
                 &bytes_written,
                 nullptr) ||
             bytes_written != bytes_read) {
-            return fail_and_remove(
+            return fail_download(
                 L"写入 OCR 下载文件失败：" +
-                windows_error_message(GetLastError()));
+                    windows_error_message(GetLastError()),
+                false);
         }
         total_bytes += bytes_read;
         if (progress_callback) {
@@ -1909,12 +2277,21 @@ bool download_file_attempt(
         }
     }
 
+    if (resume_existing && total_bytes != maximum_size) {
+        if (retryable_failure) {
+            *retryable_failure = true;
+        }
+        return fail_download(
+            L"OCR 下载响应提前结束，将从已接收位置继续重试。",
+            false);
+    }
     if (total_bytes == 0 || !FlushFileBuffers(output_file.get())) {
-        return fail_and_remove(
+        return fail_download(
             total_bytes == 0
                 ? L"OCR 下载响应为空。"
                 : L"刷新 OCR 下载文件失败：" +
-                      windows_error_message(GetLastError()));
+                      windows_error_message(GetLastError()),
+            total_bytes == 0);
     }
     output_file.reset();
     if (!is_regular_non_reparse_file(path)) {
@@ -1935,12 +2312,14 @@ bool download_file(
     ULONGLONG operation_deadline,
     std::stop_token stop_token,
     const std::function<void(std::uint64_t)>& progress_callback,
+    bool resume_existing,
     std::wstring* error) {
     const ULONGLONG file_deadline =
         std::min(
             operation_deadline,
             GetTickCount64() +
                 kDownloadFileDeadlineMs);
+    std::wstring last_attempt_error;
     for (int attempt = 0;
          attempt < kMaxDownloadAttempts;
          ++attempt) {
@@ -1959,14 +2338,8 @@ bool download_file(
             return false;
         }
 
-        bool retryable_timeout = false;
+        bool retryable_failure = false;
         std::wstring attempt_error;
-        if (progress_callback) {
-            try {
-                progress_callback(0);
-            } catch (...) {
-            }
-        }
         if (download_file_attempt(
                 context,
                 url,
@@ -1975,11 +2348,12 @@ bool download_file(
                 file_deadline,
                 stop_token,
                 progress_callback,
-                &retryable_timeout,
+                resume_existing,
+                &retryable_failure,
                 &attempt_error)) {
             return true;
         }
-        if (!retryable_timeout ||
+        if (!retryable_failure ||
             stop_token.stop_requested() ||
             GetTickCount64() >= file_deadline) {
             if (error) {
@@ -1988,10 +2362,22 @@ bool download_file(
             }
             return false;
         }
+        last_attempt_error = std::move(attempt_error);
+        const DWORD retry_delay = static_cast<DWORD>(
+            std::min(2'000, 100 << std::min(attempt, 4)));
+        const ULONGLONG retry_deadline = std::min(
+            file_deadline,
+            GetTickCount64() + retry_delay);
+        while (!stop_token.stop_requested() &&
+               GetTickCount64() < retry_deadline) {
+            Sleep(25);
+        }
     }
     if (error) {
-        *error =
-            L"OCR 下载在连续超时后停止重试。";
+        *error = last_attempt_error.empty()
+                     ? std::wstring(L"OCR 下载在连续网络错误后停止重试。")
+                     : L"OCR 下载在连续网络错误后停止重试：" +
+                           last_attempt_error;
     }
     return false;
 }
@@ -2801,6 +3187,45 @@ std::optional<std::filesystem::path> create_private_directory(
         *error = L"无法创建随机 OCR 临时目录。";
     }
     return result;
+}
+
+std::optional<std::filesystem::path> ensure_download_cache_directory(
+    const std::filesystem::path& parent,
+    std::wstring* error) {
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(parent, filesystem_error);
+    if (filesystem_error || !is_directory_without_reparse(parent)) {
+        if (error) {
+            *error = L"无法创建安全的 OCR 断点缓存根目录。";
+        }
+        return std::nullopt;
+    }
+
+    const std::filesystem::path cache =
+        parent / kDownloadCacheDirectoryName;
+    if (!CreateDirectoryW(cache.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        if (error) {
+            *error =
+                L"无法创建 OCR 断点缓存目录：" +
+                windows_error_message(GetLastError());
+        }
+        return std::nullopt;
+    }
+    if (!is_directory_without_reparse(cache)) {
+        if (error) {
+            *error = L"OCR 断点缓存目录不是安全的本地目录。";
+        }
+        return std::nullopt;
+    }
+    const DWORD attributes = GetFileAttributesW(cache.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        SetFileAttributesW(
+            cache.c_str(),
+            attributes | FILE_ATTRIBUTE_HIDDEN |
+                FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
+    }
+    return cache;
 }
 
 Bitmap resize_bitmap_bilinear_once(
@@ -4397,9 +4822,22 @@ namespace {
 
 enum class WarmAttemptStatus {
     completed,
+    worker_error,
     cancelled,
+    timed_out,
     unavailable,
 };
+
+WarmAttemptStatus classify_warm_response(
+    bool response_valid,
+    bool response_ok) noexcept {
+    if (!response_valid) {
+        return WarmAttemptStatus::unavailable;
+    }
+    return response_ok
+               ? WarmAttemptStatus::completed
+               : WarmAttemptStatus::worker_error;
+}
 
 bool warm_worker_key_matches_impl(
     bool process_healthy,
@@ -4640,7 +5078,11 @@ public:
                         dependency_lease.sequence(),
                         image,
                         &response_error);
-                    if (!parsed) {
+                    const WarmAttemptStatus response_status =
+                        classify_warm_response(
+                            parsed.has_value(),
+                            parsed && parsed->ok);
+                    if (response_status == WarmAttemptStatus::unavailable) {
                         discard_locked(125);
                         return {
                             WarmAttemptStatus::unavailable,
@@ -4648,13 +5090,11 @@ public:
                             L"温热 OCR worker 协议错误：" + response_error,
                         };
                     }
-                    if (!parsed->ok) {
-                        const std::wstring worker_error = parsed->error;
-                        discard_locked(125);
+                    if (response_status == WarmAttemptStatus::worker_error) {
                         return {
-                            WarmAttemptStatus::unavailable,
+                            WarmAttemptStatus::worker_error,
                             {},
-                            L"温热 OCR worker 执行失败：" + worker_error,
+                            L"OCR 识别失败：" + parsed->error,
                         };
                     }
                     return {
@@ -4685,7 +5125,7 @@ public:
             if (GetTickCount64() >= deadline) {
                 discard_locked(124);
                 return {
-                    WarmAttemptStatus::unavailable,
+                    WarmAttemptStatus::timed_out,
                     {},
                     L"温热 OCR worker 超过 120 秒。",
                 };
@@ -5218,6 +5658,65 @@ bool dependency_hash_cache_key_matches(
         requested_size);
 }
 
+bool resume_response_is_usable(
+    DWORD status_code,
+    std::uint64_t existing_bytes,
+    std::uint64_t expected_bytes,
+    std::wstring_view content_range) noexcept {
+    return resume_response_is_usable_impl(
+        status_code,
+        existing_bytes,
+        expected_bytes,
+        content_range);
+}
+
+std::wstring dependency_download_cache_file_name(
+    std::wstring_view sha256,
+    std::uint64_t size) {
+    return dependency_download_cache_name(sha256, size);
+}
+
+std::vector<std::size_t> dependency_download_cache_owner_indices(
+    std::span<const OcrDependencyFile> files) {
+    return dependency_download_cache_owner_indices_impl(files);
+}
+
+void update_dependency_download_cache_alias_progress(
+    std::span<const std::size_t> owner_indices,
+    std::size_t file_index,
+    std::uint64_t current_bytes,
+    std::vector<std::uint64_t>& file_progress_bytes,
+    std::uint64_t& available_bytes) noexcept {
+    update_dependency_download_cache_alias_progress_impl(
+        owner_indices,
+        file_index,
+        current_bytes,
+        file_progress_bytes,
+        available_bytes);
+}
+
+void update_dependency_download_cache_alias_verification(
+    std::span<const std::size_t> owner_indices,
+    std::size_t file_index,
+    bool verified,
+    std::vector<bool>& file_verified) noexcept {
+    update_dependency_download_cache_alias_verification_impl(
+        owner_indices,
+        file_index,
+        verified,
+        file_verified);
+}
+
+bool dependency_download_cache_is_reusable(
+    std::span<const std::size_t> owner_indices,
+    const std::vector<bool>& file_verified,
+    std::size_t file_index) noexcept {
+    return dependency_download_cache_is_reusable_impl(
+        owner_indices,
+        file_verified,
+        file_index);
+}
+
 std::optional<std::wstring> sha256_file(
     const std::filesystem::path& path,
     std::stop_token stop_token,
@@ -5244,9 +5743,23 @@ std::optional<std::wstring> sha256_file(
 
 bool warm_failure_allows_fallback(
     bool cancelled,
+    bool timed_out,
+    bool stop_requested) noexcept {
+    const WarmAttemptStatus status =
+        cancelled ? WarmAttemptStatus::cancelled
+                  : timed_out ? WarmAttemptStatus::timed_out
+                              : WarmAttemptStatus::unavailable;
+    return warm_attempt_allows_fallback(
+        status,
+        stop_requested);
+}
+
+bool warm_response_allows_fallback(
+    bool response_valid,
+    bool response_ok,
     bool stop_requested) noexcept {
     return warm_attempt_allows_fallback(
-        cancelled ? WarmAttemptStatus::cancelled : WarmAttemptStatus::unavailable,
+        classify_warm_response(response_valid, response_ok),
         stop_requested);
 }
 
@@ -5716,7 +6229,7 @@ static OcrDependencyStatus failed_preparation_status(
     OcrDependencyStatus status;
     status.detail = error;
     if (cancelled) {
-        status.message = L"OCR 组件准备已取消；未完成内容已清理，可随时重试。";
+        status.message = L"OCR 组件准备已取消；下载进度已安全保留，可随时继续。";
         status.state = OcrDependencyState::cancelled;
         status.recommended_action = OcrRecoveryAction::retry;
         status.retryable = true;
@@ -5892,6 +6405,7 @@ static bool download_ocr_dependencies_impl(
             operation_deadline,
             stop_token,
             {},
+            false,
             &download_error) ||
         !download_file(
             download_context,
@@ -5901,6 +6415,7 @@ static bool download_ocr_dependencies_impl(
             operation_deadline,
             stop_token,
             {},
+            false,
             &download_error)) {
         if (error) {
             *error = L"下载 OCR 依赖清单或签名失败：" + download_error;
@@ -6043,8 +6558,119 @@ static bool download_ocr_dependencies_impl(
     for (const auto& file : manifest.files) {
         total_download_bytes += file.size;
     }
-    std::uint64_t completed_download_bytes = 0;
-    int detailed_percent = 5;
+    std::error_code filesystem_error;
+    const auto download_cache =
+        ensure_download_cache_directory(root, error);
+    if (!download_cache) {
+        return false;
+    }
+    std::set<std::wstring> expected_cache_names;
+    for (const auto& file : manifest.files) {
+        expected_cache_names.insert(path_comparison_key(
+            dependency_download_cache_name(file.sha256, file.size)));
+    }
+    std::filesystem::directory_iterator cache_iterator(
+        *download_cache,
+        std::filesystem::directory_options::none,
+        filesystem_error);
+    const std::filesystem::directory_iterator cache_end;
+    for (;
+         !filesystem_error && cache_iterator != cache_end;
+         cache_iterator.increment(filesystem_error)) {
+        const auto candidate = cache_iterator->path();
+        const std::wstring name = candidate.filename().wstring();
+        if (valid_dependency_download_cache_name(name) &&
+            !expected_cache_names.contains(path_comparison_key(name)) &&
+            is_regular_non_reparse_file(candidate)) {
+            DeleteFileW(candidate.c_str());
+        }
+    }
+    if (filesystem_error) {
+        if (error) {
+            *error = L"无法安全枚举 OCR 断点缓存目录。";
+        }
+        return false;
+    }
+    std::vector<std::filesystem::path> cache_paths;
+    std::vector<std::uint64_t> file_progress_bytes(
+        manifest.files.size(),
+        0);
+    std::vector<bool> file_cache_verified(
+        manifest.files.size(),
+        false);
+    const std::vector<std::size_t> cache_owner_indices =
+        dependency_download_cache_owner_indices_impl(manifest.files);
+    cache_paths.reserve(manifest.files.size());
+    for (const auto& file : manifest.files) {
+        cache_paths.push_back(
+            *download_cache /
+            dependency_download_cache_name(file.sha256, file.size));
+    }
+    std::uint64_t available_download_bytes = 0;
+    for (std::size_t i = 0; i < manifest.files.size(); ++i) {
+        if (cache_owner_indices[i] != i) {
+            continue;
+        }
+        const auto& file = manifest.files[i];
+        const auto& cache_path = cache_paths[i];
+        const DWORD attributes = GetFileAttributesW(cache_path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            continue;
+        }
+        if ((attributes &
+             (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+            if (error) {
+                *error = L"OCR 断点缓存包含不安全的路径。";
+            }
+            return false;
+        }
+        filesystem_error.clear();
+        const auto cached_size = std::filesystem::file_size(
+            cache_path,
+            filesystem_error);
+        if (filesystem_error || cached_size == 0 || cached_size > file.size) {
+            if (!DeleteFileW(cache_path.c_str())) {
+                if (error) {
+                    *error = L"无法重置无效的 OCR 断点缓存。";
+                }
+                return false;
+            }
+            filesystem_error.clear();
+            continue;
+        }
+        if (cached_size == file.size) {
+            std::wstring cache_error;
+            if (!verify_dependency_file(
+                    file,
+                    cache_path,
+                    &cache_error)) {
+                if (!DeleteFileW(cache_path.c_str())) {
+                    if (error) {
+                        *error = L"无法重置校验失败的 OCR 断点缓存。";
+                    }
+                    return false;
+                }
+                continue;
+            }
+            update_dependency_download_cache_alias_verification_impl(
+                cache_owner_indices,
+                i,
+                true,
+                file_cache_verified);
+        }
+        update_dependency_download_cache_alias_progress_impl(
+            cache_owner_indices,
+            i,
+            cached_size,
+            file_progress_bytes,
+            available_download_bytes);
+    }
+
+    int detailed_percent = total_download_bytes == 0
+                               ? 5
+                               : 5 + static_cast<int>(
+                                         (available_download_bytes * 85) /
+                                         total_download_bytes);
     publish_ocr_preparation_progress(
         detailed_progress_callback,
         {
@@ -6052,14 +6678,15 @@ static bool download_ocr_dependencies_impl(
             detailed_percent,
             0,
             manifest.files.size(),
-            0,
+            available_download_bytes,
             total_download_bytes,
             true,
-            L"正在下载 OCR 组件…",
+            available_download_bytes == 0
+                ? std::wstring(L"正在下载 OCR 组件…")
+                : std::wstring(L"已恢复 OCR 下载进度，正在继续准备…"),
         });
 
     const auto staging_directory = *working_directory / L"payload";
-    std::error_code filesystem_error;
     std::filesystem::create_directory(staging_directory, filesystem_error);
     if (filesystem_error ||
         !is_directory_without_reparse(staging_directory)) {
@@ -6097,23 +6724,26 @@ static bool download_ocr_dependencies_impl(
             return false;
         }
 
-        const auto temporary =
-            target.parent_path() / (target.filename().wstring() + L".download");
+        const std::size_t cache_owner = cache_owner_indices[i];
         const auto file_progress =
-            [&, i](std::uint64_t current_file_bytes) {
+            [&, i, cache_owner](std::uint64_t current_file_bytes) {
                 const std::uint64_t bounded_file_bytes =
                     std::min(current_file_bytes, file.size);
-                const std::uint64_t downloaded =
-                    completed_download_bytes + bounded_file_bytes;
+                if (bounded_file_bytes <= file_progress_bytes[cache_owner]) {
+                    return;
+                }
+                update_dependency_download_cache_alias_progress_impl(
+                    cache_owner_indices,
+                    cache_owner,
+                    bounded_file_bytes,
+                    file_progress_bytes,
+                    available_download_bytes);
                 const int percent = total_download_bytes == 0
                                         ? 5
                                         : 5 + static_cast<int>(
-                                                  (downloaded * 85) /
+                                                  (available_download_bytes * 85) /
                                                   total_download_bytes);
-                if (percent <= detailed_percent) {
-                    return;
-                }
-                detailed_percent = percent;
+                detailed_percent = std::max(detailed_percent, percent);
                 publish_ocr_preparation_progress(
                     detailed_progress_callback,
                     {
@@ -6121,7 +6751,7 @@ static bool download_ocr_dependencies_impl(
                         detailed_percent,
                         i,
                         manifest.files.size(),
-                        downloaded,
+                        available_download_bytes,
                         total_download_bytes,
                         true,
                         std::format(
@@ -6130,31 +6760,80 @@ static bool download_ocr_dependencies_impl(
                             manifest.files.size()),
                     });
             };
-        if (!download_file(
-                download_context,
-                file.url,
-                temporary,
-                file.size,
-                operation_deadline,
-                stop_token,
-                file_progress,
-                error) ||
-            !verify_dependency_file(file, temporary, error)) {
-            return false;
+        const auto& cache_path = cache_paths[cache_owner];
+        bool cache_ready = dependency_download_cache_is_reusable_impl(
+            cache_owner_indices,
+            file_cache_verified,
+            i);
+        if (!cache_ready &&
+            file_progress_bytes[cache_owner] == file.size) {
+            std::wstring cache_error;
+            cache_ready = verify_dependency_file(
+                file,
+                cache_path,
+                &cache_error);
+            update_dependency_download_cache_alias_verification_impl(
+                cache_owner_indices,
+                cache_owner,
+                cache_ready,
+                file_cache_verified);
         }
-        if (!MoveFileExW(
-                temporary.c_str(),
+        if (!cache_ready) {
+            if (GetFileAttributesW(cache_path.c_str()) !=
+                    INVALID_FILE_ATTRIBUTES &&
+                file_progress_bytes[cache_owner] == file.size) {
+                if (!DeleteFileW(cache_path.c_str())) {
+                    if (error) {
+                        *error = L"无法重置校验失败的 OCR 断点缓存。";
+                    }
+                    return false;
+                }
+            }
+            if (!download_file(
+                    download_context,
+                    file.url,
+                    cache_path,
+                    file.size,
+                    operation_deadline,
+                    stop_token,
+                    file_progress,
+                    true,
+                    error) ||
+                !verify_dependency_file(file, cache_path, error)) {
+                const DWORD cache_attributes =
+                    GetFileAttributesW(cache_path.c_str());
+                if (cache_attributes != INVALID_FILE_ATTRIBUTES) {
+                    std::error_code size_error;
+                    const auto cache_size = std::filesystem::file_size(
+                        cache_path,
+                        size_error);
+                    if (!size_error && cache_size >= file.size) {
+                        DeleteFileW(cache_path.c_str());
+                    }
+                }
+                return false;
+            }
+            update_dependency_download_cache_alias_verification_impl(
+                cache_owner_indices,
+                cache_owner,
+                true,
+                file_cache_verified);
+        }
+        file_progress(file.size);
+        if (!CopyFileW(
+                cache_path.c_str(),
                 target.c_str(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ||
-            !is_regular_non_reparse_file(target)) {
+                TRUE) ||
+            !verify_dependency_file(file, target, error)) {
             if (error) {
-                *error =
-                    L"无法安全写入 OCR 依赖文件：" +
-                    windows_error_message(GetLastError());
+                if (error->empty()) {
+                    *error =
+                        L"无法安全复用 OCR 下载缓存：" +
+                        windows_error_message(GetLastError());
+                }
             }
             return false;
         }
-        completed_download_bytes += file.size;
         publish_ocr_preparation_progress(
             detailed_progress_callback,
             {
@@ -6162,7 +6841,7 @@ static bool download_ocr_dependencies_impl(
                 detailed_percent,
                 i + 1,
                 manifest.files.size(),
-                completed_download_bytes,
+                available_download_bytes,
                 total_download_bytes,
                 true,
                 std::format(
@@ -6189,7 +6868,7 @@ static bool download_ocr_dependencies_impl(
             92,
             manifest.files.size(),
             manifest.files.size(),
-            completed_download_bytes,
+            available_download_bytes,
             total_download_bytes,
             true,
             L"正在安装已验证的 OCR 组件…",
@@ -6282,7 +6961,7 @@ static bool download_ocr_dependencies_impl(
             96,
             manifest.files.size(),
             manifest.files.size(),
-            completed_download_bytes,
+            available_download_bytes,
             total_download_bytes,
             true,
             L"正在复验 OCR 组件并固化安全版本…",
@@ -6365,6 +7044,15 @@ static bool download_ocr_dependencies_impl(
             final_verification_error);
     }
 
+    std::set<std::wstring> cleared_cache_entries;
+    for (const auto& cache_path : cache_paths) {
+        const std::wstring key = path_comparison_key(
+            cache_path.filename().wstring());
+        if (cleared_cache_entries.insert(key).second) {
+            DeleteFileW(cache_path.c_str());
+        }
+    }
+
     publish_legacy_progress(100);
     publish_ocr_preparation_progress(
         detailed_progress_callback,
@@ -6373,7 +7061,7 @@ static bool download_ocr_dependencies_impl(
             99,
             manifest.files.size(),
             manifest.files.size(),
-            completed_download_bytes,
+            available_download_bytes,
             total_download_bytes,
             false,
             L"安装完成，正在确认 OCR 组件可用状态…",
@@ -6930,6 +7618,16 @@ OcrOutput recognize_text(
         stop_token);
     if (warm_attempt.status == WarmAttemptStatus::completed) {
         return std::move(warm_attempt.output);
+    }
+    if (warm_attempt.status == WarmAttemptStatus::worker_error ||
+        warm_attempt.status == WarmAttemptStatus::timed_out) {
+        return {
+            false,
+            {},
+            warm_attempt.error.empty()
+                ? L"OCR 识别失败。"
+                : std::move(warm_attempt.error),
+        };
     }
     if (!warm_attempt_allows_fallback(
             warm_attempt.status,

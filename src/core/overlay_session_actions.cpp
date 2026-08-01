@@ -1,10 +1,12 @@
 #include "overlay_session.h"
+#include "overlay_ocr_result.h"
 
 #include <dwmapi.h>
 
 #include <array>
 #include <atomic>
 #include <exception>
+#include <memory>
 #include <new>
 #include <stdexcept>
 
@@ -184,6 +186,163 @@ RectI buttons_bounds(const std::vector<ToolbarButton>& buttons) {
     return bounds;
 }
 
+std::vector<std::wstring> split_toolbar_order(std::wstring_view value) {
+    std::vector<std::wstring> result;
+    std::size_t start = 0;
+    while (start <= value.size()) {
+        const std::size_t end = value.find(L',', start);
+        result.emplace_back(value.substr(
+            start,
+            end == std::wstring_view::npos ? value.size() - start
+                                           : end - start));
+        if (end == std::wstring_view::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return result;
+}
+
+[[nodiscard]] bool is_annotation_toolbar_item(std::wstring_view id) noexcept {
+    return id == L"select" || id == L"rect" || id == L"ellipse" ||
+           id == L"line" || id == L"arrow" || id == L"pen" ||
+           id == L"mosaic" || id == L"blur" || id == L"redact" ||
+           id == L"highlight" ||
+           id == L"watermark" || id == L"text" || id == L"serial" ||
+           id == L"eraser" || id == L"undo" || id == L"redo";
+}
+
+[[nodiscard]] bool toolbar_item_available(
+    const AppConfig& config,
+    std::wstring_view id) {
+    if (id == L"ocr" && !config.ocr_enabled) {
+        return false;
+    }
+    if ((id == L"lock" || is_annotation_toolbar_item(id)) &&
+        !config.annotation_enabled) {
+        return false;
+    }
+    // Closing the capture is the recovery path and intentionally remains
+    // present even if an older configuration listed it as hidden.
+    return id == L"close" || !hidden(config, id);
+}
+
+[[nodiscard]] bool is_fixed_trailing_toolbar_item(
+    std::wstring_view id) noexcept {
+    return id == L"undo" || id == L"redo" || id == L"save" ||
+           id == L"close" || id == L"done";
+}
+
+[[nodiscard]] std::wstring toolbar_short_label(std::wstring_view id) {
+    if (id == L"lock") return std::wstring(strings::toolbar_lock);
+    if (id == L"select") return L"选";
+    if (id == L"rect") return std::wstring(strings::toolbar_rectangle);
+    if (id == L"ellipse") return std::wstring(strings::toolbar_ellipse);
+    if (id == L"line") return std::wstring(strings::toolbar_line);
+    if (id == L"arrow") return std::wstring(strings::toolbar_arrow);
+    if (id == L"pen") return std::wstring(strings::toolbar_pen);
+    if (id == L"mosaic" || id == L"blur") return L"糊";
+    if (id == L"redact") return L"遮";
+    if (id == L"highlight") return std::wstring(strings::toolbar_highlight);
+    if (id == L"watermark") return L"水";
+    if (id == L"text") return std::wstring(strings::toolbar_text);
+    if (id == L"serial") return std::wstring(strings::toolbar_serial);
+    if (id == L"eraser") return std::wstring(strings::toolbar_eraser);
+    if (id == L"undo") return std::wstring(strings::toolbar_undo);
+    if (id == L"redo") return std::wstring(strings::toolbar_redo);
+    if (id == L"ocr") return std::wstring(strings::toolbar_ocr);
+    if (id == L"scroll") return L"长";
+    if (id == L"pin") return L"钉";
+    if (id == L"copy") return std::wstring(strings::toolbar_copy);
+    if (id == L"save") return std::wstring(strings::toolbar_save);
+    if (id == L"close") return std::wstring(strings::toolbar_close);
+    if (id == L"done") return L"完成";
+    if (id == L"group_shape") return L"形";
+    if (id == L"group_brush") return L"画";
+    if (id == L"group_privacy") return L"隐";
+    if (id == L"group_mark") return L"标";
+    if (id == L"group_capture") return L"捕";
+    if (id == L"more") return L"更多";
+    return {};
+}
+
+[[nodiscard]] std::wstring toolbar_menu_label(
+    std::wstring_view id,
+    const AppConfig& config) {
+    if (id == L"group_shape") return L"形状";
+    if (id == L"group_brush") return L"画笔";
+    if (id == L"group_privacy") return L"隐私处理";
+    if (id == L"group_mark") return L"文字与标记";
+    if (id == L"group_capture") return L"捕获能力";
+    if (id == L"lock") return L"连续标注";
+    if (id == L"select") return std::format(L"选择\t{}", config.tool_shortcut_select);
+    if (id == L"rect") return std::format(L"矩形\t{}", config.tool_shortcut_rectangle);
+    if (id == L"ellipse") return std::format(L"椭圆\t{}", config.tool_shortcut_ellipse);
+    if (id == L"line") return std::format(L"直线\t{}", config.tool_shortcut_line);
+    if (id == L"arrow") return std::format(L"箭头\t{}", config.tool_shortcut_arrow);
+    if (id == L"pen") return std::format(L"画笔\t{}", config.tool_shortcut_pen);
+    if (id == L"mosaic") return std::format(L"马赛克\t{}", config.tool_shortcut_mosaic);
+    if (id == L"blur") return std::format(L"高斯模糊\t{}", config.tool_shortcut_blur);
+    if (id == L"redact") return L"实心遮挡";
+    if (id == L"highlight") return std::format(L"荧光笔\t{}", config.tool_shortcut_highlight);
+    if (id == L"watermark") return L"水印";
+    if (id == L"text") return std::format(L"文本\t{}", config.tool_shortcut_text);
+    if (id == L"serial") return std::format(L"步骤序号\t{}", config.tool_shortcut_serial);
+    if (id == L"eraser") return std::format(L"对象橡皮擦\t{}", config.tool_shortcut_eraser);
+    if (id == L"ocr") return std::format(L"屏幕识字\t{}", config.capture_ocr_shortcut);
+    if (id == L"scroll") return L"滚动截图";
+    if (id == L"pin") return L"贴图";
+    if (id == L"copy") return L"复制到剪贴板\tCtrl+C";
+    if (id == L"save") return L"保存到文件\tCtrl+S";
+    if (id == L"undo") return L"撤销\tCtrl+Z";
+    if (id == L"redo") return L"重做\tCtrl+Y";
+    if (id == L"close") return L"关闭\tEsc";
+    if (id == L"done") return L"完成\tEnter";
+    return std::wstring(id);
+}
+
+[[nodiscard]] std::vector<std::wstring> ordered_visible_toolbar_ids(
+    const AppConfig& config) {
+    std::vector<std::wstring> visible;
+    for (const auto& id : split_toolbar_order(
+             normalize_toolbar_order(config.toolbar_order))) {
+        if (toolbar_item_available(config, id)) {
+            visible.push_back(id);
+        }
+    }
+    return visible;
+}
+
+[[nodiscard]] std::vector<std::pair<std::wstring, std::wstring>>
+grouped_middle_toolbar_items(const AppConfig& config) {
+    const auto visible_ids = ordered_visible_toolbar_ids(config);
+    std::vector<std::pair<std::wstring, std::wstring>> ordered_middle;
+    for (const auto& id : visible_ids) {
+        if (is_fixed_trailing_toolbar_item(id)) {
+            continue;
+        }
+        ordered_middle.push_back({id, toolbar_short_label(id)});
+    }
+    auto result = collapse_toolbar_groups(ordered_middle);
+    for (auto& item : result) {
+        if (toolbar_is_group_id(item.first)) {
+            item.second = toolbar_short_label(item.first);
+        }
+    }
+    return result;
+}
+
+[[nodiscard]] std::vector<std::pair<std::wstring, std::wstring>>
+toolbar_group_members(const AppConfig& config, std::wstring_view group) {
+    std::vector<std::pair<std::wstring, std::wstring>> result;
+    for (const auto& id : ordered_visible_toolbar_ids(config)) {
+        if (toolbar_group_for_item(id) == group) {
+            result.push_back({id, toolbar_menu_label(id, config)});
+        }
+    }
+    return result;
+}
+
 Tool tool_from_id(std::wstring_view id) {
     if (id == L"select") return Tool::select;
     if (id == L"rect") return Tool::rectangle;
@@ -193,6 +352,7 @@ Tool tool_from_id(std::wstring_view id) {
     if (id == L"pen") return Tool::pen;
     if (id == L"mosaic") return Tool::mosaic;
     if (id == L"blur") return Tool::blur;
+    if (id == L"redact") return Tool::redact;
     if (id == L"highlight") return Tool::highlight;
     if (id == L"text") return Tool::text;
     if (id == L"serial") return Tool::serial;
@@ -212,6 +372,7 @@ Tool tool_from_id(std::wstring_view id) {
         case Tool::serial: return L"serial";
         case Tool::mosaic: return L"mosaic";
         case Tool::blur: return L"blur";
+        case Tool::redact: return L"redact";
         case Tool::highlight: return L"highlight";
         case Tool::watermark: return L"watermark";
         case Tool::eraser: return L"eraser";
@@ -296,13 +457,13 @@ bool tool_is_feishu_style_shape(Tool tool) {
 bool tool_supports_color(Tool tool) {
     return tool == Tool::rectangle || tool == Tool::ellipse || tool == Tool::line || tool == Tool::arrow ||
            tool == Tool::pen || tool == Tool::highlight || tool == Tool::text || tool == Tool::serial ||
-           tool == Tool::watermark;
+           tool == Tool::watermark || tool == Tool::redact;
 }
 
 bool tool_supports_width(Tool tool) {
     return tool == Tool::rectangle || tool == Tool::ellipse || tool == Tool::line || tool == Tool::arrow ||
            tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::serial ||
-           tool == Tool::blur || tool == Tool::eraser;
+           tool == Tool::blur || tool == Tool::redact || tool == Tool::eraser;
 }
 
 bool tool_supports_alpha(Tool tool) {
@@ -326,17 +487,18 @@ float nearest_text_size(float value) {
 }
 
 std::wstring text_size_label(float value) {
-    return std::format(L"{:.0f}pt", nearest_text_size(value));
+    return text_size_label_px(value);
 }
 
 void add_feishu_palette(std::vector<std::pair<std::wstring, std::wstring>>& items) {
+    // Keep the most useful quick colours on the 40-DIP surface. The last
+    // swatch always shows the active colour and opens the full RGB/HEX picker,
+    // so neutral and brand colours remain one click away without stretching
+    // every contextual toolbar across the capture.
     items.push_back({L"color_red", L""});
     items.push_back({L"color_yellow", L""});
     items.push_back({L"color_green", L""});
     items.push_back({L"color_blue", L""});
-    items.push_back({L"color_black", L""});
-    items.push_back({L"color_gray", L""});
-    items.push_back({L"color_white", L""});
     items.push_back({L"color_custom", L""});
 }
 
@@ -716,27 +878,34 @@ private:
         config.text_font_family.c_str());
 }
 
-[[nodiscard]] RectI measure_selected_text_bounds(
+[[nodiscard]] TextAnnotationMeasurement measure_selected_text(
     HDC dc,
     const std::wstring& text,
     POINT origin,
+    int text_box_width_px,
     TextStyle style) noexcept {
     if (!dc || text.empty()) {
         return {};
     }
-    RECT measured{origin.x, origin.y, origin.x, origin.y};
+    const int safe_box_width = std::max(0, text_box_width_px);
+    RECT measured{
+        origin.x,
+        origin.y,
+        origin.x + safe_box_width,
+        origin.y,
+    };
     if (DrawTextW(
             dc,
             text.c_str(),
             static_cast<int>(text.size()),
             &measured,
-            DT_LEFT | DT_TOP | DT_CALCRECT | DT_NOPREFIX) == 0) {
+            text_draw_flags(safe_box_width, true)) == 0) {
         return {};
     }
     const RectI logical{
-        measured.left,
-        measured.top,
-        measured.right,
+        origin.x,
+        origin.y,
+        safe_box_width > 0 ? origin.x + safe_box_width : measured.right,
         measured.bottom,
     };
 
@@ -744,56 +913,58 @@ private:
     // bold/italic first or last glyph. Query each visual line's boundary
     // glyphs so hit testing also contains the pixels that GDI really emits.
     RectI ink = logical;
-    std::size_t line_start = 0;
-    while (line_start <= text.size()) {
-        const std::size_t line_end = text.find(L'\n', line_start);
-        const std::size_t count =
-            (line_end == std::wstring::npos ? text.size() : line_end) -
-            line_start;
-        std::size_t visual_count = count;
-        if (visual_count > 0 &&
-            text[line_start + visual_count - 1] == L'\r') {
-            --visual_count;
-        }
-        if (visual_count > 0) {
-            RECT line_bounds{origin.x, origin.y, origin.x, origin.y};
-            if (DrawTextW(
-                    dc,
-                    text.data() + line_start,
-                    static_cast<int>(visual_count),
-                    &line_bounds,
-                    DT_LEFT | DT_TOP | DT_CALCRECT | DT_NOPREFIX |
-                        DT_SINGLELINE) != 0) {
-                ABC first{};
-                if (GetCharABCWidthsW(
+    if (safe_box_width == 0) {
+        std::size_t line_start = 0;
+        while (line_start <= text.size()) {
+            const std::size_t line_end = text.find(L'\n', line_start);
+            const std::size_t count =
+                (line_end == std::wstring::npos ? text.size() : line_end) -
+                line_start;
+            std::size_t visual_count = count;
+            if (visual_count > 0 &&
+                text[line_start + visual_count - 1] == L'\r') {
+                --visual_count;
+            }
+            if (visual_count > 0) {
+                RECT line_bounds{origin.x, origin.y, origin.x, origin.y};
+                if (DrawTextW(
                         dc,
-                        text[line_start],
-                        text[line_start],
-                        &first)) {
-                    ink.left = std::min(
-                        ink.left,
-                        static_cast<int>(origin.x) +
-                            std::min(0, first.abcA));
-                }
-                ABC last{};
-                const wchar_t last_character =
-                    text[line_start + visual_count - 1];
-                if (GetCharABCWidthsW(
-                        dc,
-                        last_character,
-                        last_character,
-                        &last)) {
-                    ink.right = std::max(
-                        ink.right,
-                        static_cast<int>(line_bounds.right) +
-                            std::max(0, -last.abcC));
+                        text.data() + line_start,
+                        static_cast<int>(visual_count),
+                        &line_bounds,
+                        DT_LEFT | DT_TOP | DT_CALCRECT | DT_NOPREFIX |
+                            DT_SINGLELINE) != 0) {
+                    ABC first{};
+                    if (GetCharABCWidthsW(
+                            dc,
+                            text[line_start],
+                            text[line_start],
+                            &first)) {
+                        ink.left = std::min(
+                            ink.left,
+                            static_cast<int>(origin.x) +
+                                std::min(0, first.abcA));
+                    }
+                    ABC last{};
+                    const wchar_t last_character =
+                        text[line_start + visual_count - 1];
+                    if (GetCharABCWidthsW(
+                            dc,
+                            last_character,
+                            last_character,
+                            &last)) {
+                        ink.right = std::max(
+                            ink.right,
+                            static_cast<int>(line_bounds.right) +
+                                std::max(0, -last.abcC));
+                    }
                 }
             }
+            if (line_end == std::wstring::npos) {
+                break;
+            }
+            line_start = line_end + 1;
         }
-        if (line_end == std::wstring::npos) {
-            break;
-        }
-        line_start = line_end + 1;
     }
 
     RectI result = ink;
@@ -808,7 +979,7 @@ private:
         result.right += 2;
         result.bottom += 2;
     }
-    return result;
+    return {logical, result};
 }
 
 void draw_polyline(HDC dc, const std::vector<POINT>& points) {
@@ -827,27 +998,30 @@ bool draw_text_with_style(
     RECT bounds,
     COLORREF color,
     TextStyle style,
-    HFONT font) {
+    HFONT font,
+    int text_box_width_px) {
     SelectedObject selected_font(dc, font);
     if (!selected_font.valid()) {
         return false;
     }
     SetBkMode(dc, TRANSPARENT);
+    const UINT flags = text_draw_flags(text_box_width_px);
 
     if (style == TextStyle::dark) {
-        const RectI measured_bounds = measure_selected_text_bounds(
+        const TextAnnotationMeasurement measurement = measure_selected_text(
             dc,
             text,
             POINT{bounds.left, bounds.top},
+            text_box_width_px,
             style);
-        if (measured_bounds.empty()) {
+        if (measurement.visual_bounds.empty()) {
             return false;
         }
         const RECT measured{
-            measured_bounds.left,
-            measured_bounds.top,
-            measured_bounds.right,
-            measured_bounds.bottom,
+            measurement.visual_bounds.left,
+            measurement.visual_bounds.top,
+            measurement.visual_bounds.right,
+            measurement.visual_bounds.bottom,
         };
         OwnedGdiObject background(CreateSolidBrush(RGB(31, 35, 41)));
         if (!background.get()) {
@@ -860,7 +1034,7 @@ bool draw_text_with_style(
             text.c_str(),
             static_cast<int>(text.size()),
             &bounds,
-            DT_LEFT | DT_TOP | DT_NOPREFIX);
+            flags);
     } else if (style == TextStyle::outline) {
         SetTextColor(dc, RGB(255, 255, 255));
         for (int dy = -2; dy <= 2; ++dy) {
@@ -875,7 +1049,7 @@ bool draw_text_with_style(
                     text.c_str(),
                     static_cast<int>(text.size()),
                     &outline,
-                    DT_LEFT | DT_TOP | DT_NOPREFIX);
+                    flags);
             }
         }
         SetTextColor(dc, color);
@@ -884,7 +1058,7 @@ bool draw_text_with_style(
             text.c_str(),
             static_cast<int>(text.size()),
             &bounds,
-            DT_LEFT | DT_TOP | DT_NOPREFIX);
+            flags);
     } else {
         SetTextColor(dc, color);
         DrawTextW(
@@ -892,7 +1066,7 @@ bool draw_text_with_style(
             text.c_str(),
             static_cast<int>(text.size()),
             &bounds,
-            DT_LEFT | DT_TOP | DT_NOPREFIX);
+            flags);
     }
 
     return true;
@@ -1008,9 +1182,71 @@ bool blend_watermark(HDC compatible_dc,
     return true;
 }
 
+[[nodiscard]] bool paint_solid_redaction(
+    Bitmap& bitmap,
+    const Annotation& annotation) noexcept {
+    if (!bitmap.valid() || annotation.tool != Tool::redact) {
+        return false;
+    }
+    const std::array<std::uint8_t, Bitmap::bytes_per_pixel> pixel{
+        GetBValue(annotation.color),
+        GetGValue(annotation.color),
+        GetRValue(annotation.color),
+        255U,
+    };
+    const auto paint_span = [&](int y, int left, int right) {
+        if (y < 0 || y >= bitmap.height) {
+            return;
+        }
+        left = std::clamp(left, 0, bitmap.width);
+        right = std::clamp(right, 0, bitmap.width);
+        if (left >= right) {
+            return;
+        }
+        auto row = bitmap.row(y);
+        for (int x = left; x < right; ++x) {
+            const std::size_t offset =
+                static_cast<std::size_t>(x) * Bitmap::bytes_per_pixel;
+            std::copy(pixel.begin(), pixel.end(), row.begin() + offset);
+        }
+    };
+
+    if (annotation.points.empty()) {
+        RectI bounds{
+            annotation.start.x,
+            annotation.start.y,
+            annotation.end.x,
+            annotation.end.y,
+        };
+        bounds = bounds.normalized();
+        const int top = std::clamp(bounds.top, 0, bitmap.height);
+        const int bottom = std::clamp(bounds.bottom, 0, bitmap.height);
+        const int left = std::clamp(bounds.left, 0, bitmap.width);
+        const int right = std::clamp(bounds.right, 0, bitmap.width);
+        if (left >= right || top >= bottom) {
+            return false;
+        }
+        for (int y = top; y < bottom; ++y) {
+            paint_span(y, left, right);
+        }
+        return true;
+    }
+
+    const int radius = std::max(
+        1,
+        static_cast<int>(std::ceil(
+            tool_visual_radius(Tool::redact, annotation.width))));
+    return apply_privacy_stroke(
+               bitmap,
+               annotation.points,
+               radius,
+               {PrivacyEffectMode::solid, 255, annotation.color}) ==
+           PrivacyEffectResult::applied;
+}
+
 }  // namespace
 
-RectI measure_text_annotation_bounds(
+TextAnnotationMeasurement measure_text_annotation(
     const Annotation& annotation,
     const AppConfig& config) noexcept {
     if (annotation.tool != Tool::text || annotation.text.empty()) {
@@ -1028,22 +1264,101 @@ RectI measure_text_annotation_bounds(
     if (!selected_font.valid()) {
         return {};
     }
-    return measure_selected_text_bounds(
+    return measure_selected_text(
         dc.get(),
         annotation.text,
         annotation.start,
+        annotation.text_box_width_px,
         annotation.text_style);
+}
+
+RectI measure_text_annotation_bounds(
+    const Annotation& annotation,
+    const AppConfig& config) noexcept {
+    return measure_text_annotation(annotation, config).visual_bounds;
 }
 
 bool refresh_text_annotation_bounds(
     Annotation& annotation,
     const AppConfig& config) noexcept {
-    const RectI measured = measure_text_annotation_bounds(annotation, config);
-    if (measured.empty()) {
+    const TextAnnotationMeasurement measured =
+        measure_text_annotation(annotation, config);
+    if (measured.visual_bounds.empty() || measured.layout_bounds.empty()) {
         annotation.measured_text_bounds = {};
+        annotation.measured_text_layout_bounds = {};
         return false;
     }
-    annotation.measured_text_bounds = measured;
+    annotation.measured_text_bounds = measured.visual_bounds;
+    annotation.measured_text_layout_bounds = measured.layout_bounds;
+    return true;
+}
+
+bool fit_text_annotation_to_canvas(
+    Annotation& annotation,
+    const AppConfig& config,
+    int canvas_width,
+    int canvas_height) noexcept {
+    if (annotation.tool != Tool::text || annotation.text.empty() ||
+        canvas_width <= 0 || canvas_height <= 0) {
+        annotation.measured_text_bounds = {};
+        annotation.measured_text_layout_bounds = {};
+        return false;
+    }
+
+    annotation.width = std::clamp(
+        std::isfinite(annotation.width) ? annotation.width : 18.0F,
+        kMinimumTextSizePx,
+        kMaximumTextSizePx);
+    annotation.start.x = std::clamp(
+        annotation.start.x, 0L, static_cast<long>(canvas_width));
+    annotation.start.y = std::clamp(
+        annotation.start.y, 0L, static_cast<long>(canvas_height));
+
+    const int horizontal_style_padding =
+        annotation.text_style == TextStyle::dark
+            ? 8
+            : (annotation.text_style == TextStyle::outline ? 4 : 0);
+    const int maximum_box_width =
+        std::max(1, canvas_width - horizontal_style_padding);
+    if (annotation.text_box_width_px > 0) {
+        const int desired_minimum = minimum_text_box_width_px(annotation.width);
+        annotation.text_box_width_px =
+            maximum_box_width >= desired_minimum
+                ? std::clamp(
+                      annotation.text_box_width_px,
+                      desired_minimum,
+                      maximum_box_width)
+                : maximum_box_width;
+    }
+
+    if (!refresh_text_annotation_bounds(annotation, config)) {
+        return false;
+    }
+    if (annotation.text_box_width_px == 0 &&
+        annotation.measured_text_bounds.width() > canvas_width) {
+        annotation.text_box_width_px = maximum_box_width;
+        if (!refresh_text_annotation_bounds(annotation, config)) {
+            return false;
+        }
+    }
+
+    const RectI bounds = annotation_bounds(annotation);
+    int delta_x{};
+    int delta_y{};
+    if (bounds.width() <= canvas_width) {
+        delta_x = std::clamp(0, -bounds.left, canvas_width - bounds.right);
+    } else {
+        delta_x = -bounds.left;
+    }
+    if (bounds.height() <= canvas_height) {
+        delta_y = std::clamp(0, -bounds.top, canvas_height - bounds.bottom);
+    } else {
+        delta_y = -bounds.top;
+    }
+    if (delta_x != 0 || delta_y != 0) {
+        translate_annotation(annotation, delta_x, delta_y);
+    }
+    annotation.end = annotation.start;
     return true;
 }
 
@@ -1062,93 +1377,22 @@ unsigned int OverlaySession::ui_dpi_at(POINT point) const noexcept {
 
 void OverlaySession::build_toolbar() {
     toolbar_.clear();
-    std::vector<std::pair<std::wstring, std::wstring>> items;
-    items.push_back({L"drag", L""});
+    toolbar_overflow_items_.clear();
 
-    auto split_by_comma = [](std::wstring_view value) {
-        std::vector<std::wstring> result;
-        std::size_t start = 0;
-        while (start <= value.size()) {
-            const std::size_t end = value.find(L',', start);
-            result.emplace_back(value.substr(start, end == std::wstring_view::npos ? value.size() - start : end - start));
-            if (end == std::wstring_view::npos) {
-                break;
-            }
-            start = end + 1;
-        }
-        return result;
+    const std::vector<std::pair<std::wstring, std::wstring>> leading{
+        {L"drag", L""},
     };
-
-    auto get_tool_label = [&](std::wstring_view id) -> std::wstring {
-        if (id == L"lock") return std::wstring(strings::toolbar_lock);
-        if (id == L"select") return L"选";
-        if (id == L"rect") return std::wstring(strings::toolbar_rectangle);
-        if (id == L"ellipse") return std::wstring(strings::toolbar_ellipse);
-        if (id == L"line") return std::wstring(strings::toolbar_line);
-        if (id == L"arrow") return std::wstring(strings::toolbar_arrow);
-        if (id == L"pen") return std::wstring(strings::toolbar_pen);
-        if (id == L"mosaic") return std::wstring(strings::toolbar_mosaic);
-        if (id == L"blur") return L"糊";
-        if (id == L"highlight") return std::wstring(strings::toolbar_highlight);
-        if (id == L"watermark") return L"水";
-        if (id == L"text") return std::wstring(strings::toolbar_text);
-        if (id == L"serial") return std::wstring(strings::toolbar_serial);
-        if (id == L"eraser") return std::wstring(strings::toolbar_eraser);
-        if (id == L"undo") return std::wstring(strings::toolbar_undo);
-        if (id == L"redo") return std::wstring(strings::toolbar_redo);
-        if (id == L"ocr") return std::wstring(strings::toolbar_ocr);
-        if (id == L"scroll") return L"长";
-        if (id == L"pin") return L"钉";
-        if (id == L"copy") return std::wstring(strings::toolbar_copy);
-        if (id == L"save") return std::wstring(strings::toolbar_save);
-        if (id == L"close") return std::wstring(strings::toolbar_close);
-        return L"";
-    };
-
-    auto get_tool_category = [](std::wstring_view id) -> int {
-        if (id == L"lock") return 1;
-        if (id == L"rect" || id == L"ellipse" || id == L"line" || id == L"arrow" ||
-            id == L"pen" || id == L"text" || id == L"serial") {
-            return 2;
+    const auto middle = grouped_middle_toolbar_items(request_.config);
+    std::vector<std::pair<std::wstring, std::wstring>> trailing;
+    for (const std::wstring_view id : {
+             L"undo", L"redo", L"save", L"close"}) {
+        if (toolbar_item_available(request_.config, id)) {
+            trailing.push_back({std::wstring(id), toolbar_short_label(id)});
         }
-        if (id == L"mosaic" || id == L"blur" || id == L"highlight" || id == L"watermark" ||
-            id == L"pin" || id == L"ocr" || id == L"select" || id == L"scroll" || id == L"eraser") {
-            return 3;
-        }
-        if (id == L"undo" || id == L"redo") return 4;
-        if (id == L"save" || id == L"close" || id == L"copy") return 5;
-        return 0;
-    };
-
-    int last_category = -1;
-    const auto ordered_tools = split_by_comma(
-        normalize_toolbar_order(request_.config.toolbar_order));
-    for (const auto& token : ordered_tools) {
-        if (token == L"ocr" && !request_.config.ocr_enabled) continue;
-        if (token == L"lock" && !request_.config.annotation_enabled) continue;
-
-        int cat = get_tool_category(token);
-        const bool annotation_tool =
-            token == L"select" || token == L"rect" || token == L"ellipse" || token == L"line" ||
-            token == L"arrow" || token == L"pen" || token == L"mosaic" || token == L"blur" ||
-            token == L"highlight" || token == L"watermark" || token == L"text" ||
-            token == L"serial" || token == L"eraser" || token == L"undo" || token == L"redo";
-        if (annotation_tool && !request_.config.annotation_enabled) continue;
-
-        if (hidden(request_.config, token) && token != L"close") {
-            continue;
-        }
-
-        std::wstring label = get_tool_label(token);
-        if (label.empty()) continue;
-
-        if (last_category != -1 && last_category != cat) {
-            add_separator(items);
-        }
-        items.push_back({std::wstring(token), label});
-        last_category = cat;
     }
-    trim_trailing_separators(items);
+    // Done is the sole primary action and intentionally is not part of the
+    // persisted 22-item customization format.
+    trailing.push_back({L"done", toolbar_short_label(L"done")});
 
     const RectI host_bounds = toolbar_host_bounds(monitors_, selection_, virtual_bounds_);
     const POINT host_center{
@@ -1157,8 +1401,23 @@ void OverlaySession::build_toolbar() {
     };
     const OverlayUiMetrics ui{ui_dpi_at(host_center)};
     const ToolbarMetrics metrics{
-        ui.px(40), ui.px(40), ui.px(4), ui.px(8), ui.dpi};
-    const auto rows = wrap_toolbar_items(items, metrics, host_bounds);
+        ui.px(kToolbarButtonDip),
+        ui.px(kToolbarButtonDip),
+        ui.px(kToolbarSpacingDip),
+        ui.px(kToolbarPaddingDip),
+        ui.dpi};
+    auto plan = fit_toolbar_single_row(
+        leading,
+        middle,
+        trailing,
+        metrics,
+        host_bounds,
+        {L"more", toolbar_short_label(L"more")});
+    toolbar_overflow_items_ = std::move(plan.overflow);
+    std::vector<ToolbarRow> rows;
+    if (!plan.row.items.empty()) {
+        rows.push_back(std::move(plan.row));
+    }
     const int total_width = toolbar_width(rows, metrics);
     const int total_height = toolbar_height(rows, metrics);
     if (rows.empty()) {
@@ -1203,8 +1462,41 @@ void OverlaySession::build_toolbar() {
     }
 
     place_toolbar_rows(toolbar_, rows, metrics, left, top);
+    const std::wstring_view active_id =
+        active_tool_ == Tool::select ? L"select"
+                                    : style_id_from_tool(active_tool_);
+    const bool overflow_busy =
+        ocr_running_ &&
+        std::ranges::any_of(
+            toolbar_overflow_items_,
+            [](const auto& item) {
+                return item.first == L"ocr" ||
+                       item.first == L"group_capture";
+            });
     for (auto& button : toolbar_) {
-        if (button.id == L"undo" && !annotation_history_.can_undo()) {
+        button.checked =
+            (button.id == L"lock" && request_.config.annotation_locked_tool) ||
+            (!active_id.empty() &&
+             (button.id == active_id ||
+              (toolbar_is_group_id(button.id) &&
+               toolbar_group_for_item(active_id) == button.id)));
+        button.busy =
+            ocr_running_ &&
+            (button.id == L"ocr" || button.id == L"group_capture" ||
+             (button.id == L"more" && overflow_busy));
+
+        if (ocr_running_) {
+            if (button.id == L"close") {
+                button.enabled =
+                    ocr_cancellable_.load(std::memory_order_relaxed);
+                if (!button.enabled) {
+                    button.disabled_reason = L"OCR 正在完成关键步骤，暂时无法取消";
+                }
+            } else if (button.id != L"|") {
+                button.enabled = false;
+                button.disabled_reason = L"正在识别文字；可按 Esc 或点击关闭取消";
+            }
+        } else if (button.id == L"undo" && !annotation_history_.can_undo()) {
             button.enabled = false;
             button.disabled_reason = L"暂无可撤销操作";
         } else if (button.id == L"redo" && !annotation_history_.can_redo()) {
@@ -1239,27 +1531,53 @@ void OverlaySession::build_sub_toolbar() {
     }
     std::vector<std::pair<std::wstring, std::wstring>> items;
 
-    if (style_tool == Tool::mosaic || style_tool == Tool::blur) {
-        const bool mosaic_available =
-            !hidden(request_.config, L"mosaic");
-        const bool blur_available =
-            !hidden(request_.config, L"blur");
-        if (mosaic_available && blur_available) {
-            items.push_back({L"effect_mosaic", L"马赛克"});
-            items.push_back({L"effect_blur", L"模糊"});
-        }
-        if (effect_geometry_mode_available(
-                active_tool_, style_tool, editing_selected)) {
-            items.push_back({L"|", L""});
-            items.push_back({L"mode_smear", L"涂抹"});
-            items.push_back({L"mode_rect", L"框选"});
-        }
-        items.push_back({L"|", L""});
-        items.push_back({L"mosaic_strength_slider", L""});
+    if (style_tool == Tool::eraser) {
+        items.push_back({L"eraser_mode_local", L""});
+        items.push_back({L"eraser_mode_object", L""});
         items.push_back({L"|", L""});
         items.push_back({L"width_small", L""});
         items.push_back({L"width_medium", L""});
         items.push_back({L"width_large", L""});
+    } else if (tool_is_privacy_effect(style_tool)) {
+        const bool mosaic_available =
+            !hidden(request_.config, L"mosaic");
+        const bool blur_available =
+            !hidden(request_.config, L"blur");
+        const bool redaction_available =
+            !hidden(request_.config, L"redact");
+        const int available_effects =
+            static_cast<int>(mosaic_available) +
+            static_cast<int>(blur_available) +
+            static_cast<int>(redaction_available);
+        if (available_effects > 1) {
+            if (mosaic_available) {
+                items.push_back({L"effect_mosaic", L""});
+            }
+            if (blur_available) {
+                items.push_back({L"effect_blur", L""});
+            }
+            if (redaction_available) {
+                items.push_back({L"effect_redact", L""});
+            }
+        }
+        if (effect_geometry_mode_available(
+                active_tool_, style_tool, editing_selected)) {
+            items.push_back({L"|", L""});
+            items.push_back({L"mode_smear", L""});
+            items.push_back({L"mode_rect", L""});
+        }
+        if (style_tool != Tool::redact) {
+            items.push_back({L"|", L""});
+            items.push_back({L"mosaic_strength_slider", L""});
+        }
+        items.push_back({L"|", L""});
+        items.push_back({L"width_small", L""});
+        items.push_back({L"width_medium", L""});
+        items.push_back({L"width_large", L""});
+        if (style_tool == Tool::redact) {
+            items.push_back({L"|", L""});
+            add_feishu_palette(items);
+        }
     } else if (style_tool == Tool::text) {
         items.push_back({L"text_style_normal", L""});
         items.push_back({L"text_style_dark", L""});
@@ -1271,8 +1589,8 @@ void OverlaySession::build_sub_toolbar() {
         add_feishu_palette(items);
     } else if (style_tool == Tool::watermark) {
         items.push_back({L"watermark_text", watermark_text_.empty() ? L"水印文字" : watermark_text_});
-        items.push_back({L"watermark_apply", L"应用"});
-        items.push_back({L"watermark_clear", L"清除"});
+        items.push_back({L"watermark_apply", L""});
+        items.push_back({L"watermark_clear", L""});
         items.push_back({L"|", L""});
         items.push_back({L"text_size_btn", text_size_label(active_text_size_)});
         items.push_back({L"|", L""});
@@ -1288,27 +1606,27 @@ void OverlaySession::build_sub_toolbar() {
         if (style_tool == Tool::rectangle ||
             style_tool == Tool::ellipse) {
             items.push_back({L"|", L""});
-            items.push_back({L"fill_outline", L"空心"});
-            items.push_back({L"fill_translucent", L"填充"});
+            items.push_back({L"fill_outline", L""});
+            items.push_back({L"fill_translucent", L""});
         }
         if (style_tool == Tool::rectangle) {
             items.push_back({L"|", L""});
-            items.push_back({L"corner_square", L"直角"});
-            items.push_back({L"corner_round", L"圆角"});
+            items.push_back({L"corner_square", L""});
+            items.push_back({L"corner_round", L""});
         }
         if (style_tool == Tool::rectangle ||
             style_tool == Tool::ellipse ||
             style_tool == Tool::line ||
             style_tool == Tool::arrow) {
             items.push_back({L"|", L""});
-            items.push_back({L"stroke_solid", L"实线"});
-            items.push_back({L"stroke_dashed", L"虚线"});
+            items.push_back({L"stroke_solid", L""});
+            items.push_back({L"stroke_dashed", L""});
         }
         if (style_tool == Tool::arrow) {
             items.push_back({L"|", L""});
-            items.push_back({L"head_forward", L"正向"});
-            items.push_back({L"head_reverse", L"反向"});
-            items.push_back({L"head_both", L"双向"});
+            items.push_back({L"head_forward", L""});
+            items.push_back({L"head_reverse", L""});
+            items.push_back({L"head_both", L""});
         }
     } else {
         if (tool_supports_color(style_tool)) {
@@ -1343,7 +1661,11 @@ void OverlaySession::build_sub_toolbar() {
     };
     const OverlayUiMetrics ui{ui_dpi_at(host_center)};
     const ToolbarMetrics metrics{
-        ui.px(40), ui.px(40), ui.px(4), ui.px(8), ui.dpi};
+        ui.px(kToolbarButtonDip),
+        ui.px(kToolbarButtonDip),
+        ui.px(kSubToolbarSpacingDip),
+        ui.px(kSubToolbarPaddingDip),
+        ui.dpi};
     const auto rows = wrap_toolbar_items(items, metrics, host_bounds);
     const int total_width = toolbar_width(rows, metrics);
     const int total_height = toolbar_height(rows, metrics);
@@ -1406,7 +1728,11 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
         MessageBeep(MB_ICONWARNING);
         return;
     }
-    if (id == L"color_red") {
+    if (id == L"eraser_mode_local") {
+        eraser_mode_ = EraserMode::local_stroke;
+    } else if (id == L"eraser_mode_object") {
+        eraser_mode_ = EraserMode::object;
+    } else if (id == L"color_red") {
         active_color_ = RGB(245, 34, 45);
     } else if (id == L"color_green") {
         active_color_ = RGB(82, 196, 26);
@@ -1431,7 +1757,7 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
         begin_annotation_transaction();
         show_rgb_picker_popup(
             source,
-            custom_color_,
+            active_color_,
             button_bounds,
             virtual_bounds_,
             [this](COLORREF new_color) {
@@ -1541,6 +1867,7 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
             preview_.tool = Tool::mosaic;
         } else {
             mosaic_is_blur_ = false;
+            privacy_is_redaction_ = false;
         }
         build_sub_toolbar();
     } else if (id == L"effect_blur") {
@@ -1551,6 +1878,20 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
             preview_.tool = Tool::blur;
         } else {
             mosaic_is_blur_ = true;
+            privacy_is_redaction_ = false;
+        }
+        build_sub_toolbar();
+    } else if (id == L"effect_redact") {
+        if (active_tool_ != Tool::select) {
+            remember_current_style();
+            load_active_style(Tool::redact);
+            active_tool_ = Tool::redact;
+            preview_.tool = Tool::redact;
+        } else {
+            mosaic_is_blur_ = false;
+            privacy_is_redaction_ = true;
+            active_color_ =
+                tool_styles_.for_tool(Tool::redact).color;
         }
         build_sub_toolbar();
     } else if (id == L"mode_smear") {
@@ -1566,6 +1907,125 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
     mark_preview_visual_changed();
 }
 
+void OverlaySession::show_toolbar_menu(std::wstring_view id, HWND source) {
+    if (ocr_running_ || (!toolbar_is_group_id(id) && id != L"more")) {
+        return;
+    }
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu) {
+        return;
+    }
+
+    std::vector<std::wstring> commands;
+    const auto command_for = [&](std::wstring_view command_id) {
+        commands.emplace_back(command_id);
+        return static_cast<UINT_PTR>(4000 + commands.size());
+    };
+    const std::wstring_view active_id =
+        active_tool_ == Tool::select ? L"select"
+                                    : style_id_from_tool(active_tool_);
+    const auto command_flags = [&](std::wstring_view command_id) {
+        UINT flags = MF_STRING;
+        bool enabled = true;
+        if (command_id == L"undo") {
+            enabled = annotation_history_.can_undo();
+        } else if (command_id == L"redo") {
+            enabled = annotation_history_.can_redo();
+        } else if (command_id == L"scroll") {
+            enabled = selection_.width() >= 64 && selection_.height() >= 64 &&
+                      annotations_.empty();
+        }
+        if (!enabled) {
+            flags |= MF_GRAYED;
+        }
+        if ((command_id == L"lock" &&
+             request_.config.annotation_locked_tool) ||
+            (!active_id.empty() && command_id == active_id)) {
+            flags |= MF_CHECKED;
+        }
+        return flags;
+    };
+    const auto append_commands = [&](HMENU target,
+                                     const auto& entries) {
+        for (const auto& entry : entries) {
+            AppendMenuW(
+                target,
+                command_flags(entry.first),
+                command_for(entry.first),
+                toolbar_menu_label(entry.first, request_.config).c_str());
+        }
+    };
+
+    if (toolbar_is_group_id(id)) {
+        append_commands(menu, toolbar_group_members(request_.config, id));
+    } else {
+        for (const auto& entry : toolbar_overflow_items_) {
+            if (!toolbar_is_group_id(entry.first)) {
+                AppendMenuW(
+                    menu,
+                    command_flags(entry.first),
+                    command_for(entry.first),
+                    toolbar_menu_label(entry.first, request_.config).c_str());
+                continue;
+            }
+
+            HMENU submenu = CreatePopupMenu();
+            if (!submenu) {
+                continue;
+            }
+            const auto members =
+                toolbar_group_members(request_.config, entry.first);
+            append_commands(submenu, members);
+            UINT flags = MF_POPUP;
+            if (!active_id.empty() &&
+                toolbar_group_for_item(active_id) == entry.first) {
+                flags |= MF_CHECKED;
+            }
+            AppendMenuW(
+                menu,
+                flags,
+                reinterpret_cast<UINT_PTR>(submenu),
+                toolbar_menu_label(entry.first, request_.config).c_str());
+        }
+    }
+
+    if (commands.empty()) {
+        DestroyMenu(menu);
+        return;
+    }
+
+    RectI anchor{};
+    for (const auto& button : toolbar_) {
+        if (button.id == id) {
+            anchor = button.bounds;
+            break;
+        }
+    }
+    POINT popup{anchor.left, anchor.bottom + 2};
+    if (anchor.empty()) {
+        GetCursorPos(&popup);
+    }
+
+    enter_modal();
+    const int selected = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_LEFTALIGN |
+            TPM_TOPALIGN,
+        popup.x,
+        popup.y,
+        0,
+        source,
+        nullptr);
+    DestroyMenu(menu);
+
+    if (!done_ && selected >= 4001 &&
+        static_cast<std::size_t>(selected - 4001) < commands.size()) {
+        invoke(commands[static_cast<std::size_t>(selected - 4001)], source);
+    }
+    leave_modal();
+}
+
 void OverlaySession::invoke(std::wstring_view id, HWND source) {
     if (ocr_running_) {
         if (id == L"close") {
@@ -1575,6 +2035,9 @@ void OverlaySession::invoke(std::wstring_view id, HWND source) {
     }
     if (id == L"lock") {
         request_.config.annotation_locked_tool = !request_.config.annotation_locked_tool;
+    } else if (toolbar_is_group_id(id) || id == L"more") {
+        show_toolbar_menu(id, source);
+        return;
     } else if (const Tool tool = tool_from_id(id); tool != Tool::none) {
         toggle_active_tool(tool);
     } else if (id == L"undo") {
@@ -1587,6 +2050,8 @@ void OverlaySession::invoke(std::wstring_view id, HWND source) {
         complete_clipboard();
     } else if (id == L"save") {
         complete_file({}, source);
+    } else if (id == L"done") {
+        complete_default(source);
     } else if (id == L"scroll") {
         complete_scroll(source);
     } else if (id == L"pin") {
@@ -1781,8 +2246,10 @@ void OverlaySession::remember_active_style(Tool tool) noexcept {
     if (tool == Tool::highlight) {
         style.highlight_alpha = active_highlight_alpha_;
     }
-    if (tool == Tool::mosaic || tool == Tool::blur) {
-        style.effect_strength = mosaic_strength_;
+    if (tool_is_privacy_effect(tool)) {
+        if (tool != Tool::redact) {
+            style.effect_strength = mosaic_strength_;
+        }
         style.effect_rect = mosaic_is_rect_;
     }
     style.fill_style = active_fill_style_;
@@ -1860,8 +2327,9 @@ void OverlaySession::load_active_style(Tool tool) noexcept {
     active_stroke_pattern_ = style.stroke_pattern;
     active_arrow_head_style_ = style.arrow_head_style;
     active_rectangle_rounded_ = style.rounded_rectangle;
-    if (tool == Tool::mosaic || tool == Tool::blur) {
+    if (tool_is_privacy_effect(tool)) {
         mosaic_is_blur_ = tool == Tool::blur;
+        privacy_is_redaction_ = tool == Tool::redact;
     }
 }
 
@@ -1879,15 +2347,20 @@ void OverlaySession::sync_active_style_from_selected() {
         active_width_ = annotation.width;
     }
     if (annotation.tool == Tool::text) {
-        active_text_size_ = nearest_text_size(annotation.width);
+        active_text_size_ = std::clamp(
+            std::isfinite(annotation.width) ? annotation.width : 18.0F,
+            kMinimumTextSizePx,
+            kMaximumTextSizePx);
         active_text_style_ = annotation.text_style;
     } else if (annotation.tool == Tool::highlight) {
         active_highlight_alpha_ = std::clamp(annotation.alpha, 24, 192);
-    } else if (annotation.tool == Tool::mosaic ||
-               annotation.tool == Tool::blur) {
+    } else if (tool_is_privacy_effect(annotation.tool)) {
         mosaic_is_blur_ = annotation.tool == Tool::blur;
+        privacy_is_redaction_ = annotation.tool == Tool::redact;
         mosaic_is_rect_ = annotation.points.empty();
-        mosaic_strength_ = std::clamp(annotation.alpha, 0, 100);
+        if (annotation.tool != Tool::redact) {
+            mosaic_strength_ = std::clamp(annotation.alpha, 0, 100);
+        }
     }
     active_fill_style_ = annotation.fill_style;
     active_stroke_pattern_ = annotation.stroke_pattern;
@@ -1914,13 +2387,23 @@ void OverlaySession::apply_active_style_to_selected() {
     if (updated.tool == Tool::text) {
         updated.width = active_text_size_;
         updated.text_style = active_text_style_;
-        (void)refresh_text_annotation_bounds(updated, request_.config);
+        (void)fit_text_annotation_to_canvas(
+            updated,
+            request_.config,
+            selection_.width(),
+            selection_.height());
     } else if (updated.tool == Tool::highlight) {
         updated.alpha = active_highlight_alpha_;
-    } else if (updated.tool == Tool::mosaic ||
-               updated.tool == Tool::blur) {
-        updated.tool = mosaic_is_blur_ ? Tool::blur : Tool::mosaic;
-        updated.alpha = mosaic_strength_;
+    } else if (tool_is_privacy_effect(updated.tool)) {
+        updated.tool = privacy_is_redaction_
+                           ? Tool::redact
+                           : (mosaic_is_blur_ ? Tool::blur : Tool::mosaic);
+        updated.alpha = updated.tool == Tool::redact
+                            ? 255
+                            : mosaic_strength_;
+        if (updated.tool == Tool::redact) {
+            updated.color = active_color_;
+        }
     }
     if (updated.tool == Tool::rectangle ||
         updated.tool == Tool::ellipse) {
@@ -1997,9 +2480,11 @@ void OverlaySession::edit_selected_text(HWND source) {
             }
             record_annotation_change();
             annotations_[index].text = std::move(*text);
-            (void)refresh_text_annotation_bounds(
+            (void)fit_text_annotation_to_canvas(
                 annotations_[index],
-                request_.config);
+                request_.config,
+                selection_.width(),
+                selection_.height());
             selected_annotation_idx_ = static_cast<int>(index);
             sync_active_style_from_selected();
             build_toolbar();
@@ -2010,7 +2495,8 @@ void OverlaySession::edit_selected_text(HWND source) {
         request_.config.text_font_family,
         request_.config.text_font_bold,
         request_.config.text_font_italic,
-        existing.text_style);
+        existing.text_style,
+        existing.text_box_width_px);
 }
 
 void OverlaySession::undo() {
@@ -2161,7 +2647,7 @@ Bitmap render_annotations(Bitmap result,
     };
 
     for (const auto& annotation : annotations) {
-        if (annotation.tool == Tool::mosaic || annotation.tool == Tool::blur ||
+        if (tool_is_privacy_effect(annotation.tool) ||
             annotation.tool == Tool::highlight) {
             if ((annotation.tool == Tool::mosaic ||
                  annotation.tool == Tool::blur) &&
@@ -2185,12 +2671,22 @@ Bitmap render_annotations(Bitmap result,
                         },
                         block_size);
                 } else {
-                    for (const POINT point : annotation.points) {
-                        const int radius =
-                            static_cast<int>(tool_visual_radius(
-                                Tool::mosaic,
-                                annotation.width));
-                        pixelate_circle(result, point, radius, block_size);
+                    const int radius = std::max(
+                        1,
+                        static_cast<int>(std::ceil(tool_visual_radius(
+                            Tool::mosaic,
+                            annotation.width))));
+                    const PrivacyEffectResult privacy_result =
+                        apply_privacy_stroke(
+                            result,
+                            annotation.points,
+                            radius,
+                            {PrivacyEffectMode::mosaic, block_size});
+                    if (privacy_result != PrivacyEffectResult::applied &&
+                        privacy_result != PrivacyEffectResult::no_change) {
+                        // Never silently export the unprotected source when a
+                        // privacy stroke cannot be materialized safely.
+                        return {};
                     }
                 }
             } else if (annotation.tool == Tool::blur) {
@@ -2198,7 +2694,7 @@ Bitmap render_annotations(Bitmap result,
                 const int rect_radius = std::clamp(3 + strength / 5, 3, 23);
                 const int circle_radius = std::clamp(2 + strength / 12, 2, 10);
                 if (annotation.points.empty()) {
-                    blur_rect(
+                    const PrivacyEffectResult privacy_result = blur_rect(
                         result,
                         RectI{
                             annotation.start.x,
@@ -2207,14 +2703,32 @@ Bitmap render_annotations(Bitmap result,
                             annotation.end.y,
                         },
                         rect_radius);
-                } else {
-                    for (const POINT point : annotation.points) {
-                        const int radius =
-                            static_cast<int>(tool_visual_radius(
-                                Tool::blur,
-                                annotation.width));
-                        blur_circle(result, point, radius, circle_radius);
+                    if (privacy_result != PrivacyEffectResult::applied &&
+                        privacy_result != PrivacyEffectResult::no_change) {
+                        // Rectangle privacy effects obey the same fail-closed
+                        // export contract as freehand strokes.
+                        return {};
                     }
+                } else {
+                    const int radius = std::max(
+                        1,
+                        static_cast<int>(std::ceil(tool_visual_radius(
+                            Tool::blur,
+                            annotation.width))));
+                    const PrivacyEffectResult privacy_result =
+                        apply_privacy_stroke(
+                            result,
+                            annotation.points,
+                            radius,
+                            {PrivacyEffectMode::blur, circle_radius});
+                    if (privacy_result != PrivacyEffectResult::applied &&
+                        privacy_result != PrivacyEffectResult::no_change) {
+                        return {};
+                    }
+                }
+            } else if (annotation.tool == Tool::redact) {
+                if (!paint_solid_redaction(result, annotation)) {
+                    return {};
                 }
             } else {
                 if (!blend_highlight(result, annotation)) {
@@ -2233,7 +2747,12 @@ Bitmap render_annotations(Bitmap result,
             RECT text_rect{
                 annotation.start.x,
                 annotation.start.y,
-                result.width,
+                annotation.text_box_width_px > 0
+                    ? std::min(
+                          result.width,
+                          static_cast<int>(annotation.start.x) +
+                              annotation.text_box_width_px)
+                    : result.width,
                 result.height,
             };
             if (!draw_text_with_style(dc.get(),
@@ -2241,7 +2760,8 @@ Bitmap render_annotations(Bitmap result,
                                       text_rect,
                                       annotation.color,
                                       annotation.text_style,
-                                      reinterpret_cast<HFONT>(text_font.get()))) {
+                                      reinterpret_cast<HFONT>(text_font.get()),
+                                      annotation.text_box_width_px)) {
                 return {};
             }
             continue;
@@ -2665,6 +3185,7 @@ void OverlaySession::complete_ocr() {
     ocr_downloaded_bytes_.store(0, std::memory_order_relaxed);
     ocr_total_bytes_.store(0, std::memory_order_relaxed);
     ocr_cancellable_.store(true, std::memory_order_relaxed);
+    build_toolbar();
     invalidate_all();
 
     try {
@@ -2858,6 +3379,7 @@ void OverlaySession::complete_ocr() {
     } catch (const std::exception& exception) {
         ocr_running_ = false;
         ocr_cancelling_ = false;
+        build_toolbar();
         ocr_dependency_state_.store(
             OcrDependencyState::unavailable,
             std::memory_order_relaxed);
@@ -2867,6 +3389,7 @@ void OverlaySession::complete_ocr() {
     } catch (...) {
         ocr_running_ = false;
         ocr_cancelling_ = false;
+        build_toolbar();
         ocr_dependency_state_.store(
             OcrDependencyState::unavailable,
             std::memory_order_relaxed);
@@ -2911,10 +3434,12 @@ void OverlaySession::handle_ocr_completion() {
     ocr_cancelling_ = false;
 
     if (discard_completion) {
+        build_toolbar();
         invalidate_all();
         return;
     }
     if (!completion->output.ok) {
+        build_toolbar();
         show_output_error(
             nullptr,
             completion->output.error.empty()
@@ -2924,12 +3449,80 @@ void OverlaySession::handle_ocr_completion() {
         return;
     }
 
+    // An OCR action launched from the annotation toolbar keeps the screenshot
+    // document alive and presents the structured result. Direct OCR commands
+    // retain their automation-friendly copy/return contract below.
+    if (request_.action == RegionAction::interactive) {
+        std::shared_ptr<OcrOutput> output;
+        try {
+            output = std::make_shared<OcrOutput>(
+                std::move(completion->output));
+        } catch (const std::bad_alloc&) {
+        } catch (const std::length_error&) {
+        }
+        if (output) {
+            const POINT position{
+                selection_.right,
+                selection_.top,
+            };
+            const HWND panel = show_ocr_result_panel_async(
+                *output,
+                modal_owner(),
+                position,
+                request_.config.theme,
+                [this, output](OcrResultAction action) {
+                if (action == OcrResultAction::copy_all) {
+                    if (done_ || output->text.empty()) {
+                        return;
+                    }
+                    std::wstring error;
+                    if (!copy_text_to_clipboard(output->text, &error)) {
+                        show_output_error(
+                            prompt_window_,
+                            error.empty()
+                                ? L"无法复制识别结果。结果面板仍保持打开，您可以重试。"
+                                : error +
+                                      L"\n\n结果面板仍保持打开，您可以重试。");
+                    }
+                    return;
+                }
+
+                prompt_window_ = nullptr;
+                if (done_) {
+                    return;
+                }
+                if (action == OcrResultAction::retry_fast ||
+                    action == OcrResultAction::retry_accurate) {
+                    request_.config.ocr_engine =
+                        action == OcrResultAction::retry_fast
+                            ? std::wstring(kOcrEngineRapidV5Fast)
+                            : std::wstring(kOcrEngineRapidV5Accurate);
+                    pending_ocr_text_.clear();
+                    complete_ocr();
+                    return;
+                }
+                build_toolbar();
+                invalidate_all();
+                });
+            if (panel) {
+                prompt_window_ = panel;
+                build_toolbar();
+                invalidate_all();
+                return;
+            }
+            // Window creation is best-effort. Preserve the existing copy/finish
+            // route so OCR never becomes unusable on a constrained desktop.
+            completion->output = std::move(*output);
+        }
+    }
+
     if (request_.copy_ocr) {
         std::wstring error;
         if (!copy_text_to_clipboard(completion->output.text, &error)) {
             pending_ocr_text_ = std::move(completion->output.text);
             pending_ocr_bounds_ = selection_;
             pending_ocr_revision_ = annotation_revision_;
+            build_toolbar();
             show_output_error(
                 nullptr,
                 (error.empty() ? L"无法复制识别结果。" : error) +
@@ -3586,8 +4179,25 @@ void OverlaySession::finish_scroll_capture(bool cancelled) {
     uninstall_scroll_keyboard_forwarding(keyboard_hook);
     stop_scroll_worker();
     if (cancelled) {
+        const HWND restore_focus = scroll_capture_->keyboard_sink;
         destroy_scroll_windows();
-        finish({ExitCode::user_cancelled, L"长截图已取消。"});
+        for (const auto& window : windows_) {
+            if (window && window->hwnd() && IsWindow(window->hwnd())) {
+                ShowWindow(window->hwnd(), SW_SHOWNOACTIVATE);
+                window->invalidate();
+            }
+        }
+        build_toolbar();
+        build_sub_toolbar();
+        invalidate_all();
+        DwmFlush();
+        const HWND focus_target =
+            restore_focus && IsWindow(restore_focus)
+                ? restore_focus
+                : modal_owner();
+        if (focus_target) {
+            SetForegroundWindow(focus_target);
+        }
         return;
     }
 

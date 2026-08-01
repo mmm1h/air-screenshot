@@ -481,6 +481,122 @@ void test_pre_requested_download_cancellation() {
         L"OCR pre-cancel performs no progress or network work");
 }
 
+void test_download_resume_contract() {
+    constexpr DWORD ok = 200;
+    constexpr DWORD partial_content = 206;
+    const std::wstring digest(64, L'a');
+    expect(
+        airshot::ocr_test_support::dependency_download_cache_file_name(
+            digest,
+            123456) ==
+            std::wstring(64, L'A') + L"-123456.part",
+        L"OCR resume cache keys are content-addressed by normalized digest and size");
+
+    expect(
+        airshot::ocr_test_support::resume_response_is_usable(
+            partial_content,
+            1024,
+            4096,
+            L"bytes 1024-4095/4096"),
+        L"OCR resume accepts an exact signed-size Content-Range");
+    expect(
+        airshot::ocr_test_support::resume_response_is_usable(
+            partial_content,
+            1024,
+            4096,
+            L"  BYTES 1024-2047/4096  "),
+        L"OCR resume accepts a bounded intermediate range with whitespace");
+    expect(
+        !airshot::ocr_test_support::resume_response_is_usable(
+            ok,
+            1024,
+            4096,
+            L"") &&
+            !airshot::ocr_test_support::resume_response_is_usable(
+                partial_content,
+                1024,
+                4096,
+                L"bytes 0-4095/4096") &&
+            !airshot::ocr_test_support::resume_response_is_usable(
+                partial_content,
+                1024,
+                4096,
+                L"bytes 1024-4095/8192") &&
+            !airshot::ocr_test_support::resume_response_is_usable(
+                partial_content,
+                0,
+                4096,
+                L"bytes 0-4095/4096") &&
+            !airshot::ocr_test_support::resume_response_is_usable(
+                partial_content,
+                1024,
+                4096,
+                L"bytes 1024-4096/4096"),
+        L"OCR resume rejects restart responses and mismatched or overflowing ranges");
+
+    const std::vector<airshot::OcrDependencyFile> shared_files{
+        {
+            L"models/fast/rec.onnx",
+            L"https://example.test/fast-rec.onnx",
+            std::wstring(64, L'a'),
+            4096,
+        },
+        {
+            L"models/accurate/rec.onnx",
+            L"https://mirror.example.test/accurate-rec.onnx",
+            std::wstring(64, L'A'),
+            4096,
+        },
+        {
+            L"models/compat/rec.onnx",
+            L"https://example.test/compat-rec.onnx",
+            std::wstring(64, L'a'),
+            8192,
+        },
+    };
+    const auto owners =
+        airshot::ocr_test_support::dependency_download_cache_owner_indices(
+            shared_files);
+    expect(
+        owners == std::vector<std::size_t>{0, 0, 2},
+        L"OCR transaction assigns identical digest-and-size payloads one shared cache owner");
+
+    std::vector<std::uint64_t> logical_progress(shared_files.size(), 0);
+    std::vector<bool> verified(shared_files.size(), false);
+    std::uint64_t available_bytes = 0;
+    airshot::ocr_test_support::update_dependency_download_cache_alias_progress(
+        owners,
+        0,
+        1024,
+        logical_progress,
+        available_bytes);
+    expect(
+        logical_progress == std::vector<std::uint64_t>{1024, 1024, 0} &&
+            available_bytes == 2048,
+        L"OCR shared cache reports resumed progress consistently for every logical consumer");
+
+    airshot::ocr_test_support::update_dependency_download_cache_alias_progress(
+        owners,
+        0,
+        4096,
+        logical_progress,
+        available_bytes);
+    airshot::ocr_test_support::update_dependency_download_cache_alias_verification(
+        owners,
+        0,
+        true,
+        verified);
+    expect(
+        logical_progress == std::vector<std::uint64_t>{4096, 4096, 0} &&
+            available_bytes == 8192 && verified[0] && verified[1] &&
+            !verified[2] &&
+            airshot::ocr_test_support::dependency_download_cache_is_reusable(
+                owners,
+                verified,
+                1),
+        L"OCR transaction reuses a completed verified content cache for later aliases without redownloading");
+}
+
 void test_unconfigured_build_is_offline_and_unavailable() {
     ScopedTestDirectory directory;
     expect(!directory.path().empty(),
@@ -1390,6 +1506,35 @@ void test_warm_worker_protocol_and_state_machine() {
             parsed->output.text == L"warm",
         L"warm OCR response binds and parses the nested Stage 1 protocol");
 
+    const std::string deterministic_error =
+        R"({"schemaVersion":1,"requestId":42,"profile":"rapidocr-v5-fast","dependencyRoot":"C:\\ocr-deps","dependencySequence":99,"ok":false,"error":"Native OCR inference failed."})";
+    const auto parsed_error = airshot::ocr_test_support::parse_warm_worker_response(
+        deterministic_error,
+        42,
+        airshot::kOcrEngineRapidV5Fast,
+        dependency_root,
+        99,
+        expected_image,
+        &error);
+    expect(
+        parsed_error.has_value() && !parsed_error->ok &&
+            parsed_error->worker_error == L"Native OCR inference failed.",
+        L"warm OCR preserves a valid deterministic worker error");
+    expect(
+        !airshot::ocr_test_support::warm_response_allows_fallback(
+            true,
+            false,
+            false) &&
+            airshot::ocr_test_support::warm_response_allows_fallback(
+                false,
+                false,
+                false) &&
+            !airshot::ocr_test_support::warm_response_allows_fallback(
+                false,
+                false,
+                true),
+        L"warm OCR only retries invalid transport or protocol responses and never retries cancellation");
+
     expect(
         !airshot::ocr_test_support::parse_warm_worker_response(
             valid,
@@ -1511,12 +1656,25 @@ void test_warm_worker_protocol_and_state_machine() {
             2),
         L"warm OCR restarts when thread selection shrinks from 4 to 2");
     expect(
-        airshot::ocr_test_support::warm_failure_allows_fallback(false, false),
-        L"warm OCR non-cancellation failure permits Stage 1 fallback");
+        airshot::ocr_test_support::warm_failure_allows_fallback(
+            false,
+            false,
+            false),
+        L"warm OCR startup or transport failure permits Stage 1 fallback");
     expect(
-        !airshot::ocr_test_support::warm_failure_allows_fallback(true, false) &&
-            !airshot::ocr_test_support::warm_failure_allows_fallback(false, true),
-        L"warm OCR cancellation never triggers cold fallback");
+        !airshot::ocr_test_support::warm_failure_allows_fallback(
+            true,
+            false,
+            false) &&
+            !airshot::ocr_test_support::warm_failure_allows_fallback(
+                false,
+                true,
+                false) &&
+            !airshot::ocr_test_support::warm_failure_allows_fallback(
+                false,
+                false,
+                true),
+        L"warm OCR cancellation and timeout never trigger a second cold wait");
 }
 
 void test_warm_worker_frame_limits() {
@@ -1595,6 +1753,7 @@ int wmain(int argc, wchar_t** argv) {
     test_signature_parser();
     test_signature_verifier();
     test_pre_requested_download_cancellation();
+    test_download_resume_contract();
     test_unconfigured_build_is_offline_and_unavailable();
     test_preparation_failure_classification();
     test_compiled_sequence_floor();

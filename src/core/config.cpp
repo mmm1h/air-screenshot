@@ -631,7 +631,7 @@ bool is_supported_app_icon(std::wstring_view value) {
            value == kAppIconPixelConsole;
 }
 
-constexpr std::array<std::wstring_view, 12> kAnnotationStyleTools{
+constexpr std::array<std::wstring_view, 13> kAnnotationStyleTools{
     L"rect",
     L"ellipse",
     L"line",
@@ -641,6 +641,7 @@ constexpr std::array<std::wstring_view, 12> kAnnotationStyleTools{
     L"serial",
     L"mosaic",
     L"blur",
+    L"redact",
     L"highlight",
     L"watermark",
     L"eraser",
@@ -982,7 +983,7 @@ std::wstring_view json_boolean(bool value) {
     return value ? L"true" : L"false";
 }
 
-constexpr std::array<std::wstring_view, 22> kAnnotationToolbarTools{
+constexpr std::array<std::wstring_view, 23> kAnnotationToolbarTools{
     L"lock",
     L"select",
     L"rect",
@@ -992,6 +993,7 @@ constexpr std::array<std::wstring_view, 22> kAnnotationToolbarTools{
     L"pen",
     L"mosaic",
     L"blur",
+    L"redact",
     L"highlight",
     L"watermark",
     L"text",
@@ -1079,6 +1081,8 @@ std::wstring hidden_tools_from_json_node(const JsonNode& node, std::wstring_view
             std::clamp(legacy_highlight_alpha, 24, 192);
     } else if (tool_id == L"watermark") {
         style.color = L"#FF9696";
+    } else if (tool_id == L"redact") {
+        style.color = L"#000000";
     }
     return style;
 }

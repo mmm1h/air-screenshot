@@ -1,15 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect x="24" y="24" width="464" height="464" rx="108" fill="#17191E"/>
-  <rect x="25" y="25" width="462" height="462" rx="107" fill="none" stroke="#343943" stroke-width="2"/>
+  <rect x="48" y="48" width="416" height="416" rx="96" fill="#17191E"/>
   <path
-    d="M190 120H136C127.163 120 120 127.163 120 136V190
-       M322 120H376C384.837 120 392 127.163 392 136V190
-       M392 322V376C392 384.837 384.837 392 376 392H322
-       M190 392H136C127.163 392 120 384.837 120 376V322"
+    d="M228 156H176C164.954 156 156 164.954 156 176V228
+       M284 356H336C347.046 356 356 347.046 356 336V284"
     fill="none"
     stroke="#F7F9FF"
-    stroke-width="30"
+    stroke-width="24"
     stroke-linecap="round"
     stroke-linejoin="round"/>
-  <rect x="214" y="214" width="84" height="84" rx="24" fill="#4D7CFE"/>
+  <rect x="212" y="212" width="88" height="88" rx="20" fill="#4D7CFE"/>
 </svg>

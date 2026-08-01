@@ -1007,6 +1007,7 @@ std::wstring get_tool_display_name(std::wstring_view id) {
     if (id == L"pen") return L"画笔";
     if (id == L"mosaic") return L"马赛克";
     if (id == L"blur") return L"模糊";
+    if (id == L"redact") return L"实心遮挡";
     if (id == L"highlight") return L"高亮";
     if (id == L"watermark") return L"水印";
     if (id == L"text") return L"文本";

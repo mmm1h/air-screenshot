@@ -10,6 +10,7 @@
 #include "airshot/output.h"
 #include "airshot/strings.h"
 #include "overlay_helpers.h"
+#include "overlay_refresh.h"
 
 #include <algorithm>
 #include <atomic>
@@ -47,7 +48,7 @@ public:
     void on_mouse_down(HWND source, POINT point, bool right);
     void on_mouse_move(POINT point);
     void on_mouse_up(HWND source, POINT point);
-    void on_double_click(POINT point);
+    void on_double_click(HWND source, POINT point);
     void on_key_down(HWND source, WPARAM key, bool is_auto_repeat);
     [[nodiscard]] bool on_system_key_down(
         HWND source,
@@ -89,11 +90,23 @@ public:
     [[nodiscard]] Tool active_tool() const noexcept { return active_tool_; }
     [[nodiscard]] bool annotation_locked_tool() const noexcept { return request_.config.annotation_locked_tool; }
     [[nodiscard]] bool mosaic_is_blur() const noexcept { return mosaic_is_blur_; }
+    [[nodiscard]] bool privacy_is_redaction() const noexcept {
+        return privacy_is_redaction_;
+    }
+    [[nodiscard]] EraserMode eraser_mode() const noexcept {
+        return eraser_mode_;
+    }
     [[nodiscard]] bool mosaic_is_rect() const noexcept { return mosaic_is_rect_; }
     [[nodiscard]] bool text_size_dropdown_open() const noexcept { return text_size_dropdown_open_; }
     [[nodiscard]] int text_size_hovered_idx() const noexcept { return text_size_hovered_idx_; }
     [[nodiscard]] RectI get_text_size_dropdown_bounds() const noexcept;
     [[nodiscard]] std::wstring hovered_button_id() const noexcept { return hovered_button_id_; }
+    [[nodiscard]] std::wstring_view pressed_button_id() const noexcept {
+        return toolbar_press_.id;
+    }
+    [[nodiscard]] bool pressed_button_inside() const noexcept {
+        return toolbar_press_.active() && toolbar_press_.pointer_inside;
+    }
     [[nodiscard]] bool dragging_selection() const noexcept { return dragging_selection_; }
     [[nodiscard]] POINT cursor_pos() const noexcept { return cursor_pos_; }
     [[nodiscard]] RectI dimension_badge_bounds() const noexcept;
@@ -131,11 +144,13 @@ private:
     [[nodiscard]] unsigned int ui_dpi_at(POINT point) const noexcept;
     void build_toolbar();
     void build_sub_toolbar();
+    void show_toolbar_menu(std::wstring_view id, HWND source);
     void invoke_sub(std::wstring_view id, HWND source);
     void invoke(std::wstring_view id, HWND source);
     void apply_watermark();
     void finish_annotation();
     bool erase_annotation_at(POINT relative);
+    bool erase_annotations_between(POINT start, POINT end);
     void record_annotation_change();
     void mark_annotation_visual_changed() noexcept;
     void mark_preview_visual_changed() noexcept;
@@ -148,6 +163,7 @@ private:
     void reset_annotation_drag_state() noexcept;
     void duplicate_selected_annotation();
     void open_selection_size_prompt(HWND source);
+    void refresh_capture(HWND source);
     [[nodiscard]] Tool style_context_tool() const noexcept;
     void load_persisted_tool_styles() noexcept;
     void remember_active_style(Tool tool) noexcept;
@@ -232,6 +248,8 @@ private:
     mutable std::uint64_t effect_preview_cache_revision_{};
     mutable RectI effect_preview_cache_bounds_;
     std::vector<ToolbarButton> toolbar_;
+    std::vector<std::pair<std::wstring, std::wstring>> toolbar_overflow_items_;
+    ToolbarPressState toolbar_press_;
     bool dragging_toolbar_{};
     bool dragging_slider_{};
     std::wstring dragging_slider_id_;
@@ -261,6 +279,7 @@ private:
     bool dimension_badge_hovered_{};
     SelectionSizeAnchor selection_size_anchor_{SelectionSizeAnchor::center};
     bool selection_aspect_ratio_locked_{};
+    double selection_locked_aspect_ratio_{};
     POINT cursor_pos_{};
     bool color_format_hex_{true};
     int selected_annotation_idx_{-1};
@@ -270,7 +289,9 @@ private:
     bool clone_annotation_on_drag_{};
     bool annotation_drag_clone_created_{};
     bool mosaic_is_blur_{};
+    bool privacy_is_redaction_{};
     bool mosaic_is_rect_{};
+    EraserMode eraser_mode_{EraserMode::object};
     bool highlight_constraint_active_{};
     ToolStylePalette tool_styles_;
     bool text_size_dropdown_open_{};

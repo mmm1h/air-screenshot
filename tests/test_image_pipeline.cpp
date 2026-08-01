@@ -205,7 +205,10 @@ void test_linear_blur() {
     }
     const airshot::Bitmap original = source;
     const airshot::RectI region{2, 3, 15, 12};
-    airshot::blur_rect(source, region, 4);
+    expect(
+        airshot::blur_rect(source, region, 4) ==
+            airshot::PrivacyEffectResult::applied,
+        L"rectangle blur reports a completed privacy effect");
 
     expect(source.valid(), L"blur preserves bitmap validity");
     expect(std::equal(source.row(0).begin(), source.row(0).end(), original.row(0).begin()),
@@ -224,9 +227,261 @@ void test_linear_blur() {
 
     airshot::Bitmap performance_source(640, 360);
     const auto start = std::chrono::steady_clock::now();
-    airshot::blur_rect(performance_source, {0, 0, 640, 360}, 128);
+    expect(
+        airshot::blur_rect(
+            performance_source,
+            {0, 0, 640, 360},
+            128) == airshot::PrivacyEffectResult::applied,
+        L"large-radius rectangle blur completes within its default budget");
     const auto elapsed = std::chrono::steady_clock::now() - start;
     expect(elapsed < std::chrono::seconds(5), L"large-radius blur remains linear-time");
+
+    auto constrained_source = patterned_bitmap(32, 24);
+    const auto constrained_original = constrained_source.pixels;
+    expect(
+        airshot::blur_rect(
+            constrained_source,
+            {2, 3, 30, 22},
+            4,
+            1) == airshot::PrivacyEffectResult::resource_limit,
+        L"rectangle blur reports a resource limit before changing pixels");
+    expect(
+        constrained_source.pixels == constrained_original,
+        L"failed rectangle blur leaves privacy output byte-for-byte unchanged");
+}
+
+void test_privacy_stroke_uses_one_union_mask() {
+    using airshot::PrivacyEffectMode;
+    using airshot::PrivacyEffectOptions;
+    using airshot::PrivacyEffectResult;
+
+    const std::vector<POINT> sparse{{8, 32}, {119, 32}};
+    std::vector<POINT> dense;
+    for (int x = 8; x <= 119; ++x) {
+        dense.push_back({x, 32});
+    }
+    const std::vector<POINT> self_crossing{
+        {8, 32}, {119, 32}, {8, 32}, {119, 32}};
+
+    for (const PrivacyEffectOptions options : {
+             PrivacyEffectOptions{PrivacyEffectMode::mosaic, 8, RGB(0, 0, 0)},
+             PrivacyEffectOptions{PrivacyEffectMode::blur, 4, RGB(0, 0, 0)},
+             PrivacyEffectOptions{PrivacyEffectMode::solid, 255, RGB(17, 43, 91)},
+         }) {
+        auto sparse_result = patterned_bitmap(128, 64);
+        auto dense_result = sparse_result;
+        auto self_crossing_result = sparse_result;
+        const auto sparse_status = airshot::apply_privacy_stroke(
+            sparse_result, sparse, 6, options);
+        const auto dense_status = airshot::apply_privacy_stroke(
+            dense_result, dense, 6, options);
+        const auto crossing_status = airshot::apply_privacy_stroke(
+            self_crossing_result, self_crossing, 6, options);
+        expect(
+            sparse_status == PrivacyEffectResult::applied &&
+                dense_status == PrivacyEffectResult::applied &&
+                crossing_status == PrivacyEffectResult::applied,
+            L"all privacy modes accept sparse, dense, and self-crossing strokes");
+        expect(
+            sparse_result.pixels == dense_result.pixels,
+            L"privacy coverage is independent of pointer sampling density");
+        expect(
+            sparse_result.pixels == self_crossing_result.pixels,
+            L"self-intersections apply each privacy effect at most once per pixel");
+    }
+}
+
+void test_privacy_mosaic_is_globally_anchored() {
+    airshot::Bitmap bitmap(16, 12);
+    for (int y = 0; y < bitmap.height; ++y) {
+        auto row = bitmap.row(y);
+        for (int x = 0; x < bitmap.width; ++x) {
+            const std::size_t offset = static_cast<std::size_t>(x) * 4;
+            row[offset] = static_cast<std::uint8_t>(x + y * 16);
+            row[offset + 1] = static_cast<std::uint8_t>(x * 3 + y);
+            row[offset + 2] = static_cast<std::uint8_t>(x + y * 5);
+        }
+    }
+    const airshot::Bitmap original = bitmap;
+    const std::vector<POINT> points{{5, 5}, {6, 5}};
+    const auto status = airshot::apply_privacy_stroke(
+        bitmap,
+        points,
+        2,
+        {airshot::PrivacyEffectMode::mosaic, 4, RGB(0, 0, 0)});
+
+    std::array<unsigned int, 3> sums{};
+    for (int y = 4; y < 8; ++y) {
+        for (int x = 4; x < 8; ++x) {
+            for (int value = 0; value < 3; ++value) {
+                sums[static_cast<std::size_t>(value)] +=
+                    channel(original, x, y, value);
+            }
+        }
+    }
+    expect(status == airshot::PrivacyEffectResult::applied,
+           L"globally anchored mosaic stroke is applied");
+    expect(channel(bitmap, 5, 5, 0) == sums[0] / 16U &&
+               channel(bitmap, 5, 5, 1) == sums[1] / 16U &&
+               channel(bitmap, 5, 5, 2) == sums[2] / 16U,
+           L"mosaic samples the global 4x4 grid instead of the stroke bounds");
+    expect(channel(bitmap, 1, 1, 0) == channel(original, 1, 1, 0),
+           L"globally anchored mosaic preserves pixels outside the union mask");
+}
+
+void test_privacy_solid_fill_and_boundary_clipping() {
+    auto solid = patterned_bitmap(20, 20);
+    for (std::size_t offset = 3; offset < solid.pixels.size(); offset += 4) {
+        solid.pixels[offset] = 19;
+    }
+    const auto solid_original = solid;
+    const auto status = airshot::apply_privacy_stroke(
+        solid,
+        std::array<POINT, 1>{POINT{10, 10}},
+        4,
+        {airshot::PrivacyEffectMode::solid, 255, RGB(12, 34, 56)});
+    bool exact_interior = true;
+    for (int y = 7; y <= 13; ++y) {
+        for (int x = 7; x <= 13; ++x) {
+            const int delta_x = x - 10;
+            const int delta_y = y - 10;
+            if (delta_x * delta_x + delta_y * delta_y > 12) {
+                continue;
+            }
+            exact_interior = exact_interior &&
+                             channel(solid, x, y, 0) == 56 &&
+                             channel(solid, x, y, 1) == 34 &&
+                             channel(solid, x, y, 2) == 12 &&
+                             channel(solid, x, y, 3) == 255;
+        }
+    }
+    expect(status == airshot::PrivacyEffectResult::applied && exact_interior,
+           L"opaque solid privacy fill writes every fully covered BGRA pixel exactly");
+    expect(channel(solid, 14, 10, 0) == 56 &&
+               channel(solid, 14, 10, 1) == 34 &&
+               channel(solid, 14, 10, 2) == 12 &&
+               channel(solid, 14, 10, 3) == 255,
+           L"opaque solid fill fully redacts partially covered antialiased edge pixels");
+    expect(channel(solid, 15, 10, 0) == channel(solid_original, 15, 10, 0) &&
+               channel(solid, 15, 10, 3) == 19,
+           L"opaque solid fill preserves pixels outside the coverage edge");
+
+    for (const airshot::PrivacyEffectOptions options : {
+             airshot::PrivacyEffectOptions{
+                 airshot::PrivacyEffectMode::mosaic, 6, RGB(0, 0, 0)},
+             airshot::PrivacyEffectOptions{
+                 airshot::PrivacyEffectMode::blur, 3, RGB(0, 0, 0)},
+             airshot::PrivacyEffectOptions{
+                 airshot::PrivacyEffectMode::solid, 255, RGB(1, 2, 3)},
+         }) {
+        auto clipped = patterned_bitmap(24, 16);
+        const auto original = clipped;
+        const std::array<POINT, 2> boundary_points{
+            POINT{-8, -5}, POINT{4, 3}};
+        expect(
+            airshot::apply_privacy_stroke(clipped, boundary_points, 5, options) ==
+                airshot::PrivacyEffectResult::applied,
+            L"privacy stroke clips safely at the top-left bitmap boundary");
+        expect(
+            channel(clipped, 23, 15, 0) == channel(original, 23, 15, 0) &&
+                channel(clipped, 23, 15, 1) == channel(original, 23, 15, 1) &&
+                channel(clipped, 23, 15, 2) == channel(original, 23, 15, 2),
+            L"boundary clipping does not touch the opposite bitmap corner");
+    }
+}
+
+void test_privacy_noop_and_resource_contract() {
+    using airshot::PrivacyEffectMode;
+    using airshot::PrivacyEffectOptions;
+    using airshot::PrivacyEffectResult;
+
+    const auto original = patterned_bitmap(40, 24);
+    for (const PrivacyEffectMode mode : {
+             PrivacyEffectMode::mosaic,
+             PrivacyEffectMode::blur,
+             PrivacyEffectMode::solid,
+         }) {
+        auto zero_strength = original;
+        expect(
+            airshot::apply_privacy_stroke(
+                zero_strength,
+                std::array<POINT, 2>{POINT{2, 2}, POINT{30, 20}},
+                4,
+                PrivacyEffectOptions{mode, 0, RGB(4, 5, 6)}) ==
+                    PrivacyEffectResult::no_change &&
+                zero_strength.pixels == original.pixels,
+            L"zero-strength privacy effects are byte-for-byte no-ops");
+
+        auto empty_mask = original;
+        expect(
+            airshot::apply_privacy_stroke(
+                empty_mask,
+                {},
+                4,
+                PrivacyEffectOptions{mode, 8, RGB(4, 5, 6)}) ==
+                    PrivacyEffectResult::no_change &&
+                empty_mask.pixels == original.pixels,
+            L"an empty privacy mask is a byte-for-byte no-op");
+    }
+
+    airshot::PrivacyMaskLimits tiny_limits;
+    tiny_limits.max_mask_pixels = 64;
+    auto limited = original;
+    expect(
+        airshot::apply_privacy_stroke(
+            limited,
+            std::array<POINT, 2>{POINT{0, 0}, POINT{39, 23}},
+            5,
+            {PrivacyEffectMode::solid, 255, RGB(0, 0, 0)},
+            tiny_limits) == PrivacyEffectResult::resource_limit &&
+            limited.pixels == original.pixels,
+        L"an oversized union mask is rejected before the bitmap changes");
+
+    std::vector<POINT> too_many(
+        airshot::PrivacyMaskLimits::hard_max_input_points + 1,
+        POINT{8, 8});
+    auto point_limited = original;
+    expect(
+        airshot::apply_privacy_stroke(
+            point_limited,
+            too_many,
+            3,
+            {PrivacyEffectMode::solid, 255, RGB(0, 0, 0)}) ==
+                PrivacyEffectResult::resource_limit &&
+            point_limited.pixels == original.pixels,
+        L"input beyond the documented hard point cap is rejected without mutation");
+}
+
+void test_privacy_large_stroke_is_bounded() {
+    static_assert(
+        airshot::PrivacyMaskLimits::hard_max_mask_pixels >=
+        static_cast<std::size_t>(7680) * 4320,
+        "the default privacy mask budget must cover one 8K UHD frame");
+
+    auto bitmap = patterned_bitmap(3840, 2160);
+    std::vector<POINT> points;
+    points.reserve(airshot::PrivacyMaskLimits::hard_max_input_points);
+    for (std::size_t index = 0;
+         index < airshot::PrivacyMaskLimits::hard_max_input_points;
+         ++index) {
+        const int x = static_cast<int>(
+            index * 3839U /
+            (airshot::PrivacyMaskLimits::hard_max_input_points - 1));
+        const int y = 1080 + static_cast<int>(index % 7U) - 3;
+        points.push_back({x, y});
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto status = airshot::apply_privacy_stroke(
+        bitmap,
+        points,
+        5,
+        {airshot::PrivacyEffectMode::solid, 255, RGB(9, 19, 29)});
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    expect(status == airshot::PrivacyEffectResult::applied && bitmap.valid(),
+           L"a 100,000-point stroke on a 4K bitmap is resampled and applied");
+    expect(elapsed < std::chrono::seconds(15),
+           L"a maximum-size input stroke has bounded rasterization time");
 }
 
 void test_ordered_annotation_rendering() {
@@ -1135,6 +1390,11 @@ int wmain() {
     test_alpha_compositing_for_legacy_outputs();
     test_blit_and_holes();
     test_linear_blur();
+    test_privacy_stroke_uses_one_union_mask();
+    test_privacy_mosaic_is_globally_anchored();
+    test_privacy_solid_fill_and_boundary_clipping();
+    test_privacy_noop_and_resource_contract();
+    test_privacy_large_stroke_is_bounded();
     test_ordered_annotation_rendering();
     test_highlight_alpha_is_sampling_independent();
     test_effect_strokes_are_sampling_independent();

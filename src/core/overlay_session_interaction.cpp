@@ -1,5 +1,7 @@
 #include "overlay_session.h"
 
+#include <dwmapi.h>
+
 #include <array>
 
 namespace airshot::overlay_detail {
@@ -10,7 +12,8 @@ constexpr std::array<float, 13> kTextSizes{12.0F, 14.0F, 16.0F, 18.0F, 20.0F, 24
 constexpr int kTextSizeDropdownRowHeight = 32;
 
 bool tool_uses_points(Tool tool) {
-    return tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::eraser || tool == Tool::blur;
+    return tool == Tool::pen || tool_is_privacy_effect(tool) ||
+           tool == Tool::highlight || tool == Tool::eraser;
 }
 
 double distance_to_segment(POINT point, POINT start, POINT end) {
@@ -63,7 +66,6 @@ bool hit_annotation(
             8.0,
             static_cast<double>(annotation_visual_radius(annotation)) + 4.0) +
         safe_additional_radius;
-    const RectI bounds{annotation.start.x, annotation.start.y, annotation.end.x, annotation.end.y};
     switch (annotation.tool) {
         case Tool::rectangle:
         case Tool::ellipse:
@@ -75,16 +77,15 @@ bool hit_annotation(
         case Tool::arrow:
             return distance_to_segment(point, annotation.start, annotation.end) <= threshold;
         case Tool::pen:
-        case Tool::mosaic:
         case Tool::highlight:
-        case Tool::blur:
-            if ((annotation.tool == Tool::mosaic || annotation.tool == Tool::blur) && annotation.points.empty()) {
-                return inflated(
-                    bounds.normalized(),
-                    static_cast<int>(std::ceil(
-                        4.0 + safe_additional_radius))).contains(point);
-            }
             return near_polyline(point, annotation.points, threshold);
+        case Tool::mosaic:
+        case Tool::blur:
+        case Tool::redact:
+            return privacy_annotation_hit_test(
+                annotation,
+                point,
+                safe_additional_radius);
         case Tool::text:
             return inflated(
                 annotation_bounds(annotation),
@@ -103,15 +104,17 @@ bool hit_annotation(
 bool tool_supports_width(Tool tool) {
     return tool == Tool::rectangle || tool == Tool::ellipse || tool == Tool::line || tool == Tool::arrow ||
            tool == Tool::pen || tool == Tool::mosaic || tool == Tool::highlight || tool == Tool::serial ||
-           tool == Tool::blur || tool == Tool::eraser;
+           tool == Tool::blur || tool == Tool::redact || tool == Tool::eraser;
 }
 
 int slider_value_from_point(
     const ToolbarButton& button,
     POINT point,
     OverlayUiMetrics ui) {
-    const int track_left = button.bounds.left + ui.px(88);
-    const int track_right = button.bounds.right - ui.px(42);
+    const int track_left =
+        button.bounds.left + ui.px(kSubToolbarSliderTrackLeftDip);
+    const int track_right =
+        button.bounds.right - ui.px(kSubToolbarSliderTrackRightInsetDip);
     const int track_width = std::max(1, track_right - track_left);
     const int raw = static_cast<int>(std::lround((point.x - track_left) * 100.0 / track_width));
     return std::clamp(raw, 0, 100);
@@ -121,9 +124,11 @@ bool slider_track_contains(
     const ToolbarButton& button,
     POINT point,
     OverlayUiMetrics ui) {
-    const int hit_slop = ui.px(8);
-    const int track_left = button.bounds.left + ui.px(88);
-    const int track_right = button.bounds.right - ui.px(42);
+    const int hit_slop = ui.px(kSubToolbarSliderHitSlopDip);
+    const int track_left =
+        button.bounds.left + ui.px(kSubToolbarSliderTrackLeftDip);
+    const int track_right =
+        button.bounds.right - ui.px(kSubToolbarSliderTrackRightInsetDip);
     const int track_y =
         button.bounds.top + button.bounds.height() / 2;
     return point.x >= track_left - hit_slop &&
@@ -163,7 +168,12 @@ OverlaySession::OverlaySession(RegionRequest request, RegionCaptureCompletion co
     const bool blur_hidden = annotation_tool_hidden(
         request_.config.annotation_hidden_tools,
         L"blur");
+    const bool redaction_hidden = annotation_tool_hidden(
+        request_.config.annotation_hidden_tools,
+        L"redact");
     mosaic_is_blur_ = mosaic_hidden && !blur_hidden;
+    privacy_is_redaction_ =
+        mosaic_hidden && blur_hidden && !redaction_hidden;
 }
 
 OverlaySession::~OverlaySession() {
@@ -288,7 +298,7 @@ bool OverlaySession::settle_active_interaction(
     HWND source,
     InteractionSettleMode mode) {
     const bool had_interaction =
-        dragging_toolbar_ || dragging_slider_ ||
+        toolbar_press_.active() || dragging_toolbar_ || dragging_slider_ ||
         drawing_annotation_ || dragging_selection_;
     if (!had_interaction) {
         return false;
@@ -369,6 +379,7 @@ bool OverlaySession::settle_active_interaction(
     dragging_toolbar_ = false;
     dragging_slider_ = false;
     dragging_slider_id_.clear();
+    toolbar_press_.cancel();
     drawing_annotation_ = false;
     dragging_selection_ = false;
     highlight_constraint_active_ = false;
@@ -392,6 +403,7 @@ bool OverlaySession::cancel_active_interaction(HWND source) {
 
 void OverlaySession::on_capture_lost() {
     if (!releasing_capture_) {
+        hovered_button_id_.clear();
         (void)cancel_active_interaction(nullptr);
     }
 }
@@ -515,6 +527,11 @@ void OverlaySession::open_selection_size_prompt(HWND source) {
             selection_ = *resized;
             selection_aspect_ratio_locked_ =
                 input->aspect_ratio_locked;
+            selection_locked_aspect_ratio_ =
+                selection_aspect_ratio_locked_ && selection_.height() > 0
+                    ? static_cast<double>(selection_.width()) /
+                          static_cast<double>(selection_.height())
+                    : 0.0;
             selection_size_anchor_ = input->anchor;
             request_.config.capture_corner_radius =
                 input->corner_radius;
@@ -523,6 +540,103 @@ void OverlaySession::open_selection_size_prompt(HWND source) {
             build_sub_toolbar();
             invalidate_all();
         });
+}
+
+void OverlaySession::refresh_capture(HWND source) {
+    if (done_ || windows_.empty()) {
+        return;
+    }
+    if (prompt_window_ && IsWindow(prompt_window_)) {
+        MessageBeep(MB_ICONWARNING);
+        return;
+    }
+
+    // A refresh is a document-level operation. Cancel an unfinished gesture so
+    // a half-drawn stroke or half-resized selection cannot be committed merely
+    // because the user asked for a newer desktop frame.
+    (void)settle_active_interaction(
+        source,
+        InteractionSettleMode::cancel);
+
+    const auto restore_windows = [this, source] {
+        for (const auto& window : windows_) {
+            if (window && window->hwnd() && IsWindow(window->hwnd())) {
+                ShowWindow(window->hwnd(), SW_SHOWNOACTIVATE);
+                window->invalidate();
+            }
+        }
+        (void)DwmFlush();
+        HWND focus_target =
+            source && IsWindow(source)
+                ? source
+                : windows_.front()->hwnd();
+        if (focus_target && IsWindow(focus_target)) {
+            SetForegroundWindow(focus_target);
+            SetFocus(focus_target);
+        }
+    };
+
+    for (const auto& window : windows_) {
+        if (window && window->hwnd() && IsWindow(window->hwnd())) {
+            ShowWindow(window->hwnd(), SW_HIDE);
+        }
+    }
+    (void)DwmFlush();
+
+    SnapshotRefreshStatus refresh_status =
+        SnapshotRefreshStatus::capture_failed;
+    try {
+        std::vector<MonitorSnapshot> refreshed =
+            capture_monitors(request_.config.capture_cursor);
+        refresh_status = validate_snapshot_refresh(monitors_, refreshed);
+        if (refresh_status == SnapshotRefreshStatus::compatible) {
+            std::vector<WindowCandidate> refreshed_candidates =
+                enumerate_window_candidates();
+            if (!apply_snapshot_refresh(monitors_, refreshed)) {
+                refresh_status = SnapshotRefreshStatus::capture_failed;
+            } else {
+                window_candidates_ = std::move(refreshed_candidates);
+            }
+        }
+        if (refresh_status == SnapshotRefreshStatus::compatible) {
+            for (const auto& window : windows_) {
+                window->refresh_snapshot();
+            }
+            rendered_selection_cache_ = {};
+            rendered_selection_cache_revision_ = 0;
+            rendered_selection_cache_bounds_ = {};
+            effect_preview_cache_ = {};
+            effect_preview_cache_revision_ = 0;
+            effect_preview_cache_bounds_ = {};
+            mark_annotation_visual_changed();
+
+            clicked_window_ = {};
+            hover_cycle_anchor_.reset();
+            hover_ancestor_offset_ = 0;
+            if (!selection_complete_) {
+                POINT cursor{};
+                GetCursorPos(&cursor);
+                cursor_pos_ = cursor;
+                const auto candidate = window_candidate_at_point(
+                    window_candidates_,
+                    cursor,
+                    0);
+                hover_ = candidate ? candidate->bounds : RectI{};
+            }
+        }
+    } catch (...) {
+        refresh_status = SnapshotRefreshStatus::capture_failed;
+    }
+
+    restore_windows();
+    if (refresh_status == SnapshotRefreshStatus::compatible) {
+        return;
+    }
+    show_output_error(
+        source,
+        refresh_status == SnapshotRefreshStatus::topology_changed
+            ? L"显示器布局已发生变化，当前截图未刷新。请退出后重新截图。"
+            : L"屏幕刷新失败，已保留当前截图。请稍后重试。");
 }
 
 DragMode OverlaySession::hit_test_drag_mode(POINT point) const {
@@ -594,22 +708,37 @@ DragMode OverlaySession::hit_test_drag_mode(POINT point) const {
 }
 
 bool OverlaySession::erase_annotation_at(POINT relative) {
-    const double eraser_radius = static_cast<double>(
-        tool_visual_radius(Tool::eraser, active_width_));
-    for (auto it = annotations_.rbegin(); it != annotations_.rend(); ++it) {
-        if (hit_annotation(*it, relative, eraser_radius)) {
-            record_annotation_change();
-            annotations_.erase((it + 1).base());
-            renumber_serial_annotations(annotations_);
-            if (selected_annotation_idx_ >= static_cast<int>(annotations_.size())) {
-                selected_annotation_idx_ = -1;
-            }
-            build_toolbar();
-            invalidate_all();
-            return true;
-        }
+    return erase_annotations_between(relative, relative);
+}
+
+bool OverlaySession::erase_annotations_between(POINT start, POINT end) {
+    const bool owns_transaction = !annotation_transaction_active();
+    if (owns_transaction) {
+        begin_annotation_transaction();
     }
-    return false;
+    const EraserSweepResult erased = erase_annotations_with_sweep(
+        annotations_,
+        start,
+        end,
+        static_cast<double>(
+            tool_visual_radius(Tool::eraser, active_width_)),
+        eraser_mode_,
+        selected_annotation_idx_);
+    if (!erased.changed) {
+        if (owns_transaction) {
+            commit_annotation_transaction();
+        }
+        return false;
+    }
+    selected_annotation_idx_ = erased.selected_annotation_idx;
+    record_annotation_change();
+    build_toolbar();
+    build_sub_toolbar();
+    invalidate_all();
+    if (owns_transaction) {
+        commit_annotation_transaction();
+    }
+    return true;
 }
 
 void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
@@ -617,8 +746,11 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
         if (!right) {
             for (const auto& button : toolbar_) {
                 if (button.id == L"close" &&
-                    button.bounds.contains(point)) {
-                    invoke(button.id, source);
+                    button.bounds.contains(point) &&
+                    toolbar_press_.begin(button, false)) {
+                    hovered_button_id_ = button.id;
+                    SetCapture(source);
+                    invalidate_all();
                     break;
                 }
             }
@@ -712,9 +844,11 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
                     toolbar_drag_start_ = point;
                     toolbar_drag_origin_ = {
                         toolbar_bounds.left -
-                            OverlayUiMetrics{ui_dpi_at(point)}.px(8),
+                            OverlayUiMetrics{ui_dpi_at(point)}.px(
+                                kToolbarPaddingDip),
                         toolbar_bounds.top -
-                            OverlayUiMetrics{ui_dpi_at(point)}.px(8),
+                            OverlayUiMetrics{ui_dpi_at(point)}.px(
+                                kToolbarPaddingDip),
                     };
                     toolbar_custom_origin_ = toolbar_drag_origin_;
                     hovered_button_id_ = L"drag";
@@ -725,7 +859,11 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
                 if (!button.enabled) {
                     return;
                 }
-                invoke(button.id, source);
+                if (toolbar_press_.begin(button, false)) {
+                    hovered_button_id_ = button.id;
+                    SetCapture(source);
+                    invalidate_all();
+                }
                 return;
             }
         }
@@ -764,8 +902,11 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
                     invalidate_all();
                     return;
                 }
-                invoke_sub(button.id, source);
-                invalidate_all();
+                if (toolbar_press_.begin(button, true)) {
+                    hovered_button_id_ = button.id;
+                    SetCapture(source);
+                    invalidate_all();
+                }
                 return;
             }
         }
@@ -868,9 +1009,11 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
                         annotation.color = color;
                         annotation.width = text_size;
                         annotation.text_style = text_style;
-                        (void)refresh_text_annotation_bounds(
+                        (void)fit_text_annotation_to_canvas(
                             annotation,
-                            request_.config);
+                            request_.config,
+                            selection_.width(),
+                            selection_.height());
                         annotations_.push_back(std::move(annotation));
                         finish_annotation();
                     },
@@ -924,7 +1067,8 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
             preview_.arrow_head_style = active_arrow_head_style_;
             preview_.rounded_rectangle = active_rectangle_rounded_;
             if (tool_uses_points(active_tool_)) {
-                if (!((active_tool_ == Tool::mosaic || active_tool_ == Tool::blur) && mosaic_is_rect_)) {
+                if (!(tool_is_privacy_effect(active_tool_) &&
+                      mosaic_is_rect_)) {
                     preview_.points.push_back(relative);
                 }
             }
@@ -953,10 +1097,19 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
 }
 
 void OverlaySession::on_mouse_move(POINT point) {
+    cursor_pos_ = point;
+    if (toolbar_press_.active()) {
+        if (toolbar_press_.update(point)) {
+            hovered_button_id_ = toolbar_press_.pointer_inside
+                                     ? toolbar_press_.id
+                                     : std::wstring{};
+            invalidate_all();
+        }
+        return;
+    }
     if (ocr_running_) {
         return;
     }
-    cursor_pos_ = point;
     const bool badge_hovered =
         can_edit_selection_size() &&
         dimension_badge_bounds().contains(point);
@@ -1032,6 +1185,7 @@ void OverlaySession::on_mouse_move(POINT point) {
             std::clamp(raw_relative.x, 0L, static_cast<long>(selection_.width())),
             std::clamp(raw_relative.y, 0L, static_cast<long>(selection_.height())),
         };
+        const POINT previous_eraser_position = preview_.end;
         const bool constrain = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         const bool from_center = (GetKeyState(VK_MENU) & 0x8000) != 0;
         if (preview_.tool == Tool::rectangle ||
@@ -1059,9 +1213,10 @@ void OverlaySession::on_mouse_move(POINT point) {
             preview_.end = relative;
         }
         if (preview_.tool == Tool::eraser) {
-            if (selection_.contains(point)) {
-                erase_annotation_at(relative);
-            }
+            // Treat every pointer update as a swept circle rather than a
+            // sampled point. A fast drag can therefore cross a sparse, long
+            // source segment without tunnelling through it.
+            erase_annotations_between(previous_eraser_position, relative);
             invalidate_all();
             return;
         }
@@ -1087,7 +1242,8 @@ void OverlaySession::on_mouse_move(POINT point) {
             highlight_constraint_active_ = false;
         }
         if (tool_uses_points(preview_.tool) && selection_.contains(point)) {
-            if (!((preview_.tool == Tool::mosaic || preview_.tool == Tool::blur) && mosaic_is_rect_)) {
+            if (!(tool_is_privacy_effect(preview_.tool) &&
+                  mosaic_is_rect_)) {
                 double minimum_distance = 2.0;
                 if (preview_.tool == Tool::pen) {
                     minimum_distance = std::clamp(
@@ -1143,8 +1299,42 @@ void OverlaySession::on_mouse_move(POINT point) {
                         point.x - selection_.left,
                         point.y - selection_.top,
                     };
-                    const Annotation updated =
-                        resize_annotation_from_handle(
+                    Annotation updated = original_annotation_;
+                    if (original_annotation_.tool == Tool::text) {
+                        const TextAnnotationResizePlan plan =
+                            plan_text_annotation_resize(
+                                original_annotation_,
+                                active_annotation_handle_,
+                                relative,
+                                selection_.width(),
+                                selection_.height());
+                        if (plan.valid) {
+                            updated.start = plan.start;
+                            updated.end = plan.start;
+                            updated.width = plan.font_size_px;
+                            updated.text_box_width_px = plan.box_width_px;
+                            if (refresh_text_annotation_bounds(
+                                    updated,
+                                    request_.config)) {
+                                const POINT correction =
+                                    text_resize_anchor_delta(
+                                        plan,
+                                        updated.measured_text_layout_bounds);
+                                translate_annotation(
+                                    updated,
+                                    correction.x,
+                                    correction.y);
+                                (void)fit_text_annotation_to_canvas(
+                                    updated,
+                                    request_.config,
+                                    selection_.width(),
+                                    selection_.height());
+                            } else {
+                                updated = original_annotation_;
+                            }
+                        }
+                    } else {
+                        updated = resize_annotation_from_handle(
                             original_annotation_,
                             active_annotation_handle_,
                             relative,
@@ -1152,6 +1342,7 @@ void OverlaySession::on_mouse_move(POINT point) {
                             selection_.height(),
                             (GetKeyState(VK_SHIFT) & 0x8000) != 0,
                             (GetKeyState(VK_MENU) & 0x8000) != 0);
+                    }
                     if (!annotation_geometry_equal(
                             updated,
                             annotations_[static_cast<std::size_t>(
@@ -1159,6 +1350,9 @@ void OverlaySession::on_mouse_move(POINT point) {
                         mark_annotation_transaction_changed();
                         annotations_[static_cast<std::size_t>(
                             selected_annotation_idx_)] = updated;
+                        if (updated.tool == Tool::text) {
+                            active_text_size_ = updated.width;
+                        }
                     }
                 } else {
                     const POINT clamped_delta =
@@ -1222,40 +1416,48 @@ void OverlaySession::on_mouse_move(POINT point) {
                             snap_coordinate(point.y, false),
                         },
                         virtual_bounds_,
-                        (GetKeyState(VK_SHIFT) & 0x8000) != 0,
-                        (GetKeyState(VK_MENU) & 0x8000) != 0);
+                        selection_aspect_ratio_locked_ ||
+                            (GetKeyState(VK_SHIFT) & 0x8000) != 0,
+                        (GetKeyState(VK_MENU) & 0x8000) != 0,
+                        selection_aspect_ratio_locked_
+                            ? selection_locked_aspect_ratio_
+                            : 0.0);
                 } else {
-                    int left = selection_.left;
-                    int top = selection_.top;
-                    int right = selection_.right;
-                    int bottom = selection_.bottom;
-
+                    POINT snapped = point;
                     switch (current_drag_mode_) {
                         case DragMode::top:
-                            top = snap_coordinate(
+                            snapped.y = snap_coordinate(
                                 original_selection_.top + dy,
                                 false);
                             break;
                         case DragMode::right:
-                            right = snap_coordinate(
+                            snapped.x = snap_coordinate(
                                 original_selection_.right + dx,
                                 true);
                             break;
                         case DragMode::bottom:
-                            bottom = snap_coordinate(
+                            snapped.y = snap_coordinate(
                                 original_selection_.bottom + dy,
                                 false);
                             break;
                         case DragMode::left:
-                            left = snap_coordinate(
+                            snapped.x = snap_coordinate(
                                 original_selection_.left + dx,
                                 true);
                             break;
                         default:
                             break;
                     }
-
-                    selection_ = {left, top, right, bottom};
+                    selection_ = resize_selection_from_edge(
+                        original_selection_,
+                        current_drag_mode_,
+                        snapped,
+                        virtual_bounds_,
+                        selection_aspect_ratio_locked_ ||
+                            (GetKeyState(VK_SHIFT) & 0x8000) != 0,
+                        selection_aspect_ratio_locked_
+                            ? selection_locked_aspect_ratio_
+                            : 0.0);
                 }
             }
         }
@@ -1308,6 +1510,21 @@ void OverlaySession::on_mouse_move(POINT point) {
 }
 
 void OverlaySession::on_mouse_up(HWND source, POINT point) {
+    if (toolbar_press_.active()) {
+        const auto activation = toolbar_press_.release(point);
+        release_capture_if_owned(source);
+        hovered_button_id_ = activation ? activation->id : std::wstring{};
+        invalidate_all();
+        if (activation) {
+            if (activation->from_sub_toolbar) {
+                invoke_sub(activation->id, source);
+                invalidate_all();
+            } else {
+                invoke(activation->id, source);
+            }
+        }
+        return;
+    }
     if (ocr_running_) {
         return;
     }
@@ -1328,6 +1545,20 @@ void OverlaySession::on_mouse_up(HWND source, POINT point) {
         return;
     }
     if (selection_complete_ && drawing_annotation_) {
+        if (preview_.tool == Tool::eraser) {
+            const POINT final_relative{
+                std::clamp(
+                    point.x - selection_.left,
+                    0L,
+                    static_cast<long>(selection_.width())),
+                std::clamp(
+                    point.y - selection_.top,
+                    0L,
+                    static_cast<long>(selection_.height())),
+            };
+            erase_annotations_between(preview_.end, final_relative);
+            preview_.end = final_relative;
+        }
         drawing_annotation_ = false;
         highlight_constraint_active_ = false;
         normalize_annotation_stroke(preview_);
@@ -1394,7 +1625,7 @@ void OverlaySession::on_mouse_up(HWND source, POINT point) {
     }
 }
 
-void OverlaySession::on_double_click(POINT point) {
+void OverlaySession::on_double_click(HWND source, POINT point) {
     if (ocr_running_) {
         return;
     }
@@ -1408,8 +1639,7 @@ void OverlaySession::on_double_click(POINT point) {
         selected_annotation_idx_ < static_cast<int>(annotations_.size()) &&
         annotations_[static_cast<std::size_t>(selected_annotation_idx_)].tool ==
             Tool::text) {
-        HWND owner = windows_.empty() ? nullptr : windows_.front()->hwnd();
-        edit_selected_text(owner);
+        edit_selected_text(source);
         return;
     }
     if (active_tool_ == Tool::none) {
@@ -1467,6 +1697,12 @@ void OverlaySession::on_key_down(
             return;
         }
         finish({ExitCode::user_cancelled, L"已取消。"});
+        return;
+    }
+    if (key == VK_F5) {
+        if (!is_auto_repeat) {
+            refresh_capture(source);
+        }
         return;
     }
 
@@ -1581,11 +1817,53 @@ void OverlaySession::on_key_down(
                             ? SelectionResizeDirection::up
                             : SelectionResizeDirection::down;
         if (control_down != shift_down) {
-            selection_ = resize_selection_one_pixel(
-                selection_,
-                virtual_bounds_,
-                direction,
-                control_down);
+            if (selection_aspect_ratio_locked_) {
+                DragMode edge = DragMode::none;
+                POINT cursor{};
+                switch (direction) {
+                    case SelectionResizeDirection::left:
+                        edge = control_down ? DragMode::left : DragMode::right;
+                        cursor = {
+                            control_down ? selection_.left - 1
+                                         : selection_.right - 1,
+                            selection_.top};
+                        break;
+                    case SelectionResizeDirection::right:
+                        edge = control_down ? DragMode::right : DragMode::left;
+                        cursor = {
+                            control_down ? selection_.right + 1
+                                         : selection_.left + 1,
+                            selection_.top};
+                        break;
+                    case SelectionResizeDirection::up:
+                        edge = control_down ? DragMode::top : DragMode::bottom;
+                        cursor = {
+                            selection_.left,
+                            control_down ? selection_.top - 1
+                                         : selection_.bottom - 1};
+                        break;
+                    case SelectionResizeDirection::down:
+                        edge = control_down ? DragMode::bottom : DragMode::top;
+                        cursor = {
+                            selection_.left,
+                            control_down ? selection_.bottom + 1
+                                         : selection_.top + 1};
+                        break;
+                }
+                selection_ = resize_selection_from_edge(
+                    selection_,
+                    edge,
+                    cursor,
+                    virtual_bounds_,
+                    true,
+                    selection_locked_aspect_ratio_);
+            } else {
+                selection_ = resize_selection_one_pixel(
+                    selection_,
+                    virtual_bounds_,
+                    direction,
+                    control_down);
+            }
             build_toolbar();
             build_sub_toolbar();
             invalidate_all();
@@ -2051,6 +2329,7 @@ void OverlaySession::show_quick_menu(HWND hwnd, POINT pt) {
     append_tool(106, L"pen", L"画笔 (Pen)\tPen");
     append_tool(107, L"mosaic", L"马赛克 (Mosaic)\tMosaic");
     append_tool(108, L"blur", L"模糊 (Blur)\tBlur");
+    append_tool(114, L"redact", L"实心遮挡 (Solid Redaction)");
     append_tool(109, L"highlight", L"高亮 (Highlight)\tHighlight");
     append_tool(110, L"text", L"文本 (Text)\tText");
     append_tool(111, L"serial", L"序号 (Serial)\tSerial");
@@ -2126,7 +2405,7 @@ void OverlaySession::show_quick_menu(HWND hwnd, POINT pt) {
         redo();
     } else if (selection == 7) {
         finish({ExitCode::user_cancelled, L"已取消。"});
-    } else if (selection >= 101 && selection <= 113) {
+    } else if (selection >= 101 && selection <= 114) {
         Tool chosen_tool = Tool::none;
         switch (selection) {
             case 101: chosen_tool = Tool::select; break;
@@ -2142,6 +2421,7 @@ void OverlaySession::show_quick_menu(HWND hwnd, POINT pt) {
             case 111: chosen_tool = Tool::serial; break;
             case 112: chosen_tool = Tool::eraser; break;
             case 113: chosen_tool = Tool::watermark; break;
+            case 114: chosen_tool = Tool::redact; break;
         }
         remember_current_style();
         active_tool_ = chosen_tool;

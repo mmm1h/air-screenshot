@@ -5,8 +5,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "airshot/ocr.h"
 
@@ -84,6 +86,38 @@ parse_warm_worker_response(
     std::wstring_view requested_sha256,
     std::uint64_t requested_size);
 
+[[nodiscard]] bool resume_response_is_usable(
+    DWORD status_code,
+    std::uint64_t existing_bytes,
+    std::uint64_t expected_bytes,
+    std::wstring_view content_range) noexcept;
+
+[[nodiscard]] std::wstring dependency_download_cache_file_name(
+    std::wstring_view sha256,
+    std::uint64_t size);
+
+[[nodiscard]] std::vector<std::size_t>
+dependency_download_cache_owner_indices(
+    std::span<const OcrDependencyFile> files);
+
+void update_dependency_download_cache_alias_progress(
+    std::span<const std::size_t> owner_indices,
+    std::size_t file_index,
+    std::uint64_t current_bytes,
+    std::vector<std::uint64_t>& file_progress_bytes,
+    std::uint64_t& available_bytes) noexcept;
+
+void update_dependency_download_cache_alias_verification(
+    std::span<const std::size_t> owner_indices,
+    std::size_t file_index,
+    bool verified,
+    std::vector<bool>& file_verified) noexcept;
+
+[[nodiscard]] bool dependency_download_cache_is_reusable(
+    std::span<const std::size_t> owner_indices,
+    const std::vector<bool>& file_verified,
+    std::size_t file_index) noexcept;
+
 [[nodiscard]] std::optional<std::wstring> sha256_file(
     const std::filesystem::path& path,
     std::stop_token stop_token,
@@ -91,6 +125,12 @@ parse_warm_worker_response(
 
 [[nodiscard]] bool warm_failure_allows_fallback(
     bool cancelled,
+    bool timed_out,
+    bool stop_requested) noexcept;
+
+[[nodiscard]] bool warm_response_allows_fallback(
+    bool response_valid,
+    bool response_ok,
     bool stop_requested) noexcept;
 
 [[nodiscard]] std::optional<std::uint32_t> decode_warm_frame_size(

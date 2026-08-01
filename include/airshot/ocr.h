@@ -241,7 +241,8 @@ private:
 // Idempotent first-use preparation entry point. It reuses a verified local
 // package when available and otherwise performs the existing signed-manifest,
 // anti-rollback, per-file SHA256, staged-install and post-install verification
-// pipeline. Retry by calling this function again with the same options.
+// pipeline. Signed payload downloads use a content-addressed partial cache, so
+// retrying with the same options resumes safely when the server supports Range.
 [[nodiscard]] OcrPreparationResult prepare_ocr_dependencies(
     const OcrPreparationOptions& options,
     const OcrPreparationProgressCallback& progress_callback = {},

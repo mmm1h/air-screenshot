@@ -5,7 +5,7 @@ seeded by Stitch project `454227981142275123`, session `8313762202511579579`.
 The Flow Lens production master was refined in Stitch screen
 `bdd901cfa6904c73b36e187a8a39c930` to remove a chart-like radial wedge.
 
-- `focus-frame.svg` — the default executable icon and precision-first direction.
+- `focus-frame.svg` — the default executable icon: two opposing focus corners and one captured pixel, reduced to the three shapes that remain legible at 16 px.
 - `flow-lens.svg` — the continuous, speed-first circular direction.
 - `pixel-console.svg` — the modular, technical direction.
 
