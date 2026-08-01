@@ -516,6 +516,30 @@ jobs:
           set -euo pipefail
           ocr_payload_dir="$(mktemp -d)"
 
+          valid_ocr_manifest_path() {
+            local file_path="$1"
+            local component stem upper
+            local -a components
+
+            if [[ -z "$file_path" || ${#file_path} -gt 240 ||
+                  ! "$file_path" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
+              return 1
+            fi
+            IFS=/ read -r -a components <<<"$file_path"
+            for component in "${components[@]}"; do
+              if [[ "$component" == "." || "$component" == ".." ||
+                    "$component" == *. ]]; then
+                return 1
+              fi
+              stem="${component%%.*}"
+              upper="${stem^^}"
+              case "$upper" in
+                CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]) return 1 ;;
+              esac
+            done
+            return 0
+          }
+
           verify_ocr_payload() {
             local target_root="$1"
             local downloaded_count=0
@@ -524,17 +548,15 @@ jobs:
 
             while IFS=$'\t' read -r \
                 file_path file_url file_sha256 file_size; do
-              if [[ ! "$file_path" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] ||
-                 [[ "$file_path" == /* || "$file_path" == *"//"* ||
-                    "$file_path" == "." || "$file_path" == ".." ||
-                    "$file_path" == ./* || "$file_path" == ../* ||
-                    "$file_path" == */../* || "$file_path" == */.. ]]; then
+              if ! valid_ocr_manifest_path "$file_path"; then
+                echo "Invalid OCR manifest path: $file_path" >&2
                 return 1
               fi
               expected_url="https://mmm1h.github.io/air-screenshot/ocr/rapidocr-onnx/$file_path"
               if [[ "$file_url" != "$expected_url" ]] ||
                  [[ ! "$file_sha256" =~ ^[0-9a-f]{64}$ ]] ||
                  [[ ! "$file_size" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Invalid OCR manifest metadata for: $file_path" >&2
                 return 1
               fi
 
@@ -555,12 +577,14 @@ jobs:
                    --connect-timeout 10 --max-time 180 \
                    -H 'Cache-Control: no-cache' \
                    -o "$partial_path" "$file_url"; then
+                echo "Failed to download OCR payload file: $file_url" >&2
                 return 1
               fi
               actual_sha256="$(sha256sum "$partial_path" | cut -d' ' -f1)"
               actual_size="$(stat -c%s "$partial_path")"
               if [[ "$actual_sha256" != "$file_sha256" ]] ||
                  [[ "$actual_size" != "$file_size" ]]; then
+                echo "OCR payload hash or size mismatch: $file_path" >&2
                 return 1
               fi
               mv -f "$partial_path" "$target_path"
