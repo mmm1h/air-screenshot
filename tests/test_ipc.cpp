@@ -39,6 +39,45 @@ void expect(bool condition, std::wstring_view message) {
     }
 }
 
+void test_unavailable_pipe_honors_timeout() {
+    const auto wait_started = std::chrono::steady_clock::now();
+    const bool became_available = pipe_is_available(125);
+    const auto wait_duration = std::chrono::steady_clock::now() - wait_started;
+
+    expect(!became_available,
+           L"missing pipe remains unavailable after a bounded wait");
+    expect(wait_duration >= std::chrono::milliseconds(75) &&
+               wait_duration < std::chrono::seconds(1),
+           L"missing pipe honors the requested timeout without an unbounded wait");
+}
+
+void test_waits_for_delayed_pipe_creation() {
+    airshot::PipeServer server(test_pipe_name());
+    bool started = false;
+    std::thread starter([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        started = server.start([](std::wstring_view request) {
+            return std::wstring(request);
+        });
+    });
+
+    const auto wait_started = std::chrono::steady_clock::now();
+    const bool became_available = pipe_is_available(2000);
+    const auto wait_duration = std::chrono::steady_clock::now() - wait_started;
+    starter.join();
+
+    expect(started, L"delayed pipe server starts");
+    expect(became_available,
+           L"pipe availability waits for a listener created during its timeout");
+    expect(wait_duration >= std::chrono::milliseconds(100) &&
+               wait_duration < std::chrono::seconds(2),
+           L"delayed pipe availability honors its bounded wait");
+    const auto response = send_pipe_request(L"delayed", 2000);
+    expect(response && *response == L"delayed",
+           L"pipe created during the wait accepts a request");
+    server.stop();
+}
+
 void test_round_trip_and_single_server() {
     std::mutex callback_mutex;
     std::condition_variable callback_condition;
@@ -502,6 +541,8 @@ void test_listener_creation_retry_and_fault_notification() {
 }  // namespace
 
 int wmain() {
+    test_unavailable_pipe_honors_timeout();
+    test_waits_for_delayed_pipe_creation();
     test_round_trip_and_single_server();
     test_restart_and_legacy_start_overload();
     test_stop_cancels_transport_after_handler_cancellation();

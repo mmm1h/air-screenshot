@@ -309,6 +309,7 @@ function Start-AirScreenshot {
         Process = $process
         Stdout = $stdout
         Stderr = $stderr
+        Arguments = @($Arguments)
     }
 }
 
@@ -320,7 +321,10 @@ function Complete-AirScreenshot {
 
     if (-not $Run.Process.WaitForExit($TimeoutMilliseconds)) {
         Stop-Process -Id $Run.Process.Id -Force -ErrorAction SilentlyContinue
-        throw "AirScreenshot command timed out (PID $($Run.Process.Id))."
+        throw (
+            "AirScreenshot command timed out after $TimeoutMilliseconds ms " +
+            "(PID $($Run.Process.Id), arguments=$($Run.Arguments -join ' '))."
+        )
     }
     $Run.Process.WaitForExit()
     $result = [pscustomobject]@{

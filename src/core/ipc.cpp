@@ -628,8 +628,36 @@ bool pipe_is_available(DWORD timeout_ms) {
 }
 
 bool pipe_is_available_at(std::wstring_view pipe_name, DWORD timeout_ms) {
-    return !pipe_name.empty() &&
-           WaitNamedPipeW(std::wstring(pipe_name).c_str(), timeout_ms) != FALSE;
+    if (pipe_name.empty()) {
+        return false;
+    }
+
+    const std::wstring name(pipe_name);
+    Deadline deadline(timeout_ms);
+    bool first_attempt = true;
+    for (;;) {
+        const DWORD wait_timeout = deadline.remaining();
+        if (!first_attempt && wait_timeout == 0) {
+            return false;
+        }
+        first_attempt = false;
+        if (WaitNamedPipeW(name.c_str(), wait_timeout) != FALSE) {
+            return true;
+        }
+
+        const DWORD error = GetLastError();
+        const DWORD remaining = deadline.remaining();
+        if (remaining == 0 ||
+            (error != ERROR_FILE_NOT_FOUND && error != ERROR_PIPE_BUSY &&
+             error != ERROR_SEM_TIMEOUT)) {
+            return false;
+        }
+
+        // WaitNamedPipe returns immediately when no pipe instance exists yet.
+        // A host owns its mutex before it creates the listener, so poll within
+        // the caller's deadline instead of reporting a false startup failure.
+        Sleep(std::min<DWORD>(remaining, 10));
+    }
 }
 
 std::optional<std::wstring> send_pipe_request(std::wstring_view request_json, DWORD timeout_ms) {

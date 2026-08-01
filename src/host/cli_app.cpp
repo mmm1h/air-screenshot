@@ -171,6 +171,32 @@ bool host_instance_exists() noexcept {
     return held_by_host;
 }
 
+enum class HostPipeWaitResult {
+    ready,
+    host_gone,
+    timed_out,
+};
+
+HostPipeWaitResult wait_for_host_pipe(DWORD timeout_ms) noexcept {
+    const ULONGLONG started_at = GetTickCount64();
+    for (;;) {
+        if (pipe_is_available(0)) {
+            return HostPipeWaitResult::ready;
+        }
+        if (!host_instance_exists()) {
+            return HostPipeWaitResult::host_gone;
+        }
+
+        const ULONGLONG elapsed = GetTickCount64() - started_at;
+        if (elapsed >= timeout_ms) {
+            return HostPipeWaitResult::timed_out;
+        }
+        Sleep(std::min<DWORD>(
+            10,
+            timeout_ms - static_cast<DWORD>(elapsed)));
+    }
+}
+
 }  // namespace
 
 int run_cli(std::span<const std::wstring> arguments) {
@@ -188,12 +214,18 @@ int run_cli(std::span<const std::wstring> arguments) {
     std::wstring request_json = parsed.request_json;
     bool pipe_available = pipe_is_available(0);
     if (!pipe_available && host_instance_exists()) {
-        pipe_available = pipe_is_available(15000);
-        if (!pipe_available) {
+        const HostPipeWaitResult wait_result = wait_for_host_pipe(15000);
+        pipe_available = wait_result == HostPipeWaitResult::ready;
+        if (wait_result == HostPipeWaitResult::timed_out) {
             const CommandResponse response =
                 ipc_failure(L"Air Screenshot 宿主存在，但命名管道未就绪。");
             write_response(response, parsed.json);
             return static_cast<int>(response.code);
+        }
+        if (wait_result == HostPipeWaitResult::host_gone) {
+            // A replacement host may already be ready. If it is still
+            // starting, the normal launch/status path below remains safe.
+            pipe_available = pipe_is_available(0);
         }
     }
     if (!pipe_available) {
