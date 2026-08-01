@@ -1,57 +1,47 @@
 #Requires -Version 7.0
 
-function Remove-NonRuntimeRunnerFiles {
+$script:NativeOcrRuntimeFiles = @(
+    "rapidocr_runner.exe",
+    "onnxruntime.dll",
+    "msvcp140.dll",
+    "msvcp140_1.dll",
+    "vcruntime140.dll",
+    "vcruntime140_1.dll"
+)
+
+function Get-NativeOcrRuntimeFiles {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)][string]$Root,
-        [switch]$AllowUnexpectedEmpty
-    )
+    param()
+    return @($script:NativeOcrRuntimeFiles)
+}
+
+function Remove-LegacyOcrRunnerFiles {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Root)
 
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
         return
     }
-
-    # Dependencies and PyInstaller are hash-pinned. Keep this list exact so a
-    # changed dependency layout cannot silently broaden what the release drops.
-    $emptyMetadata = [Collections.Generic.HashSet[string]]::new(
-        [StringComparer]::Ordinal
+    $resolvedRoot = [IO.Path]::GetFullPath($Root).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
     )
-    foreach ($relative in @(
-            "_internal/certifi/py.typed",
-            "_internal/numpy-2.4.6.dist-info/REQUESTED",
-            "_internal/pyreadline3-3.5.6.dist-info/REQUESTED",
-            "_internal/tqdm-4.69.0.dist-info/REQUESTED"
-        )) {
-        $null = $emptyMetadata.Add($relative)
+    $legacyInternal = [IO.Path]::GetFullPath((Join-Path $resolvedRoot "_internal"))
+    if (-not $legacyInternal.StartsWith(
+            $resolvedRoot + [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        [IO.Path]::GetFileName($legacyInternal) -cne "_internal") {
+        throw "Unsafe legacy OCR runtime cleanup path: $legacyInternal"
     }
-
-    # jaraco.text's bundled sample is not used by the OCR runner and its space
-    # is intentionally outside the signed dependency path grammar.
-    $nonRuntimeData = [Collections.Generic.HashSet[string]]::new(
-        [StringComparer]::Ordinal
-    )
-    $null = $nonRuntimeData.Add(
-        "_internal/setuptools/_vendor/jaraco/text/Lorem ipsum.txt"
-    )
-
-    $unexpected = [Collections.Generic.List[string]]::new()
-    foreach ($file in @(Get-ChildItem -LiteralPath $Root -File -Recurse)) {
-        $relative = [IO.Path]::GetRelativePath($Root, $file.FullName).Replace("\", "/")
-        $remove = $nonRuntimeData.Contains($relative) -or
-            ($file.Length -eq 0 -and $emptyMetadata.Contains($relative))
-        if ($remove) {
-            Write-Host "Removing non-runtime OCR runner file: $relative"
-            Remove-Item -LiteralPath $file.FullName -Force
-            continue
-        }
-        if ($file.Length -eq 0) {
-            $unexpected.Add($relative)
-        }
+    if (Test-Path -LiteralPath $legacyInternal -PathType Container) {
+        Remove-Item -LiteralPath $legacyInternal -Recurse -Force
     }
-
-    if (-not $AllowUnexpectedEmpty -and $unexpected.Count -gt 0) {
-        $listed = ($unexpected | Sort-Object) -join ", "
-        throw "PyInstaller output contains unexpected empty OCR runner files: $listed"
+    foreach ($retiredFile in @("rapidocr_api.dll", "DirectML.dll")) {
+        $path = Join-Path $resolvedRoot $retiredFile
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Remove-Item -LiteralPath $path -Force
+        }
     }
 }
 
@@ -59,29 +49,27 @@ function Get-RunnerOutputFingerprint {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Root)
 
-    $runner = Join-Path $Root "rapidocr_runner.exe"
-    $internal = Join-Path $Root "_internal"
-    if (-not (Test-Path -LiteralPath $runner -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $internal -PathType Container)) {
-        return ""
+    $files = [Collections.Generic.List[IO.FileInfo]]::new()
+    foreach ($relative in Get-NativeOcrRuntimeFiles) {
+        $path = Join-Path $Root $relative
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            return ""
+        }
+        $file = Get-Item -LiteralPath $path
+        if ($file.Length -le 0 -or
+            ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return ""
+        }
+        $files.Add($file)
     }
 
-    $files = @(
-        Get-Item -LiteralPath $runner
-        Get-ChildItem -LiteralPath $internal -File -Recurse
-    ) | Sort-Object FullName
-    if (@($files | Where-Object Length -EQ 0).Count -gt 0) {
-        return ""
-    }
-
-    $inventory = foreach ($file in $files) {
+    $inventory = foreach ($file in $files | Sort-Object FullName) {
         $relative = [IO.Path]::GetRelativePath($Root, $file.FullName).Replace("\", "/")
         "$relative|$($file.Length)|$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash)"
     }
-    $inventoryText = $inventory -join "`n"
     return [Convert]::ToHexString(
         [Security.Cryptography.SHA256]::HashData(
-            [Text.Encoding]::UTF8.GetBytes($inventoryText)
+            [Text.Encoding]::UTF8.GetBytes($inventory -join "`n")
         )
     )
 }

@@ -48,7 +48,7 @@ Windows SmartScreen 可能提示未知发布者。这是因为当前使用自签
 
 ## 构建与验证
 
-要求 PowerShell 7、CMake 3.25+、Ninja，以及带“使用 C++ 的桌面开发”和 CMake 组件的 Visual Studio 2022 17.8+。只支持 MSVC x64，Windows SDK 必须为 10.0.19041 或更新版本；执行 RapidOCR runner 单测需要 Python 3.11 或更新版本，构建正式 OCR payload 则固定使用 GitHub Windows runner 可用的 CPython 3.11.9 x64。
+要求 PowerShell 7、CMake 3.25+、Ninja、Rust 1.88.0，以及带“使用 C++ 的桌面开发”和 CMake 组件的 Visual Studio 2022 17.8+。只支持 MSVC x64，Windows SDK 必须为 10.0.19041 或更新版本。Rust 仅用于编译原生 OCR worker；最终用户不需要安装 Rust，也不会下载或运行 Python。
 
 ```powershell
 .\scripts\build.ps1 -Configuration Release
@@ -86,8 +86,8 @@ Windows SmartScreen 可能提示未知发布者。这是因为当前使用自签
 推送格式为 `vX.Y.Z` 的 tag 会自动运行 [release.yml](.github/workflows/release.yml)：
 
 ```powershell
-git tag v0.3.6
-git push origin v0.3.6
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 工作流将职责分为四个 job：无 secrets 的构建与 Debug/Release 测试、只有签名权限的打包验证、无 PFX 的产物证明与 Pages 暂存、最终部署和 Release 发布。签名证书只写入签名 runner 的临时目录，并在打包步骤结束时删除。所有版本共享同一个发布并发组；发布前会将 lightweight/annotated tag 解引用到 commit，核对 `GITHUB_SHA`，并拒绝不高于现有最高正式版本的发布。失败重跑遇到同名正式 Release 时，会逐个比对不可变资产；内容完全一致才继续验证，绝不覆盖或悄悄替换资产。
@@ -136,15 +136,15 @@ GitHub Release 包含 EXE、PDB、OCR manifest 及其签名、SHA256 校验和�
 
 ## OCR
 
-OCR 使用本地 RapidOCR / PP-OCRv5 / ONNX Runtime CPU 推理，设置中可切换三档：
+OCR 使用原生 Rust worker、`paddle-ocr-rs`、PaddleOCR ONNX 模型和 ONNX Runtime 1.22 CPU 推理，设置中可切换三档：
 
 - 极速 OCR：默认档，使用 PP-OCRv5 mobile 模型，适合日常截图识字。
-- 高精度 OCR：使用 PP-OCRv5 server 模型，适合小字、大图和复杂背景。
+- 高精度 OCR：使用 PP-OCRv5 server 检测模型配合 mobile 识别模型，在增强小字和复杂背景检测的同时避免 server 识别模型的高延迟。
 - 兼容 OCR：使用 PP-OCRv4 mobile 模型，作为稳定兼容档。
 
 首次点击 OCR 时无需先跳转设置页：程序会自动检查本地依赖，必要时进入安全准备流程，并显示检查、下载、验证、安装及最终校验状态。用户可随时取消，取消或可恢复的网络故障不会污染已安装版本，可直接重试；已通过完整验证的依赖可离线复用。安装时先用内置公钥验证版本化清单的 ECDSA 签名、有效期和防回滚序列，再校验每个文件的大小和 SHA256，最后事务式安装到 `%LOCALAPPDATA%\AirScreenshot\ocr\rapidocr-onnx`；签名、校验或防回滚失败不会被“重试”绕过。
 
-OCR 识别由后台任务启动受 Job 约束的独立子进程；同一依赖版本与识别档位可复用温热 worker，空闲 60 秒或宿主管道关闭后自动退出，因此模型和 ONNX Runtime 不会进入托盘主进程。worker 崩溃、超时或协议不匹配会被丢弃并安全回退到单次冷启动；用户取消会终止完整子进程树，不再继续冷启动。
+OCR 识别由后台任务启动受 Job 约束的原生独立子进程；同一依赖版本与识别档位可复用温热 worker，空闲 60 秒或宿主管道关闭后自动退出，因此模型和 ONNX Runtime 不会进入托盘主进程。worker 崩溃、超时或协议不匹配会被丢弃并安全回退到单次冷启动；用户取消会终止完整子进程树，不再继续冷启动。OCR payload 不含 Python 解释器、Python 包或 PyInstaller 运行时。
 
 小选区会使用高质量有限倍数放大，超长截图会分块识别、对重叠结果去重并还原全局坐标。结果协议保留文字块、四边形、置信度、排序、预处理方式及分阶段耗时；纯文本由结构化结果稳定生成。真实准确率和冷/热启动耗时必须使用正式签名 OCR payload 与固定语料测量，普通无 payload 的本地构建不会用模拟数据宣称性能提升。
 

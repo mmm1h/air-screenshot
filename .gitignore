@@ -2,6 +2,7 @@
 /build-*/
 /build_debug/
 /dist/
+/ocr-worker/target/
 /.vs/
 /out/
 /*.user

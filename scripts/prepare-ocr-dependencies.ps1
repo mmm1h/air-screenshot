@@ -1,10 +1,9 @@
-#requires -Version 7.0
+#Requires -Version 7.0
 
 [CmdletBinding()]
 param(
     [string]$OcrRoot,
-    [string]$PythonExecutable,
-    [string]$RequirementsLockPath,
+    [string]$CargoExecutable,
     [switch]$Force
 )
 
@@ -15,17 +14,17 @@ $root = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($OcrRoot)) {
     $OcrRoot = Join-Path $root "dist\ocr-dependencies\rapidocr-onnx"
 }
-
+$OcrRoot = [IO.Path]::GetFullPath($OcrRoot)
 $cache = Join-Path $root "dist\ocr-cache"
-$staging = Join-Path $cache "staging"
-New-Item -ItemType Directory -Force -Path $cache, $staging, $OcrRoot | Out-Null
+$downloadCache = Join-Path $cache "downloads"
+$cargoTarget = Join-Path $cache "rust-target"
+New-Item -ItemType Directory -Force -Path $cache, $downloadCache, $cargoTarget, $OcrRoot | Out-Null
 
 function Invoke-CheckedNative {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
         [Parameter(Mandatory = $true)][string[]]$ArgumentList
     )
-
     & $FilePath @ArgumentList
     if ($LASTEXITCODE -ne 0) {
         throw "Native command failed with exit code $LASTEXITCODE`: $FilePath $($ArgumentList -join ' ')"
@@ -38,19 +37,17 @@ function Get-DependencyFile {
         [Parameter(Mandatory = $true)][string]$Destination,
         [Parameter(Mandatory = $true)][ValidatePattern("^[A-Fa-f0-9]{64}$")][string]$Sha256
     )
-
     $expectedHash = $Sha256.ToUpperInvariant()
-    if (Test-Path -LiteralPath $Destination) {
+    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
         $actualHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
         if (-not $Force -and $actualHash -eq $expectedHash) {
             return
         }
         Remove-Item -LiteralPath $Destination -Force
     }
-
-    $destinationParent = Split-Path -Parent $Destination
-    New-Item -ItemType Directory -Force -Path $destinationParent | Out-Null
-    $temporary = Join-Path $destinationParent (
+    $parent = Split-Path -Parent $Destination
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    $temporary = Join-Path $parent (
         ".$([IO.Path]::GetFileName($Destination)).$([guid]::NewGuid().ToString('N')).download"
     )
     try {
@@ -59,7 +56,7 @@ function Get-DependencyFile {
             -Uri $Url `
             -OutFile $temporary `
             -MaximumRedirection 5 `
-            -Headers @{ "User-Agent" = "AirScreenshot-OCR-Build/1" }
+            -Headers @{ "User-Agent" = "AirScreenshot-OCR-Build/2" }
         $actualHash = (Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash
         if ($actualHash -ne $expectedHash) {
             throw "SHA256 mismatch: $Url`nExpected: $expectedHash`nActual:   $actualHash"
@@ -71,45 +68,13 @@ function Get-DependencyFile {
     }
 }
 
-function Resolve-Python311 {
-    if (-not [string]::IsNullOrWhiteSpace($PythonExecutable)) {
-        $command = Get-Command $PythonExecutable -ErrorAction Stop
-        return @{
-            Executable = $command.Source
-            Prefix = @()
-        }
-    }
-
-    $launcher = Get-Command "py" -ErrorAction SilentlyContinue
-    if ($launcher) {
-        try {
-            $version = & $launcher.Source -3.11 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"
-            if ($LASTEXITCODE -eq 0 -and $version.Trim() -eq "3.11.9") {
-                return @{
-                    Executable = $launcher.Source
-                    Prefix = @("-3.11")
-                }
-            }
-        }
-        catch {
-            # Fall through to a directly discoverable python executable.
-        }
-    }
-
-    $python = Get-Command "python" -ErrorAction Stop
-    return @{
-        Executable = $python.Source
-        Prefix = @()
-    }
-}
-
 function Copy-PreparedFile {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
         [Parameter(Mandatory = $true)][string]$RelativePath
     )
-
-    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf) -or
+        (Get-Item -LiteralPath $Source).Length -le 0) {
         throw "Missing prepared dependency: $Source"
     }
     $destination = Join-Path $OcrRoot $RelativePath
@@ -117,167 +82,314 @@ function Copy-PreparedFile {
     Copy-Item -LiteralPath $Source -Destination $destination -Force
 }
 
-$inlineRequirementsLock = @'
-altgraph==0.17.5 --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
-certifi==2026.7.22 --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775
-charset-normalizer==3.4.9 --hash=sha256:6366a16e1a25018694d6a5d784d09b046edc9eac40ea2b54065c3052672516a1
-colorama==0.4.6 --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6
-coloredlogs==15.0.1 --hash=sha256:612ee75c546f53e92e70049c9dbfcc18c935a2b9a53b66085ce9ef6a6e5c0934
-colorlog==6.11.0 --hash=sha256:f1e27d75aa2cb138f3f640c0e305b65b680ccbef6ecc034eba7e03494ffcd2a1
-flatbuffers==25.12.19 --hash=sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4
-humanfriendly==10.0 --hash=sha256:1697e1a8a8f550fd43c2865cd84542fc175a61dcb779b6fee18cf6b6ccba1477
-idna==3.18 --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2
-mpmath==1.3.0 --hash=sha256:a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c
-numpy==2.4.6 --hash=sha256:1e254a00cdf42b1e4d5b3d68d33af63268d41340d8885df2ab6470f2e1500147
-omegaconf==2.0.0 --hash=sha256:80e4f4aa932b10699baf94d43b0e9e44e504d140b6c94b92ab4ed12ce6b77ec6
-onnxruntime==1.20.1 --hash=sha256:8508887eb1c5f9537a4071768723ec7c30c28eb2518a00d0adcd32c89dea3221
-opencv-python==5.0.0.93 --hash=sha256:f90ba04b8f73bc5c3814037699739f0156f597338a98f05956c684e7c3ca10d2
-packaging==26.2 --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
-pefile==2024.8.26 --hash=sha256:76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f
-pillow==12.3.0 --hash=sha256:8e95e1385e4998ae9694eeaa4730ba5457ff61185b3a55e2e7bea0880aef452a
-protobuf==7.35.1 --hash=sha256:230a75ddfc2de4806e56696ce9640c1cdfdb6543b7cfce98d42a4c0a0e7bdb87
-pyclipper==1.4.0 --hash=sha256:e9b973467d9c5fa9bc30bb6ac95f9f4d7c3d9fc25f6cf2d1cc972088e5955c01
-pyinstaller==6.17.0 --hash=sha256:b019940dbf7a01489d6b26f9fb97db74b504e0a757010f7ad078675befc85a82
-pyinstaller-hooks-contrib==2026.6 --hash=sha256:fd13b8ac126b35361175edacd41a0d97080b75dd5f4b594ecefefff969509dd3
-pyreadline3==3.5.6 --hash=sha256:8449b734232e42a5dcd74048e39b60db2839a4c38cf3ae2bf7707d58b5389c0d
-pywin32-ctypes==0.2.3 --hash=sha256:8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8
-PyYAML==6.0.3 --hash=sha256:9f3bfb4965eb874431221a3ff3fdcddc7e74e3b07799e0e84ca4a0f867d449bf
-rapidocr==3.8.1 --hash=sha256:650044b1fbce9e6bae5cae462dcf8be754cde11e2f23fc51f65dcc08deae2c46
-requests==2.34.2 --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
-setuptools==83.0.0 --hash=sha256:29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3
-shapely==2.1.2 --hash=sha256:c64d5c97b2f47e3cd9b712eaced3b061f2b71234b3fc263e0fcf7d889c6559dc
-six==1.17.0 --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274
-sympy==1.14.0 --hash=sha256:e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5
-tqdm==4.69.0 --hash=sha256:9979978912be667a6ef21fd5d8abf54e324e63d82f7f43c360792ebc2bc4e622
-typing-extensions==4.16.0 --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
-urllib3==2.7.0 --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
-'@
-
-if ([string]::IsNullOrWhiteSpace($RequirementsLockPath)) {
-    $RequirementsLockPath = Join-Path $cache "rapidocr-runner-requirements.lock"
-    [IO.File]::WriteAllText(
-        $RequirementsLockPath,
-        $inlineRequirementsLock + [Environment]::NewLine,
-        [Text.UTF8Encoding]::new($false)
+function Expand-PinnedZipEntry {
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$EntryPath,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][ValidatePattern("^[A-Fa-f0-9]{64}$")][string]$Sha256
     )
-}
-elseif (-not (Test-Path -LiteralPath $RequirementsLockPath -PathType Leaf)) {
-    throw "Requirements lock file does not exist: $RequirementsLockPath"
-}
-$requirementsHash = (Get-FileHash -LiteralPath $RequirementsLockPath -Algorithm SHA256).Hash
-$runnerScript = Join-Path $PSScriptRoot "rapidocr_runner.py"
-$runnerScriptHash = (Get-FileHash -LiteralPath $runnerScript -Algorithm SHA256).Hash
-$runnerSpecPath = Join-Path $PSScriptRoot "rapidocr_runner.spec"
-$runnerSpecHash = (Get-FileHash -LiteralPath $runnerSpecPath -Algorithm SHA256).Hash
-$pythonCommand = Resolve-Python311
-$pythonVersion = & $pythonCommand.Executable @($pythonCommand.Prefix) -c (
-    "import platform,sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{platform.machine()}')"
-)
-if ($LASTEXITCODE -ne 0 -or $pythonVersion.Trim() -ne "3.11.9|AMD64") {
-    throw "OCR dependency build requires CPython 3.11.9 x64; found '$($pythonVersion.Trim())'."
-}
-$runnerBuildFingerprint = [Convert]::ToHexString(
-    [Security.Cryptography.SHA256]::HashData(
-        [Text.Encoding]::UTF8.GetBytes(
-            "$requirementsHash|$runnerScriptHash|$runnerSpecHash|$($pythonVersion.Trim())"
-        )
-    )
-)
-
-# Remove artifacts from the retired native RapidOcrOnnx fallback.
-foreach ($retiredFile in @("rapidocr_api.dll", "onnxruntime.dll")) {
-    Remove-Item -LiteralPath (Join-Path $OcrRoot $retiredFile) -Force -ErrorAction SilentlyContinue
-}
-
-# Remove only reviewed non-runtime PyInstaller artifacts. Unknown empty files
-# remain during this repair pass so a damaged cached runner/model can be rebuilt
-# or downloaded; fresh output and the final prepared tree are fail-closed.
-Remove-NonRuntimeRunnerFiles -Root $OcrRoot -AllowUnexpectedEmpty
-
-$runnerExe = Join-Path $OcrRoot "rapidocr_runner.exe"
-$runnerInternal = Join-Path $OcrRoot "_internal"
-$runnerStamp = Join-Path $cache "rapidocr-runner-output.sha256"
-$installedStamp = if (Test-Path -LiteralPath $runnerStamp) {
-    (Get-Content -LiteralPath $runnerStamp -Raw).Trim()
-} else {
-    ""
-}
-$stampParts = @($installedStamp -split "\|", 2)
-$installedOutputFingerprint = Get-RunnerOutputFingerprint -Root $OcrRoot
-$needsRunnerBuild = (
-    $Force -or
-    -not (Test-Path -LiteralPath $runnerExe -PathType Leaf) -or
-    -not (Test-Path -LiteralPath $runnerInternal -PathType Container) -or
-    $stampParts.Count -ne 2 -or
-    $stampParts[0] -ne $runnerBuildFingerprint -or
-    $stampParts[1] -ne $installedOutputFingerprint
-)
-
-if ($needsRunnerBuild) {
-    $runnerVenv = Join-Path $cache "runner-venv"
-    $runnerPython = Join-Path $runnerVenv "Scripts\python.exe"
-    if (Test-Path -LiteralPath $runnerVenv) {
-        Remove-Item -LiteralPath $runnerVenv -Recurse -Force
+    $expectedHash = $Sha256.ToUpperInvariant()
+    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+        $actualHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
+        if (-not $Force -and $actualHash -eq $expectedHash) {
+            return
+        }
+        Remove-Item -LiteralPath $Destination -Force
     }
-    Invoke-CheckedNative `
-        -FilePath $pythonCommand.Executable `
-        -ArgumentList (@($pythonCommand.Prefix) + @("-m", "venv", $runnerVenv))
-    Invoke-CheckedNative `
-        -FilePath $runnerPython `
-        -ArgumentList @(
-            "-m", "pip", "install",
-            "--disable-pip-version-check",
-            "--require-hashes",
-            "--only-binary=:all:",
-            "-r", $RequirementsLockPath
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $entries = @($archive.Entries | Where-Object FullName -CEQ $EntryPath)
+        if ($entries.Count -ne 1 -or $entries[0].Length -le 0) {
+            throw "Pinned archive entry is missing or ambiguous: $EntryPath"
+        }
+        $parent = Split-Path -Parent $Destination
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        $temporary = Join-Path $parent (
+            ".$([IO.Path]::GetFileName($Destination)).$([guid]::NewGuid().ToString('N')).extract"
         )
+        try {
+            $sourceStream = $entries[0].Open()
+            $destinationStream = [IO.File]::Create($temporary)
+            try {
+                $sourceStream.CopyTo($destinationStream)
+            }
+            finally {
+                $destinationStream.Dispose()
+                $sourceStream.Dispose()
+            }
+            $actualHash = (Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash
+            if ($actualHash -ne $expectedHash) {
+                throw "SHA256 mismatch for archive entry $EntryPath`nExpected: $expectedHash`nActual:   $actualHash"
+            }
+            Move-Item -LiteralPath $temporary -Destination $Destination -Force
+        }
+        finally {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+}
 
-    $runnerDist = Join-Path $staging "rapidocr-runner-dist"
-    $runnerBuild = Join-Path $staging "rapidocr-runner-build"
-    foreach ($directory in @($runnerDist, $runnerBuild)) {
-        if (Test-Path -LiteralPath $directory) {
-            Remove-Item -LiteralPath $directory -Recurse -Force
+function Enter-AirshotVisualStudioEnvironment {
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+        throw "Visual Studio Installer (vswhere.exe) was not found."
+    }
+    $vs = & $vswhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath
+    if (-not $vs) {
+        throw "Visual Studio 2022 with the Desktop development with C++ workload was not found."
+    }
+    Import-Module (Join-Path $vs "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+    Enter-VsDevShell `
+        -VsInstallPath $vs `
+        -SkipAutomaticLocation `
+        -DevCmdArguments "-arch=x64 -host_arch=x64" | Out-Null
+    if ($env:VSCMD_ARG_TGT_ARCH -ne "x64") {
+        throw "The Visual Studio developer environment did not select x64."
+    }
+    return $vs
+}
+
+function Resolve-CargoExecutable {
+    if (-not [string]::IsNullOrWhiteSpace($CargoExecutable)) {
+        return (Get-Command $CargoExecutable -ErrorAction Stop).Source
+    }
+    $command = Get-Command cargo.exe -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+    throw "Rust/Cargo is required to build the native OCR worker. Install the pinned rust-toolchain.toml toolchain or pass -CargoExecutable."
+}
+
+function Find-VcRuntimeDirectory {
+    param([Parameter(Mandatory = $true)][string]$VisualStudioRoot)
+    $redistRoot = Join-Path $VisualStudioRoot "VC\Redist\MSVC"
+    $required = @("msvcp140.dll", "msvcp140_1.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+    foreach ($version in @(Get-ChildItem -LiteralPath $redistRoot -Directory | Sort-Object Name -Descending)) {
+        $candidate = Join-Path $version.FullName "x64\Microsoft.VC143.CRT"
+        if (@($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $candidate $_) -PathType Leaf) }).Count -eq 0) {
+            return $candidate
+        }
+    }
+    throw "The Visual C++ x64 redistributable runtime was not found."
+}
+
+function Write-RustCrateNotices {
+    param([Parameter(Mandatory = $true)][string]$Cargo)
+
+    $manifest = Join-Path $root "ocr-worker\Cargo.toml"
+    $metadataJson = & $Cargo metadata `
+        --manifest-path $manifest `
+        --locked `
+        --format-version 1 `
+        --filter-platform x86_64-pc-windows-msvc
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($metadataJson)) {
+        throw "Unable to resolve native OCR worker license metadata."
+    }
+    $metadata = $metadataJson | ConvertFrom-Json -Depth 100
+    if (-not $metadata.resolve.root) {
+        throw "Cargo metadata did not identify the native OCR worker root package."
+    }
+
+    $nodes = @{}
+    foreach ($node in @($metadata.resolve.nodes)) {
+        $nodes[[string]$node.id] = $node
+    }
+    $reachable = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal
+    )
+    $pending = [Collections.Generic.Queue[string]]::new()
+    $pending.Enqueue([string]$metadata.resolve.root)
+    while ($pending.Count -gt 0) {
+        $id = $pending.Dequeue()
+        if (-not $reachable.Add($id)) {
+            continue
+        }
+        if (-not $nodes.ContainsKey($id)) {
+            throw "Cargo metadata dependency graph is incomplete: $id"
+        }
+        foreach ($dependency in @($nodes[$id].deps)) {
+            $pending.Enqueue([string]$dependency.pkg)
         }
     }
 
-    $env:AIRSHOT_RAPIDOCR_RUNNER_SCRIPT = $runnerScript
-    try {
-        Invoke-CheckedNative `
-            -FilePath $runnerPython `
-            -ArgumentList @(
-                "-m", "PyInstaller",
-                "--clean",
-                "--noconfirm",
-                "--distpath", $runnerDist,
-                "--workpath", $runnerBuild,
-                $runnerSpecPath
+    $packages = @(
+        $metadata.packages |
+            Where-Object { $reachable.Contains([string]$_.id) } |
+            Sort-Object name, version
+    )
+    if ($packages.Count -lt 2) {
+        throw "Cargo metadata did not resolve the native OCR dependency graph."
+    }
+
+    $notice = [Text.StringBuilder]::new()
+    [void]$notice.AppendLine("Air Screenshot native OCR worker - Rust crate notices")
+    [void]$notice.AppendLine("Generated from the locked x86_64-pc-windows-msvc dependency graph.")
+    [void]$notice.AppendLine()
+    $inventoryPackages = [Collections.Generic.List[object]]::new()
+    foreach ($package in $packages) {
+        $packageRoot = Split-Path -Parent ([string]$package.manifest_path)
+        $licenseFiles = @()
+        if (-not [string]::IsNullOrWhiteSpace([string]$package.license_file)) {
+            $licenseFiles = @(
+                Join-Path $packageRoot ([string]$package.license_file)
             )
-    }
-    finally {
-        Remove-Item Env:\AIRSHOT_RAPIDOCR_RUNNER_SCRIPT -ErrorAction SilentlyContinue
+        } else {
+            $licenseFiles = @(
+                Get-ChildItem -LiteralPath $packageRoot -File |
+                    Where-Object Name -Match "^(LICENSE|COPYING|NOTICE)([-_.].*)?$" |
+                    Sort-Object Name |
+                    ForEach-Object FullName
+            )
+        }
+        $validLicenseFiles = @(
+            $licenseFiles |
+                Where-Object {
+                    (Test-Path -LiteralPath $_ -PathType Leaf) -and
+                    (Get-Item -LiteralPath $_).Length -gt 0
+                }
+        )
+        if ([string]::IsNullOrWhiteSpace([string]$package.license) -and
+            $validLicenseFiles.Count -eq 0) {
+            throw "Rust crate has no license metadata: $($package.name) $($package.version)"
+        }
+
+        $source = if (-not [string]::IsNullOrWhiteSpace([string]$package.repository)) {
+            [string]$package.repository
+        } elseif (-not [string]::IsNullOrWhiteSpace([string]$package.source)) {
+            [string]$package.source
+        } else {
+            "Air Screenshot source tree"
+        }
+        [void]$notice.AppendLine("================================================================================")
+        [void]$notice.AppendLine("$($package.name) $($package.version)")
+        [void]$notice.AppendLine("License: $($package.license)")
+        [void]$notice.AppendLine("Source: $source")
+        $fileInventory = [Collections.Generic.List[object]]::new()
+        foreach ($licenseFile in $validLicenseFiles) {
+            $licenseName = [IO.Path]::GetFileName($licenseFile)
+            $licenseHash = (Get-FileHash -LiteralPath $licenseFile -Algorithm SHA256).Hash
+            $fileInventory.Add([ordered]@{
+                name = $licenseName
+                sha256 = $licenseHash
+            })
+            [void]$notice.AppendLine("--- $licenseName ($licenseHash) ---")
+            [void]$notice.AppendLine((Get-Content -LiteralPath $licenseFile -Raw))
+            [void]$notice.AppendLine()
+        }
+        if ($validLicenseFiles.Count -eq 0) {
+            [void]$notice.AppendLine("No separate license file was included in this crate archive; the SPDX license expression above applies.")
+            [void]$notice.AppendLine()
+        }
+        $inventoryPackages.Add([ordered]@{
+            name = [string]$package.name
+            version = [string]$package.version
+            license = [string]$package.license
+            source = $source
+            licenseFiles = @($fileInventory)
+        })
     }
 
-    $runnerOutput = Join-Path $runnerDist "rapidocr_runner"
-    $embeddedModels = Get-ChildItem -LiteralPath $runnerOutput -Filter "*.onnx" -File -Recurse
-    if ($embeddedModels) {
-        throw "PyInstaller output unexpectedly contains bundled OCR models: $($embeddedModels.FullName -join ', ')"
-    }
-
-    Remove-NonRuntimeRunnerFiles -Root $runnerOutput
-
-    Remove-Item -LiteralPath $runnerExe -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $runnerInternal -Recurse -Force -ErrorAction SilentlyContinue
-    Copy-Item -Path (Join-Path $runnerOutput "*") -Destination $OcrRoot -Recurse -Force
-    $outputFingerprint = Get-RunnerOutputFingerprint -Root $OcrRoot
-    if ([string]::IsNullOrWhiteSpace($outputFingerprint)) {
-        throw "Unable to fingerprint the prepared OCR runner output."
-    }
-    Set-Content `
-        -LiteralPath $runnerStamp `
-        -Value "$runnerBuildFingerprint|$outputFingerprint" `
-        -Encoding ascii `
-        -NoNewline
+    $noticePath = Join-Path $OcrRoot "licenses\rust-crates-NOTICES.txt"
+    $inventoryPath = Join-Path $OcrRoot "licenses\rust-crates.json"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $noticePath) | Out-Null
+    [IO.File]::WriteAllText(
+        $noticePath,
+        $notice.ToString(),
+        [Text.UTF8Encoding]::new($false)
+    )
+    $inventory = [ordered]@{
+        schemaVersion = 1
+        target = "x86_64-pc-windows-msvc"
+        cargoLockSha256 = (Get-FileHash `
+            -LiteralPath (Join-Path $root "ocr-worker\Cargo.lock") `
+            -Algorithm SHA256).Hash
+        packages = @($inventoryPackages)
+    } | ConvertTo-Json -Depth 6
+    [IO.File]::WriteAllText(
+        $inventoryPath,
+        $inventory + "`n",
+        [Text.UTF8Encoding]::new($false)
+    )
 }
+
+Remove-LegacyOcrRunnerFiles -Root $OcrRoot
+$visualStudioRoot = Enter-AirshotVisualStudioEnvironment
+$cargo = Resolve-CargoExecutable
+$rustc = Join-Path (Split-Path -Parent $cargo) "rustc.exe"
+if (-not (Test-Path -LiteralPath $rustc -PathType Leaf) -or
+    (& $rustc --version).Trim() -notmatch "^rustc 1\.88\.0 ") {
+    throw "The native OCR worker must be built with the pinned Rust 1.88.0 toolchain."
+}
+$env:CARGO_TARGET_DIR = $cargoTarget
+try {
+    Invoke-CheckedNative `
+        -FilePath $cargo `
+        -ArgumentList @(
+            "build",
+            "--manifest-path", (Join-Path $root "ocr-worker\Cargo.toml"),
+            "--release",
+            "--locked",
+            "--target", "x86_64-pc-windows-msvc"
+        )
+}
+finally {
+    Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+}
+$runner = Join-Path $cargoTarget "x86_64-pc-windows-msvc\release\rapidocr_runner.exe"
+Copy-PreparedFile -Source $runner -RelativePath "rapidocr_runner.exe"
+
+$ortArchive = Join-Path $downloadCache "onnxruntime-win-x64-1.22.0.zip"
+Get-DependencyFile `
+    -Url "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-win-x64-1.22.0.zip" `
+    -Destination $ortArchive `
+    -Sha256 "174c616efc0271194488642a72f1a514e01487da4dfe84c49296d66e40ebe0da"
+Expand-PinnedZipEntry `
+    -ArchivePath $ortArchive `
+    -EntryPath "onnxruntime-win-x64-1.22.0/lib/onnxruntime.dll" `
+    -Destination (Join-Path $OcrRoot "onnxruntime.dll") `
+    -Sha256 "579b636403983254346a5c1d80bd28f1519cd1e284cd204f8d4ff41f8d711559"
+Expand-PinnedZipEntry `
+    -ArchivePath $ortArchive `
+    -EntryPath "onnxruntime-win-x64-1.22.0/LICENSE" `
+    -Destination (Join-Path $OcrRoot "licenses\onnxruntime-LICENSE.txt") `
+    -Sha256 "c250d6278f0b47a6439fb7592b08b58a55eb9f535aa49a1db63211c3f982b674"
+Expand-PinnedZipEntry `
+    -ArchivePath $ortArchive `
+    -EntryPath "onnxruntime-win-x64-1.22.0/ThirdPartyNotices.txt" `
+    -Destination (Join-Path $OcrRoot "licenses\onnxruntime-ThirdPartyNotices.txt") `
+    -Sha256 "e00f828e0a33de591a355ae6606d2625f5758da7d2c844db7821c9dd3e3647b6"
+
+$vcRuntime = Find-VcRuntimeDirectory -VisualStudioRoot $visualStudioRoot
+foreach ($runtimeFile in @("msvcp140.dll", "msvcp140_1.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
+    Copy-PreparedFile `
+        -Source (Join-Path $vcRuntime $runtimeFile) `
+        -RelativePath $runtimeFile
+}
+
+$paddleLicense = Join-Path $downloadCache "paddle-ocr-rs-0.6.1-LICENSE.txt"
+Get-DependencyFile `
+    -Url "https://raw.githubusercontent.com/mg-chao/paddle-ocr-rs/0667be342ea45816c993421e78d2cbb428f15097/LICENSE" `
+    -Destination $paddleLicense `
+    -Sha256 "bcb782df7a575486f85a9b7b181902910c664dea4d537ada33e46dd96974cc1e"
+Copy-PreparedFile -Source $paddleLicense -RelativePath "licenses\paddle-ocr-rs-LICENSE.txt"
+Copy-PreparedFile `
+    -Source (Join-Path $root "THIRD_PARTY_NOTICES.md") `
+    -RelativePath "licenses\AirScreenshot-THIRD_PARTY_NOTICES.md"
+Copy-PreparedFile `
+    -Source (Join-Path $root "LICENSE") `
+    -RelativePath "licenses\AirScreenshot-LICENSE.txt"
+$rustSysroot = (& $rustc --print sysroot).Trim()
+Copy-PreparedFile `
+    -Source (Join-Path $rustSysroot "share\doc\rust\COPYRIGHT-library.html") `
+    -RelativePath "licenses\rust-standard-library-COPYRIGHT.html"
+Write-RustCrateNotices -Cargo $cargo
 
 $models = @(
     @{
@@ -285,7 +397,7 @@ $models = @(
         Files = @(
             @{ Name = "det.onnx"; Url = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.8.0/onnx/PP-OCRv5/det/ch_PP-OCRv5_det_mobile.onnx"; Sha256 = "4d97c44a20d30a81aad087d6a396b08f786c4635742afc391f6621f5c6ae78ae" },
             @{ Name = "rec.onnx"; Url = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.8.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile.onnx"; Sha256 = "5825fc7ebf84ae7a412be049820b4d86d77620f204a041697b0494669b1742c5" },
-            @{ Name = "cls.onnx"; Url = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.8.0/onnx/PP-OCRv5/cls/ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx"; Sha256 = "54379ae5174d026780215fc748a7f31910dee36818e63d49e17dc598ecc82df7" },
+            @{ Name = "cls.onnx"; Url = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.8.0/onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_mobile.onnx"; Sha256 = "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c" },
             @{ Name = "dict.txt"; Url = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.8.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile/ppocrv5_dict.txt"; Sha256 = "d1979e9f794c464c0d2e0b70a7fe14dd978e9dc644c0e71f14158cdf8342af1b" }
         )
     },
@@ -293,9 +405,9 @@ $models = @(
         Profile = "rapidocr-v5-accurate"
         Files = @(
             @{ Name = "det.onnx"; Url = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.8.0/onnx/PP-OCRv5/det/ch_PP-OCRv5_det_server.onnx"; Sha256 = "0f8846b1d4bba223a2a2f9d9b44022fbc22cc019051a602b41a7fda9667e4cad" },
-            @{ Name = "rec.onnx"; Url = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.8.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_server.onnx"; Sha256 = "e09385400eaaaef34ceff54aeb7c4f0f1fe014c27fa8b9905d4709b65746562a" },
-            @{ Name = "cls.onnx"; Url = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.8.0/onnx/PP-OCRv5/cls/ch_PP-LCNet_x1_0_textline_ori_cls_server.onnx"; Sha256 = "7d3c02ef6c7da8ae08b4347cc7695b2081aae68c325d64375724ecf39c99e743" },
-            @{ Name = "dict.txt"; Url = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.8.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_server/ppocrv5_dict.txt"; Sha256 = "d1979e9f794c464c0d2e0b70a7fe14dd978e9dc644c0e71f14158cdf8342af1b" }
+            @{ Name = "rec.onnx"; Url = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.8.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile.onnx"; Sha256 = "5825fc7ebf84ae7a412be049820b4d86d77620f204a041697b0494669b1742c5" },
+            @{ Name = "cls.onnx"; Url = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.8.0/onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_mobile.onnx"; Sha256 = "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c" },
+            @{ Name = "dict.txt"; Url = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.8.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile/ppocrv5_dict.txt"; Sha256 = "d1979e9f794c464c0d2e0b70a7fe14dd978e9dc644c0e71f14158cdf8342af1b" }
         )
     },
     @{
@@ -311,15 +423,15 @@ $models = @(
 
 foreach ($profile in $models) {
     foreach ($file in $profile.Files) {
-        $destination = Join-Path $OcrRoot "models\$($profile.Profile)\$($file.Name)"
-        Get-DependencyFile `
-            -Url $file.Url `
-            -Destination $destination `
-            -Sha256 $file.Sha256
+        $cached = Join-Path $downloadCache "$($file.Sha256)-$($file.Name)"
+        Get-DependencyFile -Url $file.Url -Destination $cached -Sha256 $file.Sha256
+        Copy-PreparedFile `
+            -Source $cached `
+            -RelativePath "models\$($profile.Profile)\$($file.Name)"
     }
 }
 
-$required = @("rapidocr_runner.exe")
+$required = @(Get-NativeOcrRuntimeFiles)
 foreach ($profile in $models.Profile) {
     foreach ($file in @("det.onnx", "rec.onnx", "cls.onnx", "dict.txt")) {
         $required += "models\$profile\$file"
@@ -333,19 +445,16 @@ foreach ($relative in $required) {
     }
 }
 
-$emptyPreparedFiles = @(
+$invalidPreparedFiles = @(
     Get-ChildItem -LiteralPath $OcrRoot -File -Recurse |
-        Where-Object Length -EQ 0
-)
-if ($emptyPreparedFiles.Count -gt 0) {
-    $relative = @(
-        $emptyPreparedFiles | ForEach-Object {
-            [IO.Path]::GetRelativePath($OcrRoot, $_.FullName).Replace("\", "/")
+        Where-Object {
+            $_.Length -le 0 -or
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
         }
-    )
-    throw "Prepared OCR dependencies contain empty files: $($relative -join ', ')"
+)
+if ($invalidPreparedFiles.Count -gt 0) {
+    throw "Prepared OCR dependencies contain empty or reparse-point files: $($invalidPreparedFiles.FullName -join ', ')"
 }
-
 $invalidPreparedPaths = @(
     Get-ChildItem -LiteralPath $OcrRoot -File -Recurse |
         ForEach-Object {
@@ -356,5 +465,9 @@ $invalidPreparedPaths = @(
 if ($invalidPreparedPaths.Count -gt 0) {
     throw "Prepared OCR dependencies contain paths outside the signed manifest policy: $($invalidPreparedPaths -join ', ')"
 }
-
-Write-Host "OCR dependencies ready: $OcrRoot"
+$fingerprint = Get-RunnerOutputFingerprint -Root $OcrRoot
+if ($fingerprint -notmatch "^[A-F0-9]{64}$") {
+    throw "Unable to fingerprint the native OCR runtime."
+}
+Write-Host "Native OCR dependencies ready: $OcrRoot"
+Write-Host "Native OCR runtime fingerprint: $fingerprint"

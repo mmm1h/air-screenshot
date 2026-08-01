@@ -39,6 +39,11 @@ $profiles = @(
 )
 $required = @(
     "rapidocr_runner.exe",
+    "onnxruntime.dll",
+    "msvcp140.dll",
+    "msvcp140_1.dll",
+    "vcruntime140.dll",
+    "vcruntime140_1.dll",
     ".airshot-manifest.json",
     ".airshot-manifest.sig"
 )

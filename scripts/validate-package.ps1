@@ -371,6 +371,19 @@ if ($runtimeVerification.ExitCode -ne 0) {
 $ocrPackageId = "rapidocr-onnx"
 $requiredOcrFiles = @(
     "rapidocr_runner.exe",
+    "onnxruntime.dll",
+    "msvcp140.dll",
+    "msvcp140_1.dll",
+    "vcruntime140.dll",
+    "vcruntime140_1.dll",
+    "licenses/AirScreenshot-LICENSE.txt",
+    "licenses/AirScreenshot-THIRD_PARTY_NOTICES.md",
+    "licenses/onnxruntime-LICENSE.txt",
+    "licenses/onnxruntime-ThirdPartyNotices.txt",
+    "licenses/paddle-ocr-rs-LICENSE.txt",
+    "licenses/rust-crates-NOTICES.txt",
+    "licenses/rust-crates.json",
+    "licenses/rust-standard-library-COPYRIGHT.html",
     "models/rapidocr-v5-fast/det.onnx",
     "models/rapidocr-v5-fast/rec.onnx",
     "models/rapidocr-v5-fast/cls.onnx",
@@ -422,6 +435,36 @@ foreach ($relative in $requiredOcrFiles) {
     if ($manifestPaths -notcontains $relative) {
         throw "OCR 依赖清单缺少文件：$relative"
     }
+}
+$ocrPayloadRoot = Join-Path $site "ocr\$ocrPackageId"
+$forbiddenPythonRuntime = @(
+    Get-ChildItem -LiteralPath $ocrPayloadRoot -File -Recurse |
+        Where-Object {
+            $_.Extension -in @(".py", ".pyc", ".pyd") -or
+            [IO.Path]::GetRelativePath($ocrPayloadRoot, $_.FullName).Replace("\", "/").StartsWith(
+                "_internal/",
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        }
+)
+if ($forbiddenPythonRuntime.Count -gt 0) {
+    throw "OCR payload 不得包含 Python/PyInstaller 运行时：$($forbiddenPythonRuntime.FullName -join ', ')"
+}
+
+$ocrRunnerPath = Join-Path $ocrPayloadRoot "rapidocr_runner.exe"
+$ocrRunnerSignature = Get-AuthenticodeSignature -FilePath $ocrRunnerPath
+if (-not $ocrRunnerSignature.SignerCertificate -or
+    $ocrRunnerSignature.Status -in @("NotSigned", "HashMismatch") -or
+    $ocrRunnerSignature.SignerCertificate.Subject -ne $Publisher -or
+    $ocrRunnerSignature.SignerCertificate.GetCertHashString(
+        [Security.Cryptography.HashAlgorithmName]::SHA256
+    ) -ne $SignerSha256.ToUpperInvariant() -or
+    -not $ocrRunnerSignature.TimeStamperCertificate) {
+    throw "原生 OCR worker 代码签名无效：$($ocrRunnerSignature.StatusMessage)"
+}
+if ($RequireTrustedSignature -and
+    $ocrRunnerSignature.Status -ne [Management.Automation.SignatureStatus]::Valid) {
+    throw "原生 OCR worker 签名未通过信任验证：$($ocrRunnerSignature.StatusMessage)"
 }
 foreach ($entry in $ocrManifest.files) {
     if (-not $entry.path -or $entry.path -match "(^/|^\\|:|(^|/)\.\.($|/)|(^|/)\.($|/))") {

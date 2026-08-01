@@ -117,7 +117,14 @@ private:
 };
 
 std::vector<std::wstring> required_paths() {
-    std::vector<std::wstring> paths{L"rapidocr_runner.exe"};
+    std::vector<std::wstring> paths{
+        L"rapidocr_runner.exe",
+        L"onnxruntime.dll",
+        L"msvcp140.dll",
+        L"msvcp140_1.dll",
+        L"vcruntime140.dll",
+        L"vcruntime140_1.dll",
+    };
     for (const std::wstring_view profile :
          {L"rapidocr-v5-fast", L"rapidocr-v5-accurate", L"rapidocr-v4-compat"}) {
         for (const std::wstring_view file :
@@ -329,8 +336,8 @@ void test_manifest_parser() {
     const auto valid =
         airshot::parse_ocr_dependency_manifest(manifest_json());
     expect(
-        valid && valid->files.size() == 13,
-        L"OCR manifest accepts runner-only required payload");
+        valid && valid->files.size() == required_paths().size(),
+        L"OCR manifest accepts the complete native runtime payload");
 
     std::wstring fractional = manifest_json();
     const std::size_t size_position = fractional.find(LR"("size":1)");

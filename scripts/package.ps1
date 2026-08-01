@@ -163,6 +163,22 @@ Set-Content -LiteralPath (Join-Path $site ".nojekyll") -Value "" -Encoding ascii
 $ocrPackageId = "rapidocr-onnx"
 $ocrSource = Join-Path $OcrSourceRoot $ocrPackageId
 if (Test-Path -LiteralPath $ocrSource -PathType Container) {
+    $ocrRunnerSource = Join-Path $ocrSource "rapidocr_runner.exe"
+    if ($Sign) {
+        if (-not (Test-Path -LiteralPath $ocrRunnerSource -PathType Leaf)) {
+            throw "原生 OCR worker 不存在：$ocrRunnerSource"
+        }
+        & $signTool sign `
+            /fd SHA256 `
+            /tr $TimestampUrl `
+            /td SHA256 `
+            /f $CertPath `
+            /p $CertPassword `
+            $ocrRunnerSource
+        if ($LASTEXITCODE -ne 0) {
+            throw "原生 OCR worker SignTool 签名失败，退出码：$LASTEXITCODE"
+        }
+    }
     $ocrTarget = Join-Path $site "ocr\$ocrPackageId"
     New-Item -ItemType Directory -Path $ocrTarget -Force | Out-Null
     Copy-Item -Path (Join-Path $ocrSource "*") -Destination $ocrTarget -Recurse -Force

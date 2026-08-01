@@ -208,11 +208,10 @@ bool remove_from_runner_environment(std::wstring_view entry) {
         return false;
     }
     const std::wstring_view name = entry.substr(0, separator);
-    return starts_with_ordinal_ignore_case(name, L"PYTHON") ||
-           starts_with_ordinal_ignore_case(name, L"_PYI_") ||
-           equals_ordinal_ignore_case(name, L"_MEIPASS2") ||
-           equals_ordinal_ignore_case(
-               name, L"PYINSTALLER_RESET_ENVIRONMENT");
+    return equals_ordinal_ignore_case(name, L"ORT_DYLIB_PATH") ||
+           starts_with_ordinal_ignore_case(name, L"OMP_") ||
+           equals_ordinal_ignore_case(name, L"RUST_BACKTRACE") ||
+           equals_ordinal_ignore_case(name, L"RUST_LIB_BACKTRACE");
 }
 
 std::optional<std::vector<wchar_t>> runner_environment_block() {
@@ -234,7 +233,6 @@ std::optional<std::vector<wchar_t>> runner_environment_block() {
         FreeEnvironmentStringsW(raw_environment);
         raw_environment = nullptr;
 
-        entries.emplace_back(L"PYINSTALLER_RESET_ENVIRONMENT=1");
         std::ranges::sort(
             entries,
             [](const std::wstring& first, const std::wstring& second) {

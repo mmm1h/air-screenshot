@@ -7,6 +7,7 @@ param(
     [string]$Version,
     [string]$OcrManifestKeyId,
     [string]$OcrManifestPublicKeyHex,
+    [string]$CargoExecutable,
     [switch]$Clean
 )
 
@@ -17,30 +18,48 @@ $root = Split-Path -Parent $PSScriptRoot
 & (Join-Path $PSScriptRoot "test-version-contract.ps1")
 & (Join-Path $PSScriptRoot "test-ocr-payload-policy.ps1")
 
-$python = (Get-Command python -ErrorAction Stop).Source
-$pythonVersion = (& $python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')").Trim()
-$pythonVersionParts = $pythonVersion.Split(".")
-$pythonMajor = 0
-$pythonMinor = 0
-if ($LASTEXITCODE -ne 0 -or
-    $pythonVersionParts.Count -ne 2 -or
-    -not [int]::TryParse($pythonVersionParts[0], [ref]$pythonMajor) -or
-    -not [int]::TryParse($pythonVersionParts[1], [ref]$pythonMinor) -or
-    $pythonMajor -ne 3 -or
-    $pythonMinor -lt 11) {
-    throw "RapidOCR runner tests require Python 3.11 or newer; found '$pythonVersion'."
-}
-& $python -B (Join-Path $root "tests\test_rapidocr_runner.py")
-if ($LASTEXITCODE -ne 0) {
-    throw "RapidOCR runner tests failed with exit code $LASTEXITCODE."
-}
-
 & (Join-Path $PSScriptRoot "build.ps1") `
     -Configuration $Configuration `
     -Version $Version `
     -OcrManifestKeyId $OcrManifestKeyId `
     -OcrManifestPublicKeyHex $OcrManifestPublicKeyHex `
     -Clean:$Clean
+
+$cargo = if (-not [string]::IsNullOrWhiteSpace($CargoExecutable)) {
+    (Get-Command $CargoExecutable -ErrorAction Stop).Source
+} else {
+    (Get-Command cargo.exe -ErrorAction Stop).Source
+}
+$env:CARGO_TARGET_DIR = Join-Path $root "build\ocr-worker-tests"
+try {
+    & $cargo fmt `
+        --manifest-path (Join-Path $root "ocr-worker\Cargo.toml") `
+        -- `
+        --check
+    if ($LASTEXITCODE -ne 0) {
+        throw "Native OCR worker formatting check failed with exit code $LASTEXITCODE."
+    }
+    & $cargo clippy `
+        --manifest-path (Join-Path $root "ocr-worker\Cargo.toml") `
+        --all-targets `
+        --locked `
+        --target x86_64-pc-windows-msvc `
+        -- `
+        -D warnings
+    if ($LASTEXITCODE -ne 0) {
+        throw "Native OCR worker lint failed with exit code $LASTEXITCODE."
+    }
+    & $cargo test `
+        --manifest-path (Join-Path $root "ocr-worker\Cargo.toml") `
+        --locked `
+        --target x86_64-pc-windows-msvc
+    if ($LASTEXITCODE -ne 0) {
+        throw "Native OCR worker tests failed with exit code $LASTEXITCODE."
+    }
+}
+finally {
+    Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+}
 
 $ctest = Get-Command ctest.exe -ErrorAction Stop
 Push-Location $root

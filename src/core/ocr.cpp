@@ -109,8 +109,13 @@ constexpr std::array<OcrEngineSpec, 3> kOcrEngineSpecs{{
     {kOcrEngineRapidV4Compat, L"兼容 OCR", L"models/rapidocr-v4-compat"},
 }};
 
-constexpr std::array<std::wstring_view, 1> kRapidOcrCommonRequiredFiles{
+constexpr std::array<std::wstring_view, 6> kRapidOcrCommonRequiredFiles{
     L"rapidocr_runner.exe",
+    L"onnxruntime.dll",
+    L"msvcp140.dll",
+    L"msvcp140_1.dll",
+    L"vcruntime140.dll",
+    L"vcruntime140_1.dll",
 };
 
 constexpr std::array<std::wstring_view, 4> kRapidOcrProfileRequiredFiles{
@@ -4241,10 +4246,10 @@ bool warm_remove_environment_entry(std::wstring_view entry) {
         return false;
     }
     const std::wstring_view name = entry.substr(0, separator);
-    return warm_starts_with_ignore_case(name, L"PYTHON") ||
-           warm_starts_with_ignore_case(name, L"_PYI_") ||
-           warm_equals_ignore_case(name, L"_MEIPASS2") ||
-           warm_equals_ignore_case(name, L"PYINSTALLER_RESET_ENVIRONMENT");
+    return warm_equals_ignore_case(name, L"ORT_DYLIB_PATH") ||
+           warm_starts_with_ignore_case(name, L"OMP_") ||
+           warm_equals_ignore_case(name, L"RUST_BACKTRACE") ||
+           warm_equals_ignore_case(name, L"RUST_LIB_BACKTRACE");
 }
 
 std::optional<std::vector<wchar_t>> warm_runner_environment_block() {
@@ -4263,7 +4268,6 @@ std::optional<std::vector<wchar_t>> warm_runner_environment_block() {
         }
         FreeEnvironmentStringsW(raw_environment);
         raw_environment = nullptr;
-        entries.emplace_back(L"PYINSTALLER_RESET_ENVIRONMENT=1");
         std::ranges::sort(entries, [](const std::wstring& first, const std::wstring& second) {
             const int insensitive = CompareStringOrdinal(
                 first.c_str(), static_cast<int>(first.size()),

@@ -1413,9 +1413,12 @@ void test_ocr_join() {
 void test_ocr_dependency_manifest() {
     const auto manifest = airshot::parse_ocr_dependency_manifest(
         LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[)"
-        LR"({"path":"rapidocr_api.dll","url":"https://example.com/rapidocr_api.dll","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1},)"
+        LR"({"path":"rapidocr_runner.exe","url":"https://example.com/rapidocr_runner.exe","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1},)"
         LR"({"path":"onnxruntime.dll","url":"https://example.com/onnxruntime.dll","sha256":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB","size":2},)"
-        LR"({"path":"rapidocr_runner.exe","url":"https://example.com/rapidocr_runner.exe","sha256":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","size":3},)"
+        LR"({"path":"msvcp140.dll","url":"https://example.com/msvcp140.dll","sha256":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","size":3},)"
+        LR"({"path":"msvcp140_1.dll","url":"https://example.com/msvcp140_1.dll","sha256":"CDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCD","size":4},)"
+        LR"({"path":"vcruntime140.dll","url":"https://example.com/vcruntime140.dll","sha256":"CECECECECECECECECECECECECECECECECECECECECECECECECECECECECECECECE","size":5},)"
+        LR"({"path":"vcruntime140_1.dll","url":"https://example.com/vcruntime140_1.dll","sha256":"CFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCFCF","size":6},)"
         LR"({"path":"models/rapidocr-v5-fast/det.onnx","url":"https://example.com/v5-fast-det.onnx","sha256":"DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD","size":4},)"
         LR"({"path":"models/rapidocr-v5-fast/rec.onnx","url":"https://example.com/v5-fast-rec.onnx","sha256":"EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE","size":5},)"
         LR"({"path":"models/rapidocr-v5-fast/cls.onnx","url":"https://example.com/v5-fast-cls.onnx","sha256":"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF","size":6},)"
@@ -1429,20 +1432,20 @@ void test_ocr_dependency_manifest() {
         LR"({"path":"models/rapidocr-v4-compat/cls.onnx","url":"https://example.com/v4-compat-cls.onnx","sha256":"8888888888888888888888888888888888888888888888888888888888888888","size":14},)"
         LR"({"path":"models/rapidocr-v4-compat/dict.txt","url":"https://example.com/v4-compat-dict.txt","sha256":"9999999999999999999999999999999999999999999999999999999999999999","size":15})"
         LR"(]})");
-    expect(manifest && manifest->package_id == airshot::kRapidOcrOnnxPackageId && manifest->files.size() == 15,
+    expect(manifest && manifest->package_id == airshot::kRapidOcrOnnxPackageId && manifest->files.size() == 18,
            L"OCR dependency manifest parses required files");
 
     expect(!airshot::parse_ocr_dependency_manifest(
-               LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[{"path":"../rapidocr_api.dll","url":"https://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1}]})"),
+               LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[{"path":"../rapidocr_runner.exe","url":"https://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1}]})"),
            L"OCR dependency manifest rejects unsafe paths");
     expect(!airshot::parse_ocr_dependency_manifest(
-               LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[{"path":"rapidocr_api.dll","url":"http://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1}]})"),
+               LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[{"path":"rapidocr_runner.exe","url":"http://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":1}]})"),
            L"OCR dependency manifest rejects non-HTTPS URLs");
     expect(!airshot::parse_ocr_dependency_manifest(
-               LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[{"path":"rapidocr_api.dll","url":"https://example.com/a","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":1}]})"),
+               LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[{"path":"rapidocr_runner.exe","url":"https://example.com/a","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":1}]})"),
            L"OCR dependency manifest rejects zero SHA256");
     expect(!airshot::parse_ocr_dependency_manifest(
-               LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[{"path":"rapidocr_api.dll","url":"https://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":0}]})"),
+               LR"({"schemaVersion":1,"packageId":"rapidocr-onnx","sequence":1000000,"issuedAt":1800000000,"expiresAt":1810000000,"files":[{"path":"rapidocr_runner.exe","url":"https://example.com/a","sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","size":0}]})"),
            L"OCR dependency manifest rejects zero size");
 }
 

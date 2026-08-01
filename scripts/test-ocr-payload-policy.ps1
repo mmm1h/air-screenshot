@@ -36,7 +36,7 @@ if (-not $resolvedFixture.StartsWith(
 function Add-FixtureFile {
     param(
         [Parameter(Mandatory = $true)][string]$RelativePath,
-        [byte[]]$Bytes = [byte[]]::new(0)
+        [byte[]]$Bytes = [byte[]](1, 2, 3, 4)
     )
     $path = Join-Path $fixture $RelativePath
     [IO.Directory]::CreateDirectory((Split-Path -Parent $path)) | Out-Null
@@ -45,87 +45,47 @@ function Add-FixtureFile {
 }
 
 try {
-    $allowedEmpty = @(
-        "_internal/certifi/py.typed",
-        "_internal/numpy-2.4.6.dist-info/REQUESTED",
-        "_internal/pyreadline3-3.5.6.dist-info/REQUESTED",
-        "_internal/tqdm-4.69.0.dist-info/REQUESTED"
-    )
-    foreach ($relative in $allowedEmpty) {
-        Add-FixtureFile -RelativePath $relative | Out-Null
-    }
-    $sample = Add-FixtureFile `
-        -RelativePath "_internal/setuptools/_vendor/jaraco/text/Lorem ipsum.txt" `
-        -Bytes ([Text.Encoding]::UTF8.GetBytes("sample"))
-    $unknownTyping = Add-FixtureFile -RelativePath "_internal/other/py.typed"
-    $packageInitializer = Add-FixtureFile -RelativePath "_internal/other/__init__.py"
-    $runtimeDll = Add-FixtureFile -RelativePath "_internal/runtime.dll"
+    $legacy = Add-FixtureFile -RelativePath "_internal/python311.dll"
+    $retired = Add-FixtureFile -RelativePath "DirectML.dll"
     [IO.File]::WriteAllBytes($outside, [byte[]](9))
-
-    Remove-NonRuntimeRunnerFiles -Root $fixture -AllowUnexpectedEmpty
-    foreach ($relative in $allowedEmpty) {
-        Assert-True `
-            -Condition (-not (Test-Path -LiteralPath (Join-Path $fixture $relative))) `
-            -Message "Approved empty metadata was not removed: $relative"
-    }
-    Assert-True -Condition (-not (Test-Path -LiteralPath $sample)) `
-        -Message "Non-runtime sample data was not removed."
-    $nonEmptyMarker = Add-FixtureFile `
-        -RelativePath "_internal/certifi/py.typed" `
-        -Bytes ([byte[]](1, 2, 3))
-    foreach ($path in @($unknownTyping, $packageInitializer, $runtimeDll, $nonEmptyMarker, $outside)) {
-        Assert-True -Condition (Test-Path -LiteralPath $path -PathType Leaf) `
-            -Message "Payload policy removed an unapproved file: $path"
-    }
-
-    $rejected = $false
-    try {
-        Remove-NonRuntimeRunnerFiles -Root $fixture
-    }
-    catch {
-        $rejected = $_.Exception.Message -like "*unexpected empty OCR runner files*"
-    }
-    Assert-True -Condition $rejected `
-        -Message "Unexpected empty runtime files were not rejected."
-
-    foreach ($path in @($unknownTyping, $packageInitializer, $runtimeDll)) {
-        Remove-Item -LiteralPath $path -Force
-    }
-    Remove-NonRuntimeRunnerFiles -Root $fixture
-    Remove-NonRuntimeRunnerFiles -Root $fixture
-    Assert-True -Condition ((Get-Item -LiteralPath $nonEmptyMarker).Length -eq 3) `
-        -Message "Sanitization is not idempotent for retained files."
+    Remove-LegacyOcrRunnerFiles -Root $fixture
+    Assert-True -Condition (-not (Test-Path -LiteralPath $legacy)) `
+        -Message "Legacy Python runtime was not removed."
+    Assert-True -Condition (-not (Test-Path -LiteralPath $retired)) `
+        -Message "Retired DirectML runtime was not removed."
+    Assert-True -Condition (Test-Path -LiteralPath $outside -PathType Leaf) `
+        -Message "Legacy cleanup escaped the OCR root."
+    Remove-LegacyOcrRunnerFiles -Root $fixture
 
     $fingerprintRoot = Join-Path $fixture "fingerprint"
-    Add-FixtureFile `
-        -RelativePath "fingerprint/rapidocr_runner.exe" `
-        -Bytes ([byte[]](1, 2, 3, 4)) | Out-Null
-    $truncatedRuntime = Add-FixtureFile `
-        -RelativePath "fingerprint/_internal/runtime.dll"
-    Assert-True `
-        -Condition ((Get-RunnerOutputFingerprint -Root $fingerprintRoot) -ceq "") `
-        -Message "A truncated cached runner did not request a rebuild."
-    [IO.File]::WriteAllBytes($truncatedRuntime, [byte[]](5, 6, 7, 8))
+    foreach ($relative in Get-NativeOcrRuntimeFiles) {
+        Add-FixtureFile -RelativePath "fingerprint/$relative" | Out-Null
+    }
     $firstFingerprint = Get-RunnerOutputFingerprint -Root $fingerprintRoot
     Assert-True `
         -Condition ($firstFingerprint -cmatch "^[A-F0-9]{64}$") `
-        -Message "A complete cached runner did not produce a fingerprint."
-    [IO.File]::WriteAllBytes($truncatedRuntime, [byte[]](5, 6, 7, 9))
+        -Message "A complete native OCR runtime did not produce a fingerprint."
+    $runner = Join-Path $fingerprintRoot "rapidocr_runner.exe"
+    [IO.File]::WriteAllBytes($runner, [byte[]](4, 3, 2, 1))
     $secondFingerprint = Get-RunnerOutputFingerprint -Root $fingerprintRoot
+    Assert-True -Condition ($secondFingerprint -cne $firstFingerprint) `
+        -Message "Native runner fingerprint did not detect a content change."
+    [IO.File]::WriteAllBytes((Join-Path $fingerprintRoot "onnxruntime.dll"), [byte[]]::new(0))
     Assert-True `
-        -Condition ($secondFingerprint -cne $firstFingerprint) `
-        -Message "Runner fingerprint did not detect a file content change."
+        -Condition ((Get-RunnerOutputFingerprint -Root $fingerprintRoot) -ceq "") `
+        -Message "A truncated native OCR runtime did not request a rebuild."
 
     foreach ($valid in @(
             "rapidocr_runner.exe",
-            "_internal/numpy.libs/library.dll",
+            "onnxruntime.dll",
+            "licenses/paddle-ocr-rs-LICENSE.txt",
             "models/rapidocr-v5-fast/det.onnx"
         )) {
         Assert-True -Condition (Test-OcrManifestRelativePath -Path $valid) `
             -Message "Valid signed dependency path was rejected: $valid"
     }
     foreach ($invalid in @(
-            "_internal/setuptools/Lorem ipsum.txt",
+            "licenses/Third Party.txt",
             "../escape.dll",
             "/rooted.dll",
             "models//det.onnx",
@@ -136,7 +96,7 @@ try {
             -Message "Invalid signed dependency path was accepted: $invalid"
     }
 
-    Write-Host "OCR payload policy tests passed."
+    Write-Host "Native OCR payload policy tests passed."
 }
 finally {
     if (Test-Path -LiteralPath $outside) {

@@ -1,0 +1,26 @@
+[package]
+name = "air-screenshot-ocr-worker"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.88"
+license = "LGPL-3.0-only"
+publish = false
+
+[[bin]]
+name = "rapidocr_runner"
+path = "src/main.rs"
+
+[dependencies]
+image = { version = "0.25.8", default-features = false, features = ["png"] }
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "ndarray", "std"] }
+paddle-ocr-rs = { version = "=0.6.1", default-features = false }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.142"
+windows-sys = { version = "0.60.2", features = ["Win32_Storage_FileSystem"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = "symbols"
