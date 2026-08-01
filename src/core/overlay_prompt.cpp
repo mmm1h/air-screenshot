@@ -40,26 +40,34 @@ LRESULT CALLBACK edit_subclass_proc(HWND window, UINT message, WPARAM w_param, L
     (void)subclass_id;
     (void)ref_data;
     if (message == WM_KEYDOWN) {
+        bool composing = false;
+        if (HIMC himc = ImmGetContext(window)) {
+            const LONG size =
+                ImmGetCompositionStringW(himc, GCS_COMPSTR, nullptr, 0);
+            ImmReleaseContext(window, himc);
+            composing = size > 0;
+        }
         if (w_param == VK_RETURN) {
-            if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
-                return DefSubclassProc(window, message, w_param, l_param);
-            }
-            bool composing = false;
-            if (HIMC himc = ImmGetContext(window)) {
-                LONG size = ImmGetCompositionStringW(himc, GCS_COMPSTR, nullptr, 0);
-                ImmReleaseContext(window, himc);
-                if (size > 0) {
-                    composing = true;
-                }
-            }
-            if (!composing) {
+            const TextPromptAction action = text_prompt_action(
+                TextPromptEvent::enter,
+                (GetKeyState(VK_SHIFT) & 0x8000) != 0,
+                composing);
+            if (action == TextPromptAction::accept) {
                 PostMessageW(GetParent(window), WM_COMMAND, MAKEWPARAM(IDOK, 0), reinterpret_cast<LPARAM>(window));
                 return 0;
             }
+            return DefSubclassProc(window, message, w_param, l_param);
         }
         if (w_param == VK_ESCAPE) {
-            PostMessageW(GetParent(window), WM_COMMAND, MAKEWPARAM(IDCANCEL, 0), reinterpret_cast<LPARAM>(window));
-            return 0;
+            const TextPromptAction action = text_prompt_action(
+                TextPromptEvent::escape,
+                false,
+                composing);
+            if (action == TextPromptAction::cancel) {
+                PostMessageW(GetParent(window), WM_COMMAND, MAKEWPARAM(IDCANCEL, 0), reinterpret_cast<LPARAM>(window));
+                return 0;
+            }
+            return DefSubclassProc(window, message, w_param, l_param);
         }
     }
     return DefSubclassProc(window, message, w_param, l_param);
@@ -183,7 +191,11 @@ LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPA
     }
     if (message == WM_ACTIVATE) {
         if (LOWORD(w_param) == WA_INACTIVE) {
-            PostMessageW(window, WM_COMMAND, MAKEWPARAM(IDCANCEL, 0), 0);
+            // Deactivation is commonly caused by a toolbar click, Alt+Tab or
+            // an IME-owned candidate window. None of those expresses an
+            // intent to discard the draft; Esc remains the explicit cancel
+            // path and Enter the explicit commit path.
+            (void)text_prompt_action(TextPromptEvent::deactivated);
             return 0;
         }
     }
@@ -226,7 +238,10 @@ LRESULT CALLBACK text_prompt_proc(HWND window, UINT message, WPARAM w_param, LPA
         return default_result;
     }
     if (message == WM_CLOSE) {
-        DestroyWindow(window);
+        if (text_prompt_action(TextPromptEvent::close_request) ==
+            TextPromptAction::cancel) {
+            DestroyWindow(window);
+        }
         return 0;
     }
     return DefWindowProcW(window, message, w_param, l_param);

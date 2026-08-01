@@ -69,17 +69,30 @@ private:
     void show_message(std::wstring_view message, UINT flags);
     void paint();
     void show_context_menu(POINT screen_pos);
+    void replace_from_clipboard();
     void replace_from_drop(HDROP drop);
     void notify_click_through_enabled() const noexcept;
     [[nodiscard]] bool set_alpha(int alpha) noexcept;
     void zoom_by_steps(double steps);
     void toggle_smooth_scaling() noexcept;
     void toggle_visual_effect(PinVisualEffectAction action);
+    void toggle_thumbnail_mode();
     [[nodiscard]] Bitmap visible_bitmap() const;
     void set_scale_percent(int percent);
     void rotate(bool cw);
     void flip(bool horizontal);
-    [[nodiscard]] bool resize_to_scale(double scale, POINT anchor_screen) noexcept;
+    [[nodiscard]] bool resize_to_scale(
+        double scale,
+        POINT anchor_screen,
+        bool preserve_thumbnail_mode = false) noexcept;
+    [[nodiscard]] bool apply_resize_plan(
+        const PinResizePlan& plan,
+        bool preserve_thumbnail_mode = false) noexcept;
+    void begin_border_resize(PinResizeEdge edge) noexcept;
+    void update_border_resize() noexcept;
+    void end_border_resize(bool release_capture) noexcept;
+    [[nodiscard]] PinResizeEdge resize_edge_at(POINT screen_point) const noexcept;
+    [[nodiscard]] std::optional<RectI> current_work_area() const noexcept;
     void fit_to_work_area();
     [[nodiscard]] bool rebuild_native_bitmap();
     [[nodiscard]] bool refresh_window_presentation() noexcept;
@@ -98,6 +111,11 @@ private:
     PinRuntimeState state_{};
     bool source_has_transparency_{};
     bool per_pixel_presentation_active_{};
+    PinThumbnailState thumbnail_state_{};
+    PinResizeEdge border_resize_edge_{PinResizeEdge::none};
+    RectI border_resize_start_bounds_{};
+    RectI border_resize_work_area_{};
+    bool border_resize_failed_{};
     bool click_through_available_{true};
     ReplacementGuard replacement_guard_;
     unsigned int capture_suspend_depth_{};

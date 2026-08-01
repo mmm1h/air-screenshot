@@ -91,30 +91,47 @@ void test_ocr_terminal_status_policy() {
 void test_automatic_update_draft_round_trip() {
     airshot::AppConfig saved;
     saved.automatic_updates_enabled = true;
+    saved.seamless_updates_enabled = true;
+    saved.automatic_update_idle_minutes = 15;
+    saved.update_restart_deferred_until_unix = 1'725'086'400;
     saved.last_update_check_unix = 1'725'000'000;
     saved.warned_update_target = L"C:\\Program Files\\Air Screenshot";
 
     airshot::AppConfig draft = saved;
     draft.automatic_updates_enabled = false;
+    draft.seamless_updates_enabled = false;
+    draft.automatic_update_idle_minutes = 45;
     expect(
         saved.automatic_updates_enabled &&
-            !draft.automatic_updates_enabled,
-        L"automatic update preference remains a draft until settings are saved");
+            saved.seamless_updates_enabled &&
+            saved.automatic_update_idle_minutes == 15 &&
+            !draft.automatic_updates_enabled &&
+            !draft.seamless_updates_enabled &&
+            draft.automatic_update_idle_minutes == 45,
+        L"automatic update preferences remain a draft until settings are saved");
 
     const auto parsed = airshot::config_from_json(
         airshot::config_to_json(draft));
     expect(
         parsed && !parsed->automatic_updates_enabled &&
+            !parsed->seamless_updates_enabled &&
+            parsed->automatic_update_idle_minutes == 45 &&
+            parsed->update_restart_deferred_until_unix ==
+                saved.update_restart_deferred_until_unix &&
             parsed->last_update_check_unix == saved.last_update_check_unix &&
             parsed->warned_update_target == saved.warned_update_target,
         L"automatic update draft round-trips without changing update safety metadata");
 
     draft.automatic_updates_enabled = true;
+    draft.seamless_updates_enabled = true;
+    draft.automatic_update_idle_minutes = 120;
     const auto enabled = airshot::config_from_json(
         airshot::config_to_json(draft));
     expect(
-        enabled && enabled->automatic_updates_enabled,
-        L"automatic update draft can be re-enabled before saving");
+        enabled && enabled->automatic_updates_enabled &&
+            enabled->seamless_updates_enabled &&
+            enabled->automatic_update_idle_minutes == 120,
+        L"automatic update draft can be re-enabled and rescheduled before saving");
 }
 
 void test_dpi_specific_window_icon() {

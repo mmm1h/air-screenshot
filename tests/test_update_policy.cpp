@@ -39,6 +39,50 @@ int wmain() {
             airshot::kUpdateIntervalSeconds * 1'000,
         L"a future timestamp caused by clock rollback is capped at one day");
 
+    expect(
+        airshot::automatic_update_retry_delay_ms(0) ==
+            15 * 60 * 1'000,
+        L"a missing retry count still avoids an immediate retry loop");
+    expect(
+        airshot::automatic_update_retry_delay_ms(1) ==
+            15 * 60 * 1'000,
+        L"the first consecutive failure retries after fifteen minutes");
+    expect(
+        airshot::automatic_update_retry_delay_ms(2) ==
+            60 * 60 * 1'000,
+        L"the second consecutive failure retries after one hour");
+    expect(
+        airshot::automatic_update_retry_delay_ms(3) ==
+            6 * 60 * 60 * 1'000,
+        L"the third consecutive failure reaches the six-hour cap");
+    expect(
+        airshot::automatic_update_retry_delay_ms(100) ==
+            airshot::kUpdateRetryMaxDelayMs,
+        L"later failures remain capped at six hours");
+
+    expect(
+        airshot::normalized_update_idle_minutes(0) ==
+            airshot::kUpdateMinIdleMinutes,
+        L"an invalid zero idle threshold is clamped to five minutes");
+    expect(
+        airshot::normalized_update_idle_minutes(15) ==
+            airshot::kUpdateDefaultIdleMinutes,
+        L"the default idle threshold remains fifteen minutes");
+    expect(
+        airshot::normalized_update_idle_minutes(121) ==
+            airshot::kUpdateMaxIdleMinutes,
+        L"an excessive idle threshold is clamped to two hours");
+    expect(
+        airshot::kUpdateIdleMinuteChoices[0] == 5 &&
+            airshot::kUpdateIdleMinuteChoices[1] == 15 &&
+            airshot::kUpdateIdleMinuteChoices[2] == 30 &&
+            airshot::kUpdateIdleMinuteChoices[3] == 60,
+        L"the settings policy exposes the intended common idle choices");
+    expect(
+        airshot::kUpdateStagedSettleMs == 2 * 60 * 1'000 &&
+            airshot::kUpdateActivationProbeMs == 30 * 1'000,
+        L"seamless activation settles for two minutes and probes every thirty seconds");
+
     const auto first =
         airshot::update_target_key(LR"(C:/Apps/AirScreenshot.exe)");
     const auto second =

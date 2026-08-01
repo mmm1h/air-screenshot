@@ -95,24 +95,20 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                 &update_error)) {
             return 0;
         }
-        if (!update_error.empty()) {
-            MessageBoxW(nullptr, update_error.c_str(), airshot::kAppName, MB_OK | MB_ICONERROR);
-        }
         airshot::cleanup_stale_updates();
     }
     const int result = app.run();
     if (airshot::launch_pending_update_on_host_exit(
             app.initialized(),
             app.is_transient(),
-            app.update_helper_launched())) {
+            app.update_helper_launched(),
+            result == static_cast<int>(airshot::ExitCode::success),
+            app.system_session_ending())) {
         std::wstring update_error;
-        if (!airshot::launch_pending_update(
-                false,
-                app.automatic_updates_enabled(),
-                &update_error) &&
-            !update_error.empty()) {
-            MessageBoxW(nullptr, update_error.c_str(), airshot::kAppName, MB_OK | MB_ICONERROR);
-        }
+        (void)airshot::launch_pending_update(
+            false,
+            app.automatic_updates_enabled(),
+            &update_error);
     }
     return result;
 }

@@ -376,6 +376,425 @@ inline constexpr std::size_t kMaximumLayeredPinPresentationBytes =
     }
 }
 
+inline constexpr double kAbsoluteMinimumPinScale = 0.001;
+inline constexpr double kMaximumInteractivePinScale = 10.0;
+inline constexpr int kMinimumInteractivePinLongEdgePixels = 32;
+inline constexpr int kPinResizeHitTargetDip = 8;
+inline constexpr int kPinThumbnailLongEdgeDip = 192;
+
+struct PinScaleLimits {
+    bool valid{};
+    double minimum{kAbsoluteMinimumPinScale};
+    double maximum{kAbsoluteMinimumPinScale};
+};
+
+// All interactive resize paths use one limit calculation. The lower bound
+// keeps at least a small draggable long edge without preventing a genuinely
+// fixed thumbnail for a very large source. The upper bound keeps the rendered
+// window inside the current work area and prevents a transparent/layered pin
+// from requesting an unbounded temporary surface.
+[[nodiscard]] inline PinScaleLimits pin_scale_limits(
+    int source_width,
+    int source_height,
+    const RectI& work_area,
+    std::size_t maximum_rendered_bytes =
+        kMaximumLayeredPinPresentationBytes) noexcept {
+    if (source_width <= 0 || source_height <= 0 ||
+        work_area.width() <= 0 || work_area.height() <= 0 ||
+        maximum_rendered_bytes < Bitmap::bytes_per_pixel) {
+        return {};
+    }
+
+    const long double source_pixels =
+        static_cast<long double>(source_width) *
+        static_cast<long double>(source_height);
+    if (!(source_pixels > 0.0L)) {
+        return {};
+    }
+    const long double bytes_per_frame =
+        source_pixels * Bitmap::bytes_per_pixel;
+    const double resource_maximum = std::sqrt(static_cast<double>(
+        static_cast<long double>(maximum_rendered_bytes) /
+        bytes_per_frame));
+    const double work_width_maximum =
+        static_cast<double>(work_area.width()) / source_width;
+    const double work_height_maximum =
+        static_cast<double>(work_area.height()) / source_height;
+    const double maximum = std::min({
+        kMaximumInteractivePinScale,
+        resource_maximum,
+        work_width_maximum,
+        work_height_maximum,
+    });
+    if (!std::isfinite(maximum) || maximum <= 0.0) {
+        return {};
+    }
+    const double visible_minimum =
+        static_cast<double>(kMinimumInteractivePinLongEdgePixels) /
+        std::max(source_width, source_height);
+    return {
+        true,
+        std::min(
+            std::max(kAbsoluteMinimumPinScale, visible_minimum),
+            maximum),
+        maximum,
+    };
+}
+
+[[nodiscard]] inline double clamp_pin_scale(
+    double requested,
+    const PinScaleLimits& limits) noexcept {
+    if (!limits.valid || !std::isfinite(requested)) {
+        return 0.0;
+    }
+    return std::clamp(requested, limits.minimum, limits.maximum);
+}
+
+enum class PinResizeEdge {
+    none,
+    left,
+    right,
+    top,
+    bottom,
+    top_left,
+    top_right,
+    bottom_left,
+    bottom_right,
+};
+
+[[nodiscard]] constexpr bool pin_resize_edge_is_interactive(
+    PinResizeEdge edge) noexcept {
+    return edge != PinResizeEdge::none;
+}
+
+[[nodiscard]] constexpr PinResizeEdge pin_resize_hit_test(
+    int x,
+    int y,
+    int width,
+    int height,
+    int requested_margin) noexcept {
+    if (width <= 0 || height <= 0 || requested_margin <= 0 ||
+        x < 0 || y < 0 || x >= width || y >= height) {
+        return PinResizeEdge::none;
+    }
+    const int margin_x = std::max(
+        1,
+        std::min(requested_margin, (width + 1) / 2));
+    const int margin_y = std::max(
+        1,
+        std::min(requested_margin, (height + 1) / 2));
+    const bool left = x < margin_x;
+    const bool right = x >= width - margin_x;
+    const bool top = y < margin_y;
+    const bool bottom = y >= height - margin_y;
+    if (left && top) return PinResizeEdge::top_left;
+    if (right && top) return PinResizeEdge::top_right;
+    if (left && bottom) return PinResizeEdge::bottom_left;
+    if (right && bottom) return PinResizeEdge::bottom_right;
+    if (left) return PinResizeEdge::left;
+    if (right) return PinResizeEdge::right;
+    if (top) return PinResizeEdge::top;
+    if (bottom) return PinResizeEdge::bottom;
+    return PinResizeEdge::none;
+}
+
+struct PinResizePlan {
+    bool apply{};
+    RectI bounds{};
+    double scale{1.0};
+};
+
+[[nodiscard]] inline RectI clamp_pin_bounds_to_work_area(
+    RectI bounds,
+    const RectI& work_area) noexcept {
+    if (bounds.width() <= 0 || bounds.height() <= 0 ||
+        work_area.width() <= 0 || work_area.height() <= 0) {
+        return {};
+    }
+    const int width = std::min(bounds.width(), work_area.width());
+    const int height = std::min(bounds.height(), work_area.height());
+    const int left = std::clamp(
+        bounds.left,
+        work_area.left,
+        work_area.right - width);
+    const int top = std::clamp(
+        bounds.top,
+        work_area.top,
+        work_area.bottom - height);
+    return {left, top, left + width, top + height};
+}
+
+// Resizes around an arbitrary screen anchor while keeping the anchor at the
+// same relative point in the window. Wheel, keyboard and exact-percent paths
+// all use this plan so transparent and opaque windows share the same bounds.
+[[nodiscard]] inline PinResizePlan plan_pin_scale_resize(
+    int source_width,
+    int source_height,
+    const RectI& current_bounds,
+    POINT anchor_screen,
+    double requested_scale,
+    const RectI& work_area,
+    std::size_t maximum_rendered_bytes =
+        kMaximumLayeredPinPresentationBytes) noexcept {
+    if (current_bounds.width() <= 0 || current_bounds.height() <= 0) {
+        return {};
+    }
+    const PinScaleLimits limits = pin_scale_limits(
+        source_width,
+        source_height,
+        work_area,
+        maximum_rendered_bytes);
+    const double scale = clamp_pin_scale(requested_scale, limits);
+    if (!(scale > 0.0)) {
+        return {};
+    }
+    const int width = std::max(
+        1,
+        static_cast<int>(std::llround(source_width * scale)));
+    const int height = std::max(
+        1,
+        static_cast<int>(std::llround(source_height * scale)));
+    const double ratio_x = std::clamp(
+        static_cast<double>(anchor_screen.x - current_bounds.left) /
+            current_bounds.width(),
+        0.0,
+        1.0);
+    const double ratio_y = std::clamp(
+        static_cast<double>(anchor_screen.y - current_bounds.top) /
+            current_bounds.height(),
+        0.0,
+        1.0);
+    const long long left =
+        static_cast<long long>(anchor_screen.x) -
+        std::llround(ratio_x * width);
+    const long long top =
+        static_cast<long long>(anchor_screen.y) -
+        std::llround(ratio_y * height);
+    const auto clamp_coordinate = [](long long value) noexcept {
+        return static_cast<int>(std::clamp<long long>(
+            value,
+            std::numeric_limits<int>::min(),
+            std::numeric_limits<int>::max()));
+    };
+    RectI bounds{
+        clamp_coordinate(left),
+        clamp_coordinate(top),
+        clamp_coordinate(left + width),
+        clamp_coordinate(top + height),
+    };
+    bounds = clamp_pin_bounds_to_work_area(bounds, work_area);
+    if (bounds.width() != width || bounds.height() != height) {
+        return {};
+    }
+    return {true, bounds, scale};
+}
+
+// Border and corner dragging projects the pointer onto the source aspect
+// ratio. A side handle keeps the opposite side fixed and recentres the other
+// axis; a corner keeps its opposite corner fixed. The final result is then
+// shifted, never distorted, if the work area changed during the gesture.
+[[nodiscard]] inline PinResizePlan plan_pin_drag_resize(
+    PinResizeEdge edge,
+    int source_width,
+    int source_height,
+    const RectI& original_bounds,
+    POINT cursor_screen,
+    const RectI& work_area,
+    std::size_t maximum_rendered_bytes =
+        kMaximumLayeredPinPresentationBytes) noexcept {
+    if (!pin_resize_edge_is_interactive(edge) || source_width <= 0 ||
+        source_height <= 0 || original_bounds.width() <= 0 ||
+        original_bounds.height() <= 0) {
+        return {};
+    }
+
+    const bool uses_left = edge == PinResizeEdge::left ||
+                           edge == PinResizeEdge::top_left ||
+                           edge == PinResizeEdge::bottom_left;
+    const bool uses_right = edge == PinResizeEdge::right ||
+                            edge == PinResizeEdge::top_right ||
+                            edge == PinResizeEdge::bottom_right;
+    const bool uses_top = edge == PinResizeEdge::top ||
+                          edge == PinResizeEdge::top_left ||
+                          edge == PinResizeEdge::top_right;
+    const bool uses_bottom = edge == PinResizeEdge::bottom ||
+                             edge == PinResizeEdge::bottom_left ||
+                             edge == PinResizeEdge::bottom_right;
+    const bool corner = (uses_left || uses_right) &&
+                        (uses_top || uses_bottom);
+
+    double requested_scale = 0.0;
+    if (corner) {
+        const int anchor_x = uses_left
+                                 ? original_bounds.right
+                                 : original_bounds.left;
+        const int anchor_y = uses_top
+                                 ? original_bounds.bottom
+                                 : original_bounds.top;
+        const double dx = std::abs(
+            static_cast<double>(cursor_screen.x - anchor_x));
+        const double dy = std::abs(
+            static_cast<double>(cursor_screen.y - anchor_y));
+        const double denominator =
+            static_cast<double>(source_width) * source_width +
+            static_cast<double>(source_height) * source_height;
+        requested_scale =
+            (dx * source_width + dy * source_height) / denominator;
+    } else if (uses_left) {
+        requested_scale =
+            static_cast<double>(original_bounds.right - cursor_screen.x) /
+            source_width;
+    } else if (uses_right) {
+        requested_scale =
+            static_cast<double>(cursor_screen.x - original_bounds.left) /
+            source_width;
+    } else if (uses_top) {
+        requested_scale =
+            static_cast<double>(original_bounds.bottom - cursor_screen.y) /
+            source_height;
+    } else if (uses_bottom) {
+        requested_scale =
+            static_cast<double>(cursor_screen.y - original_bounds.top) /
+            source_height;
+    }
+
+    const PinScaleLimits limits = pin_scale_limits(
+        source_width,
+        source_height,
+        work_area,
+        maximum_rendered_bytes);
+    const double scale = clamp_pin_scale(requested_scale, limits);
+    if (!(scale > 0.0)) {
+        return {};
+    }
+    const int width = std::max(
+        1,
+        static_cast<int>(std::llround(source_width * scale)));
+    const int height = std::max(
+        1,
+        static_cast<int>(std::llround(source_height * scale)));
+    const int center_x = original_bounds.left + original_bounds.width() / 2;
+    const int center_y = original_bounds.top + original_bounds.height() / 2;
+    RectI bounds{};
+    if (corner) {
+        const int anchor_x = uses_left
+                                 ? original_bounds.right
+                                 : original_bounds.left;
+        const int anchor_y = uses_top
+                                 ? original_bounds.bottom
+                                 : original_bounds.top;
+        bounds.left = uses_left ? anchor_x - width : anchor_x;
+        bounds.right = uses_left ? anchor_x : anchor_x + width;
+        bounds.top = uses_top ? anchor_y - height : anchor_y;
+        bounds.bottom = uses_top ? anchor_y : anchor_y + height;
+    } else if (uses_left || uses_right) {
+        bounds.left = uses_left
+                          ? original_bounds.right - width
+                          : original_bounds.left;
+        bounds.right = uses_left
+                           ? original_bounds.right
+                           : original_bounds.left + width;
+        bounds.top = center_y - height / 2;
+        bounds.bottom = bounds.top + height;
+    } else {
+        bounds.top = uses_top
+                         ? original_bounds.bottom - height
+                         : original_bounds.top;
+        bounds.bottom = uses_top
+                            ? original_bounds.bottom
+                            : original_bounds.top + height;
+        bounds.left = center_x - width / 2;
+        bounds.right = bounds.left + width;
+    }
+    bounds = clamp_pin_bounds_to_work_area(bounds, work_area);
+    if (bounds.width() != width || bounds.height() != height) {
+        return {};
+    }
+    return {true, bounds, scale};
+}
+
+struct PinThumbnailState {
+    bool active{};
+    double restore_scale{1.0};
+
+    [[nodiscard]] friend constexpr bool operator==(
+        const PinThumbnailState&,
+        const PinThumbnailState&) noexcept = default;
+};
+
+struct PinThumbnailPlan {
+    bool apply{};
+    PinThumbnailState state{};
+    double scale{1.0};
+};
+
+[[nodiscard]] inline double pin_fixed_thumbnail_scale(
+    int source_width,
+    int source_height,
+    int target_long_edge_pixels,
+    const RectI& work_area,
+    std::size_t maximum_rendered_bytes =
+        kMaximumLayeredPinPresentationBytes) noexcept {
+    if (source_width <= 0 || source_height <= 0 ||
+        target_long_edge_pixels <= 0) {
+        return 0.0;
+    }
+    const PinScaleLimits limits = pin_scale_limits(
+        source_width,
+        source_height,
+        work_area,
+        maximum_rendered_bytes);
+    return clamp_pin_scale(
+        static_cast<double>(target_long_edge_pixels) /
+            std::max(source_width, source_height),
+        limits);
+}
+
+[[nodiscard]] inline PinThumbnailPlan plan_pin_thumbnail_toggle(
+    PinThumbnailState state,
+    double current_scale,
+    int source_width,
+    int source_height,
+    int target_long_edge_pixels,
+    const RectI& work_area,
+    std::size_t maximum_rendered_bytes =
+        kMaximumLayeredPinPresentationBytes) noexcept {
+    const PinScaleLimits limits = pin_scale_limits(
+        source_width,
+        source_height,
+        work_area,
+        maximum_rendered_bytes);
+    if (!limits.valid || !std::isfinite(current_scale) ||
+        current_scale <= 0.0) {
+        return {};
+    }
+    if (!state.active) {
+        const double thumbnail_scale = pin_fixed_thumbnail_scale(
+            source_width,
+            source_height,
+            target_long_edge_pixels,
+            work_area,
+            maximum_rendered_bytes);
+        if (!(thumbnail_scale > 0.0)) {
+            return {};
+        }
+        return {
+            true,
+            {true, current_scale},
+            thumbnail_scale,
+        };
+    }
+    const double restored = clamp_pin_scale(state.restore_scale, limits);
+    if (!(restored > 0.0)) {
+        return {};
+    }
+    return {
+        true,
+        {false, restored},
+        restored,
+    };
+}
+
 [[nodiscard]] constexpr int clamp_pin_scale_percent(int percent) noexcept {
     return std::clamp(percent, 10, 1000);
 }

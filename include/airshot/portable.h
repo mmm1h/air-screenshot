@@ -62,6 +62,11 @@ bool launch_pending_update(
     bool restart_after_update,
     bool allow_automatic_pending,
     std::wstring* error);
+bool launch_pending_update(
+    bool restart_after_update,
+    bool allow_automatic_pending,
+    std::wstring* error,
+    std::stop_token stop_token);
 int run_update_helper(std::span<const std::wstring> arguments);
 void cleanup_stale_updates();
 

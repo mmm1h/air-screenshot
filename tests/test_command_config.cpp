@@ -430,8 +430,12 @@ void test_config_contract() {
     const airshot::AppConfig fresh;
     expect(fresh.schema_version == airshot::kCurrentConfigSchemaVersion &&
                !fresh.start_at_login &&
+               fresh.automatic_updates_enabled &&
+               fresh.seamless_updates_enabled &&
+               fresh.automatic_update_idle_minutes == 15 &&
+               fresh.update_restart_deferred_until_unix == 0 &&
                fresh.pin_hotkey.empty(),
-           L"fresh config does not steal an existing system-wide paste shortcut");
+           L"fresh config enables safe seamless updates without stealing a system-wide shortcut");
 
     const auto legacy = airshot::config_from_json(LR"({"shell":{"enabled":true}})");
     expect(legacy && legacy->schema_version == 1 && legacy->start_at_login,
@@ -449,13 +453,20 @@ void test_config_contract() {
 
     const auto current = airshot::config_from_json(
         LR"({"schemaVersion":2,"shell":{"enabled":true},"extension":{"mode":"future"},"capture":{"futureFlag":7}})");
-    expect(current && !current->start_at_login && !current->write_protected,
-           L"schema 2 missing startAtLogin uses the new false default");
+    expect(current && !current->start_at_login && !current->write_protected &&
+               current->automatic_updates_enabled &&
+               current->seamless_updates_enabled &&
+               current->automatic_update_idle_minutes == 15 &&
+               current->update_restart_deferred_until_unix == 0,
+           L"schema 2 missing additive settings uses safe current defaults");
     if (current) {
         airshot::AppConfig edited = *current;
         edited.shell_enabled = false;
         edited.tray_icon_visible = false;
         edited.automatic_updates_enabled = false;
+        edited.seamless_updates_enabled = false;
+        edited.automatic_update_idle_minutes = 45;
+        edited.update_restart_deferred_until_unix = 1'725'086'400;
         edited.last_update_check_unix = 1'725'000'000;
         edited.warned_update_target = LR"(c:\readonly\airscreenshot.exe)";
         const auto serialized = airshot::config_to_json(edited);
@@ -463,6 +474,9 @@ void test_config_contract() {
                    serialized.find(LR"("futureFlag":7)") != std::wstring::npos &&
                    serialized.find(LR"("trayIconVisible":false)") != std::wstring::npos &&
                    serialized.find(LR"("automatic":false)") != std::wstring::npos &&
+                   serialized.find(LR"("seamless":false)") != std::wstring::npos &&
+                   serialized.find(LR"("idleMinutes":45)") != std::wstring::npos &&
+                   serialized.find(LR"("deferUntilUnix":1725086400)") != std::wstring::npos &&
                    serialized.find(LR"("lastCheckUnix":1725000000)") != std::wstring::npos &&
                    serialized.find(LR"("warnedTarget":"c:\\readonly\\airscreenshot.exe")") !=
                        std::wstring::npos,
@@ -470,6 +484,9 @@ void test_config_contract() {
         const auto round_trip = airshot::config_from_json(serialized);
         expect(round_trip && !round_trip->tray_icon_visible &&
                    !round_trip->automatic_updates_enabled &&
+                   !round_trip->seamless_updates_enabled &&
+                   round_trip->automatic_update_idle_minutes == 45 &&
+                   round_trip->update_restart_deferred_until_unix == 1'725'086'400 &&
                    round_trip->last_update_check_unix == 1'725'000'000 &&
                    round_trip->warned_update_target ==
                        LR"(c:\readonly\airscreenshot.exe)",
@@ -716,6 +733,43 @@ void test_config_contract() {
                LR"({"schemaVersion":2,"update":{"automatic":"true"}})"),
            L"schema 2 rejects a malformed automatic update flag");
     expect(!airshot::config_from_json(
+               LR"({"schemaVersion":2,"update":{"seamless":"true"}})"),
+           L"schema 2 rejects a malformed seamless update flag");
+    expect(!airshot::config_from_json(
+               LR"({"schemaVersion":2,"update":{"idleMinutes":"15"}})"),
+           L"schema 2 rejects a malformed automatic update idle interval");
+    const auto defaulted_idle_intervals = airshot::config_from_json(
+        LR"({"schemaVersion":2,"update":{"idleMinutes":4}})");
+    const auto defaulted_large_idle_interval = airshot::config_from_json(
+        LR"({"schemaVersion":2,"update":{"idleMinutes":121}})");
+    const auto accepted_idle_interval_bounds = airshot::config_from_json(
+        LR"({"schemaVersion":2,"update":{"idleMinutes":5}})");
+    const auto accepted_large_idle_interval_bound = airshot::config_from_json(
+        LR"({"schemaVersion":2,"update":{"idleMinutes":120}})");
+    expect(
+        defaulted_idle_intervals && defaulted_large_idle_interval &&
+            defaulted_idle_intervals->automatic_update_idle_minutes == 15 &&
+            defaulted_large_idle_interval->automatic_update_idle_minutes == 15 &&
+            accepted_idle_interval_bounds &&
+            accepted_idle_interval_bounds->automatic_update_idle_minutes == 5 &&
+            accepted_large_idle_interval_bound &&
+            accepted_large_idle_interval_bound->automatic_update_idle_minutes == 120,
+        L"automatic update idle interval accepts 5 through 120 and safely defaults otherwise");
+    airshot::AppConfig invalid_idle_interval;
+    invalid_idle_interval.automatic_update_idle_minutes = 4;
+    const auto normalized_idle_interval = airshot::config_from_json(
+        airshot::config_to_json(invalid_idle_interval));
+    expect(
+        normalized_idle_interval &&
+            normalized_idle_interval->automatic_update_idle_minutes == 15,
+        L"automatic update idle interval is normalized consistently when saved");
+    expect(!airshot::config_from_json(
+               LR"({"schemaVersion":2,"update":{"deferUntilUnix":-1}})"),
+           L"schema 2 rejects a negative update restart deferral timestamp");
+    expect(!airshot::config_from_json(
+               LR"({"schemaVersion":2,"update":{"deferUntilUnix":9223372036854775808}})"),
+           L"schema 2 rejects an overflowing update restart deferral timestamp");
+    expect(!airshot::config_from_json(
                LR"({"schemaVersion":2,"update":{"lastCheckUnix":-1}})"),
            L"schema 2 rejects a negative update check timestamp");
     expect(!airshot::config_from_json(
@@ -805,6 +859,7 @@ void test_config_contract() {
 
     const auto reserved_f2 = airshot::parse_hotkey(L"F2");
     const auto reserved_redo = airshot::parse_hotkey(L"Ctrl+Shift+Z");
+    const auto reserved_tool_size = airshot::parse_hotkey(L"1");
     const auto available_modified_f2 = airshot::parse_hotkey(L"Shift+F2");
     const auto available_tool = airshot::parse_hotkey(L"R");
     expect(
@@ -814,6 +869,9 @@ void test_config_contract() {
             reserved_redo &&
             airshot::capture_editor_reserved_shortcut(*reserved_redo) ==
                 airshot::capture_editor_shortcuts::redo_alternate &&
+            reserved_tool_size &&
+            airshot::capture_editor_reserved_shortcut(*reserved_tool_size) ==
+                airshot::capture_editor_shortcuts::decrease_tool_size &&
             available_modified_f2 &&
             !airshot::capture_editor_reserved_shortcut(
                 *available_modified_f2) &&

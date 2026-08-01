@@ -13,7 +13,7 @@ The settings window configures six product areas:
 3. **工具栏** — tool visibility and order, with drag, buttons, and keyboard alternatives.
 4. **快捷键** — global screenshot, clipboard pin, OCR, and annotation-tool bindings with inline validation and conflict recovery.
 5. **应用与外观** — background service, tray visibility, startup behavior, system/light/dark themes, and one of three built-in application icons: 精准取景 (Focus Frame, default), 流光镜 (Flow Lens), or 像素舱 (Pixel Console).
-6. **更新与安全** — automatic-update preference, verification guarantees, installation safety, and the explicit boundary between saving a preference and manually checking for an update.
+6. **更新与安全** — background download, optional seamless idle restart, a bounded idle interval, verification guarantees, and the explicit boundary between saved policy, 24-hour deferral, and manual update intent.
 
 The surface must never imply unsupported output destinations, cloud OCR, account state, or commercial capabilities.
 
@@ -44,6 +44,7 @@ The surface must never imply unsupported output destinations, cloud OCR, account
 - Confirm before hiding the tray icon and explain how to reopen Settings while the background service continues running.
 - Show OCR preparation and recognition progress without freezing the rest of the window. Cancellation and retry must preserve the current selection and any already verified installation.
 - Keep automatic-update preference separate from the manual tray action. Disabling automatic updates cancels only automatic work and pauses automatic-origin pending installation; it must not erase explicit manual intent.
+- Seamless restart requires both user and application idleness, never closes pins, avoids full-screen or presentation state, and restores the old executable if transactional replacement fails.
 - Support full keyboard navigation, visible focus, `Ctrl + S`, `Esc`, and `Alt + ↑ / ↓` as a toolbar drag alternative.
 - Keep application-icon selection in the settings draft until Save; support hover, visible keyboard focus, and arrow-key movement across the three choices.
 - After Save, update the tray icon and running window/taskbar icons. Keep the program file's Explorer icon on the default Focus Frame resource; this feature does not rewrite the executable.

@@ -36,13 +36,16 @@ public:
         return mutex_ != nullptr;
     }
     [[nodiscard]] bool update_helper_launched() const noexcept {
-        return update_helper_launched_;
+        return update_helper_launched_.load(std::memory_order_acquire);
     }
     [[nodiscard]] bool initialized() const noexcept {
         return initialized_;
     }
     [[nodiscard]] bool automatic_updates_enabled() const noexcept {
         return config_.automatic_updates_enabled;
+    }
+    [[nodiscard]] bool system_session_ending() const noexcept {
+        return system_session_ending_.load(std::memory_order_acquire);
     }
 
 private:
@@ -88,6 +91,7 @@ private:
     };
 
     enum class UpdateActivationResult {
+        canceled,
         unavailable,
         failed,
         launched,
@@ -96,6 +100,7 @@ private:
     struct UpdateActivationCompletion {
         UpdateActivationResult result{UpdateActivationResult::failed};
         std::wstring message;
+        bool user_triggered{};
     };
 
     bool initialize();
@@ -145,14 +150,17 @@ private:
         const std::filesystem::path& requested_path = {});
     [[nodiscard]] std::optional<std::wstring> sync_region_config(const RegionResult& result);
     void schedule_update_check(DWORD fallback_delay_ms);
+    void schedule_seamless_update_activation(DWORD delay_ms);
+    void maybe_activate_seamless_update();
     [[nodiscard]] bool apply_automatic_update_preference(
         bool previous_enabled);
     void toggle_automatic_updates();
+    void toggle_update_restart_deferral();
     [[nodiscard]] bool persist_update_config(
         AppConfig next,
         bool report_failure);
     void check_for_updates(bool user_triggered);
-    void activate_pending_update();
+    void activate_pending_update(bool user_triggered = true);
     [[nodiscard]] bool can_restart_for_update();
     std::wstring handle_pipe_request(
         HWND dispatch_window,
@@ -204,6 +212,7 @@ private:
     unsigned int tray_retry_count_{};
     bool hotkeys_registered_{};
     bool initialized_{};
+    std::atomic_bool system_session_ending_{false};
     std::wstring hotkey_runtime_error_;
     UINT taskbar_created_message_{};
     bool shutdown_complete_{};
@@ -240,7 +249,10 @@ private:
     std::mutex update_activation_mutex_;
     std::optional<UpdateActivationCompletion> update_activation_completion_;
     bool update_ready_{};
-    bool update_helper_launched_{};
+    std::atomic_bool update_helper_launched_{false};
+    ULONGLONG update_ready_since_tick_{};
+    std::uint32_t consecutive_update_failures_{};
+    std::uint32_t consecutive_update_activation_failures_{};
     bool pins_suspended_for_capture_{};
     bool pin_bulk_destroy_confirmation_active_{};
     std::vector<std::unique_ptr<PinWindow>> pin_windows_;

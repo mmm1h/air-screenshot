@@ -5,6 +5,7 @@
 
 #include "airshot/ocr.h"
 #include "airshot/strings.h"
+#include "airshot/update_policy.h"
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wrl/client.h>
@@ -57,6 +58,20 @@ constexpr int kUpdateToggleLeft = 258;
 constexpr int kUpdateToggleTop = 160;
 constexpr int kUpdateToggleRight = 886;
 constexpr int kUpdateToggleBottom = 216;
+constexpr int kUpdateSeamlessTop = 216;
+constexpr int kUpdateSeamlessBottom = 272;
+
+struct UpdateIdleChoiceBounds {
+    int left;
+    int right;
+};
+
+constexpr std::array<UpdateIdleChoiceBounds, 4> kUpdateIdleChoiceBounds{{
+    {606, 666},
+    {674, 734},
+    {742, 802},
+    {810, 870},
+}};
 
 [[nodiscard]] constexpr bool settings_tab_index_is_valid(int index) noexcept {
     return index >= 0 && index < kCategoryCount;
@@ -86,6 +101,31 @@ constexpr int kUpdateToggleBottom = 216;
            y >= kUpdateToggleTop && y <= kUpdateToggleBottom;
 }
 
+[[nodiscard]] constexpr bool settings_update_seamless_hit_test(
+    long x,
+    long y) noexcept {
+    return x >= kUpdateToggleLeft && x <= kUpdateToggleRight &&
+           y >= kUpdateSeamlessTop && y <= kUpdateSeamlessBottom;
+}
+
+[[nodiscard]] constexpr int settings_update_idle_choice_hit_test(
+    long x,
+    long y) noexcept {
+    if (y < 348 || y > 384) {
+        return -1;
+    }
+    for (int index = 0;
+         index < static_cast<int>(kUpdateIdleChoiceBounds.size());
+         ++index) {
+        const auto bounds =
+            kUpdateIdleChoiceBounds[static_cast<std::size_t>(index)];
+        if (x >= bounds.left && x <= bounds.right) {
+            return index;
+        }
+    }
+    return -1;
+}
+
 static_assert(settings_tab_index_after_delta(0, -1) == kUpdateSecurityTab);
 static_assert(settings_tab_index_after_delta(kUpdateSecurityTab, 1) == 0);
 static_assert(settings_tab_index_after_delta(-1, 1) == 0);
@@ -96,6 +136,11 @@ static_assert(settings_tab_index_or_default(kCategoryCount) == 0);
 static_assert(settings_update_toggle_hit_test(828, 188));
 static_assert(!settings_update_toggle_hit_test(kUpdateToggleLeft - 1, 188));
 static_assert(!settings_update_toggle_hit_test(828, kUpdateToggleBottom + 1));
+static_assert(settings_update_seamless_hit_test(828, 244));
+static_assert(!settings_update_seamless_hit_test(828, 215));
+static_assert(settings_update_idle_choice_hit_test(620, 360) == 0);
+static_assert(settings_update_idle_choice_hit_test(850, 360) == 3);
+static_assert(settings_update_idle_choice_hit_test(700, 340) == -1);
 
 enum class SettingsFocusKind {
     category,
@@ -122,6 +167,8 @@ enum class SettingsFocusKind {
     theme,
     app_icon,
     update_automatic,
+    update_seamless,
+    update_idle,
     save,
     cancel,
     close,
@@ -1433,7 +1480,8 @@ void draw_choice_button(
     int y2,
     const wchar_t* label,
     bool is_selected,
-    bool is_hovered) {
+    bool is_hovered,
+    bool enabled = true) {
     const D2D1_RECT_F rect = D2D1::RectF(
         static_cast<float>(x1),
         static_cast<float>(y1),
@@ -1442,21 +1490,23 @@ void draw_choice_button(
     const auto rounded = D2D1::RoundedRect(rect, 7.0f, 7.0f);
     state->render_target->FillRoundedRectangle(
         rounded,
-        is_selected ? state->accent_soft_brush.Get()
-                    : (is_hovered ? state->hover_bg_brush.Get()
-                                  : state->control_bg_brush.Get()));
+        !enabled ? state->disabled_bg_brush.Get()
+                 : (is_selected
+                        ? state->accent_soft_brush.Get()
+                        : (is_hovered ? state->hover_bg_brush.Get()
+                                      : state->control_bg_brush.Get())));
     state->render_target->DrawRoundedRectangle(
         rounded,
-        is_selected ? state->hover_blue_brush.Get()
-                    : state->card_border_brush.Get(),
+        enabled && is_selected ? state->hover_blue_brush.Get()
+                               : state->card_border_brush.Get(),
         1.0f);
     state->render_target->DrawTextW(
         label,
         static_cast<UINT32>(wcslen(label)),
         state->btn_text_format.Get(),
         rect,
-        is_selected ? state->hover_blue_brush.Get()
-                    : state->text_grey_brush.Get());
+        enabled && is_selected ? state->hover_blue_brush.Get()
+                               : state->text_grey_brush.Get());
 }
 
 void draw_hotkey_box(
@@ -1726,6 +1776,17 @@ std::vector<SettingsFocusTarget> settings_focus_targets(const SettingsState* sta
         }
     } else if (active_tab == kUpdateSecurityTab) {
         targets.push_back({SettingsFocusKind::update_automatic});
+        if (state->config.automatic_updates_enabled) {
+            targets.push_back({SettingsFocusKind::update_seamless});
+            if (state->config.seamless_updates_enabled) {
+                for (int index = 0;
+                     index < static_cast<int>(kUpdateIdleMinuteChoices.size());
+                     ++index) {
+                    targets.push_back(
+                        {SettingsFocusKind::update_idle, index});
+                }
+            }
+        }
     }
     if (settings_are_dirty(state) && !state->shortcut_error) {
         targets.push_back({SettingsFocusKind::save});
@@ -1878,6 +1939,28 @@ std::optional<D2D1_ROUNDED_RECT> settings_focus_bounds(
                 static_cast<float>(kUpdateToggleRight),
                 static_cast<float>(kUpdateToggleBottom));
             break;
+        case SettingsFocusKind::update_seamless:
+            rect = D2D1::RectF(
+                static_cast<float>(kUpdateToggleLeft),
+                static_cast<float>(kUpdateSeamlessTop),
+                static_cast<float>(kUpdateToggleRight),
+                static_cast<float>(kUpdateSeamlessBottom));
+            break;
+        case SettingsFocusKind::update_idle: {
+            if (target.index < 0 ||
+                target.index >=
+                    static_cast<int>(kUpdateIdleChoiceBounds.size())) {
+                return std::nullopt;
+            }
+            const auto bounds = kUpdateIdleChoiceBounds[
+                static_cast<std::size_t>(target.index)];
+            rect = D2D1::RectF(
+                static_cast<float>(bounds.left),
+                348.0f,
+                static_cast<float>(bounds.right),
+                384.0f);
+            break;
+        }
         case SettingsFocusKind::save:
             rect = D2D1::RectF(776.0f, 670.0f, 888.0f, 710.0f);
             break;
@@ -2176,6 +2259,23 @@ bool activate_settings_focus(
         case SettingsFocusKind::update_automatic:
             state->config.automatic_updates_enabled =
                 !state->config.automatic_updates_enabled;
+            break;
+        case SettingsFocusKind::update_seamless:
+            if (state->config.automatic_updates_enabled) {
+                state->config.seamless_updates_enabled =
+                    !state->config.seamless_updates_enabled;
+            }
+            break;
+        case SettingsFocusKind::update_idle:
+            if (state->config.automatic_updates_enabled &&
+                state->config.seamless_updates_enabled &&
+                target.index >= 0 &&
+                target.index <
+                    static_cast<int>(kUpdateIdleMinuteChoices.size())) {
+                state->config.automatic_update_idle_minutes =
+                    kUpdateIdleMinuteChoices[
+                        static_cast<std::size_t>(target.index)];
+            }
             break;
         case SettingsFocusKind::save:
             if (settings_are_dirty(state) && !state->shortcut_error) {
@@ -3379,10 +3479,10 @@ void draw_update_security_page(SettingsState* state) {
     draw_page_header(
         state,
         L"更新与安全",
-        L"管理自动更新偏好，并核对每次更新遵守的安全边界。");
+        L"静默下载，只在真正空闲且不会丢失现场时完成更新。");
 
-    draw_section_title(state, L"更新偏好", 132.0f);
-    draw_row_group(state, 160.0f, 216.0f);
+    draw_section_title(state, L"更新方式", 132.0f);
+    draw_row_group(state, 160.0f, 272.0f);
     const bool automatic_hovered = settings_update_toggle_hit_test(
         state->mouse_pos.x,
         state->mouse_pos.y);
@@ -3390,11 +3490,11 @@ void draw_update_security_page(SettingsState* state) {
         state,
         160.0f,
         216.0f,
-        L"自动检查并安全更新",
-        L"每天静默检查；关闭后自动暂存的版本也暂停安装。",
+        L"自动检查并下载",
+        L"每天在后台检查，下载后完成体积、摘要和签名校验。",
         automatic_hovered,
         true,
-        false);
+        true);
     draw_switch(
         state,
         828,
@@ -3403,40 +3503,93 @@ void draw_update_security_page(SettingsState* state) {
         true,
         automatic_hovered);
 
-    draw_section_title(state, L"更新保护", 252.0f);
-    draw_row_group(state, 280.0f, 448.0f);
+    const bool seamless_enabled =
+        state->config.automatic_updates_enabled;
+    const bool seamless_hovered =
+        seamless_enabled && settings_update_seamless_hit_test(
+                                state->mouse_pos.x,
+                                state->mouse_pos.y);
     draw_setting_row(
         state,
-        280.0f,
-        336.0f,
-        L"SHA256 + 发布签名",
-        L"更新包必须同时通过摘要校验与发布签名验证。",
+        216.0f,
+        272.0f,
+        L"空闲时自动完成",
+        L"不关闭贴图，不打断截图、全屏、演示或外部调用。",
+        seamless_hovered,
+        seamless_enabled,
         false);
-    draw_setting_row(
+    draw_switch(
         state,
-        336.0f,
-        392.0f,
-        L"保护现有安装",
-        L"安装目录不可写时停止，不覆盖或破坏当前程序。",
-        false);
-    draw_setting_row(
-        state,
-        392.0f,
-        448.0f,
-        L"手动检查仍在托盘",
-        L"需要立即检查时，请使用托盘菜单中的“检查更新”。",
-        false,
-        true,
-        false);
+        828,
+        232,
+        state->config.seamless_updates_enabled,
+        seamless_enabled,
+        seamless_hovered);
 
-    draw_section_title(state, L"生效方式", 484.0f);
-    draw_row_group(state, 512.0f, 584.0f);
+    draw_section_title(state, L"空闲等待", 300.0f);
+    draw_row_group(state, 328.0f, 404.0f);
+    const bool idle_enabled = seamless_enabled &&
+                              state->config.seamless_updates_enabled;
     draw_setting_row(
         state,
-        512.0f,
-        584.0f,
-        L"保存只更新偏好",
-        L"本页不会立即联网检查；自动检查按每日计划在后台执行。",
+        328.0f,
+        404.0f,
+        L"连续无人操作",
+        L"达到等待时间后，再次确认应用与系统都可安全重启。",
+        false,
+        idle_enabled,
+        false);
+    constexpr std::array<const wchar_t*, 4> idle_labels{
+        L"5 分钟",
+        L"15 分钟",
+        L"30 分钟",
+        L"60 分钟",
+    };
+    for (int index = 0;
+         index < static_cast<int>(kUpdateIdleChoiceBounds.size());
+         ++index) {
+        const auto bounds =
+            kUpdateIdleChoiceBounds[static_cast<std::size_t>(index)];
+        const bool hovered =
+            idle_enabled &&
+            settings_update_idle_choice_hit_test(
+                state->mouse_pos.x,
+                state->mouse_pos.y) == index;
+        draw_choice_button(
+            state,
+            bounds.left,
+            348,
+            bounds.right,
+            384,
+            idle_labels[static_cast<std::size_t>(index)],
+            state->config.automatic_update_idle_minutes ==
+                kUpdateIdleMinuteChoices[static_cast<std::size_t>(index)],
+            hovered,
+            idle_enabled);
+    }
+
+    draw_section_title(state, L"安全边界", 436.0f);
+    draw_row_group(state, 464.0f, 632.0f);
+    draw_setting_row(
+        state,
+        464.0f,
+        520.0f,
+        L"下载后先验证",
+        L"体积、SHA-256、发布签名和发布者全部匹配才会安装。",
+        false);
+    draw_setting_row(
+        state,
+        520.0f,
+        576.0f,
+        L"保留用户现场",
+        L"存在截图、设置、贴图或任务时继续等待，不会强制关闭。",
+        false);
+    draw_setting_row(
+        state,
+        576.0f,
+        632.0f,
+        L"失败静默恢复",
+        L"替换失败会保留当前版本并稍后重试；托盘仍可立即更新。",
         false,
         true,
         false);
@@ -3712,9 +3865,23 @@ std::optional<SettingsFocusTarget> hit_test_settings(
                 return SettingsFocusTarget{SettingsFocusKind::app_icon, index};
             }
         }
-    } else if (active_tab == kUpdateSecurityTab &&
-               settings_update_toggle_hit_test(point.x, point.y)) {
-        return SettingsFocusTarget{SettingsFocusKind::update_automatic};
+    } else if (active_tab == kUpdateSecurityTab) {
+        if (settings_update_toggle_hit_test(point.x, point.y)) {
+            return SettingsFocusTarget{SettingsFocusKind::update_automatic};
+        }
+        if (state->config.automatic_updates_enabled &&
+            settings_update_seamless_hit_test(point.x, point.y)) {
+            return SettingsFocusTarget{SettingsFocusKind::update_seamless};
+        }
+        if (state->config.automatic_updates_enabled &&
+            state->config.seamless_updates_enabled) {
+            const int index = settings_update_idle_choice_hit_test(
+                point.x, point.y);
+            if (index >= 0) {
+                return SettingsFocusTarget{
+                    SettingsFocusKind::update_idle, index};
+            }
+        }
     }
     return std::nullopt;
 }
@@ -4059,6 +4226,8 @@ LRESULT CALLBACK settings_proc(
                            target.kind == SettingsFocusKind::theme ||
                            target.kind == SettingsFocusKind::app_icon) {
                     count = 3;
+                } else if (target.kind == SettingsFocusKind::update_idle) {
+                    count = static_cast<int>(kUpdateIdleMinuteChoices.size());
                 }
                 if (count > 0) {
                     target.index = (target.index + delta + count) % count;

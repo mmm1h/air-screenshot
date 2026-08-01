@@ -2,6 +2,7 @@
 #include "airshot/pin_lifecycle_policy.h"
 
 #include <array>
+#include <cmath>
 #include <iostream>
 #include <vector>
 
@@ -445,6 +446,146 @@ void test_visual_effects_and_scale_policy() {
         "cancelling custom scale is a no-op while valid input is applied");
 }
 
+void test_border_resize_and_thumbnail_policy() {
+    using namespace airshot;
+
+    expect(
+        pin_resize_hit_test(1, 1, 400, 200, 8) ==
+                PinResizeEdge::top_left &&
+            pin_resize_hit_test(399, 100, 400, 200, 8) ==
+                PinResizeEdge::right &&
+            pin_resize_hit_test(200, 199, 400, 200, 8) ==
+                PinResizeEdge::bottom &&
+            pin_resize_hit_test(200, 100, 400, 200, 8) ==
+                PinResizeEdge::none,
+        "border hit testing prioritizes corners, exposes side handles, and leaves the interior draggable");
+    expect(
+        pin_resize_hit_test(0, 0, 5, 5, 20) ==
+                PinResizeEdge::top_left &&
+            pin_resize_hit_test(-1, 0, 5, 5, 2) ==
+                PinResizeEdge::none,
+        "resize hit targets stay valid on tiny windows and reject out-of-window points");
+
+    const RectI generous_work_area{-1000, -800, 2000, 1200};
+    const PinScaleLimits limits = pin_scale_limits(
+        400,
+        200,
+        {0, 0, 800, 600});
+    expect(
+        limits.valid && std::abs(limits.minimum - 0.08) < 0.0001 &&
+            std::abs(limits.maximum - 2.0) < 0.0001,
+        "interactive scale limits combine the public range with the current work area");
+    const PinScaleLimits resource_limited = pin_scale_limits(
+        100,
+        100,
+        generous_work_area,
+        100U * 100U * Bitmap::bytes_per_pixel);
+    expect(
+        resource_limited.valid &&
+            std::abs(resource_limited.maximum - 1.0) < 0.0001,
+        "interactive scaling cannot exceed the rendered-frame resource budget");
+
+    const RectI original{100, 100, 500, 300};
+    const PinResizePlan centered = plan_pin_scale_resize(
+        400,
+        200,
+        original,
+        {300, 200},
+        1.5,
+        generous_work_area);
+    expect(
+        centered.apply && centered.bounds.left == 0 &&
+            centered.bounds.top == 50 &&
+            centered.bounds.width() == 600 &&
+            centered.bounds.height() == 300 &&
+            std::abs(centered.scale - 1.5) < 0.0001,
+        "wheel and exact scaling preserve the screen anchor and source aspect ratio");
+
+    const PinResizePlan right = plan_pin_drag_resize(
+        PinResizeEdge::right,
+        400,
+        200,
+        original,
+        {700, 200},
+        generous_work_area);
+    expect(
+        right.apply && right.bounds.left == original.left &&
+            right.bounds.width() == 600 &&
+            right.bounds.height() == 300 &&
+            right.bounds.top == 50,
+        "side dragging fixes the opposite side and recentres the proportional axis");
+
+    const PinResizePlan corner = plan_pin_drag_resize(
+        PinResizeEdge::top_left,
+        400,
+        200,
+        original,
+        {-100, 0},
+        generous_work_area);
+    expect(
+        corner.apply && corner.bounds.right == original.right &&
+            corner.bounds.bottom == original.bottom &&
+            corner.bounds.width() == 600 &&
+            corner.bounds.height() == 300 &&
+            std::abs(corner.scale - 1.5) < 0.0001,
+        "corner dragging projects the pointer onto the aspect ratio and fixes the opposite corner");
+
+    const PinResizePlan capped = plan_pin_drag_resize(
+        PinResizeEdge::bottom_right,
+        400,
+        200,
+        {0, 0, 400, 200},
+        {5000, 5000},
+        {0, 0, 800, 600});
+    expect(
+        capped.apply && capped.bounds.width() == 800 &&
+            capped.bounds.height() == 400 &&
+            std::abs(capped.scale - 2.0) < 0.0001,
+        "dragging beyond the monitor clamps to the largest work-area-safe scale");
+
+    const PinThumbnailPlan enter = plan_pin_thumbnail_toggle(
+        {},
+        1.75,
+        800,
+        400,
+        192,
+        generous_work_area);
+    expect(
+        enter.apply && enter.state.active &&
+            std::abs(enter.state.restore_scale - 1.75) < 0.0001 &&
+            std::abs(enter.scale - 0.24) < 0.0001,
+        "entering fixed-thumbnail mode records the exact previous scale and targets a fixed long edge");
+    const PinThumbnailPlan leave = plan_pin_thumbnail_toggle(
+        enter.state,
+        enter.scale,
+        800,
+        400,
+        192,
+        generous_work_area);
+    expect(
+        leave.apply && !leave.state.active &&
+            std::abs(leave.scale - 1.75) < 0.0001,
+        "leaving fixed-thumbnail mode restores the pre-thumbnail scale");
+    expect(
+        std::abs(pin_fixed_thumbnail_scale(
+                     400,
+                     800,
+                     192,
+                     generous_work_area) -
+                 0.24) < 0.0001,
+        "thumbnail sizing follows the rotated source dimensions without changing its long edge");
+    expect(
+        !plan_pin_thumbnail_toggle(
+             {},
+             1.0,
+             0,
+             100,
+             192,
+             generous_work_area)
+             .apply,
+        "thumbnail planning rejects invalid sources without changing state");
+}
+
 }  // namespace
 
 int main() {
@@ -454,6 +595,7 @@ int main() {
     test_budget_transactions();
     test_state_counts_and_toggle_plan();
     test_visual_effects_and_scale_policy();
+    test_border_resize_and_thumbnail_policy();
     if (failures == 0) {
         std::cout << "All pin workflow tests passed.\n";
     }

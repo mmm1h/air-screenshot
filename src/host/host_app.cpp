@@ -64,20 +64,86 @@ constexpr UINT kMenuHideAllPins = 2011;
 constexpr UINT kMenuShowAllPins = 2012;
 constexpr UINT kMenuRepeatCapture = 2013;
 constexpr UINT kMenuShowRecentPin = 2014;
+constexpr UINT kMenuDeferUpdateRestart = 2015;
 constexpr UINT_PTR kShutdownDrainTimer = 1;
 constexpr UINT_PTR kTransientIdleTimer = 2;
 constexpr UINT_PTR kUpdateTimer = 3;
 constexpr UINT_PTR kTrayRetryTimer = 4;
+constexpr UINT_PTR kSeamlessUpdateTimer = 5;
+constexpr UINT_PTR kUpdateCleanupTimer = 6;
 
 constexpr auto kRequestTimeout = std::chrono::seconds(90);
 constexpr auto kRequestCancellationPoll = std::chrono::milliseconds(50);
 constexpr DWORD kTransientStartupTimeoutMs = 20000;
 constexpr DWORD kTransientSuccessGraceMs = 500;
 constexpr DWORD kTransientFailureTimeoutMs = 2000;
+constexpr std::int64_t kUpdateRestartDeferralSeconds = 24 * 60 * 60;
+constexpr DWORD kUpdateCleanupDelayMs = 15'000;
 std::int64_t now_unix_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+std::optional<std::uint64_t> current_user_input_idle_ms() {
+    LASTINPUTINFO input{sizeof(input)};
+    if (!GetLastInputInfo(&input)) {
+        return std::nullopt;
+    }
+    const std::uint64_t now = GetTickCount64();
+    constexpr std::uint64_t tick_epoch = 1ULL << 32;
+    std::uint64_t last = (now & ~(tick_epoch - 1)) |
+                         static_cast<std::uint64_t>(input.dwTime);
+    if (last > now) {
+        // A large apparent jump is the ordinary 32-bit tick wrap. A small
+        // future value can be produced by injected input and is not safe
+        // evidence that the user has been idle.
+        if (last - now <= tick_epoch / 2 || last < tick_epoch) {
+            return std::nullopt;
+        }
+        last -= tick_epoch;
+    }
+    return now - last;
+}
+
+bool seamless_update_interruption_allowed() {
+    QUERY_USER_NOTIFICATION_STATE state{};
+    if (FAILED(SHQueryUserNotificationState(&state))) {
+        return false;
+    }
+    switch (state) {
+        case QUNS_ACCEPTS_NOTIFICATIONS:
+        case QUNS_NOT_PRESENT:
+        case QUNS_QUIET_TIME:
+            return true;
+        case QUNS_BUSY:
+        case QUNS_RUNNING_D3D_FULL_SCREEN:
+        case QUNS_PRESENTATION_MODE:
+        case QUNS_APP:
+            return false;
+    }
+    return false;
+}
+
+DWORD bounded_timer_delay_until_unix(
+    std::int64_t target_unix,
+    std::int64_t now_unix) noexcept {
+    if (target_unix <= 0 || target_unix <= now_unix) {
+        return 1'000;
+    }
+    const std::uint64_t target =
+        static_cast<std::uint64_t>(target_unix);
+    const std::uint64_t now = now_unix > 0
+                                  ? static_cast<std::uint64_t>(now_unix)
+                                  : 0;
+    const std::uint64_t remaining_seconds = target - now;
+    constexpr std::uint64_t max_delay =
+        std::numeric_limits<DWORD>::max();
+    if (remaining_seconds >= max_delay / 1'000) {
+        return std::numeric_limits<DWORD>::max();
+    }
+    return static_cast<DWORD>(
+        std::max<std::uint64_t>(1'000, remaining_seconds * 1'000));
 }
 
 std::wstring monitor_selector(const MonitorTarget& monitor) {
@@ -354,6 +420,7 @@ bool HostApp::initialize() {
             notify(kAppName, startup_error);
         }
         schedule_update_check(kUpdateInitialDelayMs);
+        SetTimer(window_, kUpdateCleanupTimer, kUpdateCleanupDelayMs, nullptr);
     }
     return true;
 }
@@ -373,6 +440,8 @@ void HostApp::shutdown() {
         KillTimer(window_, kTransientIdleTimer);
         KillTimer(window_, kUpdateTimer);
         KillTimer(window_, kTrayRetryTimer);
+        KillTimer(window_, kSeamlessUpdateTimer);
+        KillTimer(window_, kUpdateCleanupTimer);
     }
     reject_pending_requests();
 
@@ -408,6 +477,7 @@ void HostApp::shutdown() {
         update_completion_.reset();
     }
     if (update_activation_thread_.joinable()) {
+        update_activation_thread_.request_stop();
         update_activation_thread_.join();
     }
     update_activation_running_.store(false, std::memory_order_release);
@@ -434,6 +504,8 @@ void HostApp::request_shutdown() {
         KillTimer(window_, kTransientIdleTimer);
         KillTimer(window_, kUpdateTimer);
         KillTimer(window_, kTrayRetryTimer);
+        KillTimer(window_, kSeamlessUpdateTimer);
+        KillTimer(window_, kUpdateCleanupTimer);
         SetTimer(window_, kShutdownDrainTimer, 50, nullptr);
     }
     unregister_hotkeys();
@@ -442,6 +514,9 @@ void HostApp::request_shutdown() {
 
     if (update_thread_.joinable()) {
         update_thread_.request_stop();
+    }
+    if (update_activation_thread_.joinable()) {
+        update_activation_thread_.request_stop();
     }
     if (capture_session_) {
         capture_session_->cancel();
@@ -637,6 +712,7 @@ void HostApp::promote_to_persistent() {
         notify(kAppName, startup_error);
     }
     schedule_update_check(kUpdateInitialDelayMs);
+    SetTimer(window_, kUpdateCleanupTimer, kUpdateCleanupDelayMs, nullptr);
 }
 
 void HostApp::apply_shell(bool hotkeys_already_registered) {
@@ -1082,7 +1158,20 @@ void HostApp::show_tray_menu() {
             (mode_ == UiMode::idle ? 0U : MF_GRAYED) |
             (config_.automatic_updates_enabled ? MF_CHECKED : MF_UNCHECKED),
         kMenuAutomaticUpdates,
-        L"自动检查并下载更新");
+        config_.seamless_updates_enabled
+            ? L"自动更新（空闲时完成）"
+            : L"自动检查并下载更新");
+    if (update_ready_ && config_.automatic_updates_enabled &&
+        config_.seamless_updates_enabled) {
+        const bool deferred =
+            config_.update_restart_deferred_until_unix > now_unix_seconds();
+        AppendMenuW(
+            menu,
+            MF_STRING | (mode_ == UiMode::idle ? 0U : MF_GRAYED),
+            kMenuDeferUpdateRestart,
+            deferred ? L"恢复空闲自动更新"
+                     : L"暂缓自动重启 24 小时");
+    }
     AppendMenuW(menu, MF_STRING, kMenuAbout, L"关于");
     if (!pin_windows_.empty()) {
         std::vector<PinStateView> pin_states;
@@ -1213,10 +1302,17 @@ bool HostApp::show_settings() {
                 config_.last_update_check_unix;
             next.warned_update_target =
                 config_.warned_update_target;
+            next.update_restart_deferred_until_unix =
+                config_.update_restart_deferred_until_unix;
             const AppConfig previous = config_;
             const bool automatic_updates_changed =
                 previous.automatic_updates_enabled !=
                 next.automatic_updates_enabled;
+            const bool seamless_update_policy_changed =
+                previous.seamless_updates_enabled !=
+                    next.seamless_updates_enabled ||
+                previous.automatic_update_idle_minutes !=
+                    next.automatic_update_idle_minutes;
 
             const auto restore_previous_hotkeys =
                 [this, &previous](std::wstring* restore_error) {
@@ -1290,6 +1386,10 @@ bool HostApp::show_settings() {
             if (automatic_updates_changed) {
                 static_cast<void>(apply_automatic_update_preference(
                     previous.automatic_updates_enabled));
+            }
+            if (seamless_update_policy_changed) {
+                schedule_seamless_update_activation(
+                    kUpdateActivationProbeMs);
             }
             return true;
         });
@@ -1517,6 +1617,94 @@ void HostApp::schedule_update_check(DWORD fallback_delay_ms) {
     SetTimer(window_, kUpdateTimer, delay, nullptr);
 }
 
+void HostApp::schedule_seamless_update_activation(DWORD delay_ms) {
+    if (!window_ || transient_.load(std::memory_order_acquire)) {
+        return;
+    }
+    KillTimer(window_, kSeamlessUpdateTimer);
+    if (!update_ready_ || !config_.automatic_updates_enabled ||
+        !config_.seamless_updates_enabled ||
+        system_session_ending_.load(std::memory_order_acquire) ||
+        mode_ == UiMode::shutting_down) {
+        return;
+    }
+
+    DWORD delay = std::max<DWORD>(1'000, delay_ms);
+    const std::int64_t now = now_unix_seconds();
+    if (config_.update_restart_deferred_until_unix > now) {
+        delay = bounded_timer_delay_until_unix(
+            config_.update_restart_deferred_until_unix, now);
+    }
+    SetTimer(window_, kSeamlessUpdateTimer, delay, nullptr);
+}
+
+void HostApp::maybe_activate_seamless_update() {
+    if (window_) {
+        KillTimer(window_, kSeamlessUpdateTimer);
+    }
+    if (!update_ready_ || !config_.automatic_updates_enabled ||
+        !config_.seamless_updates_enabled ||
+        system_session_ending_.load(std::memory_order_acquire) ||
+        mode_ == UiMode::shutting_down) {
+        return;
+    }
+
+    const std::int64_t now = now_unix_seconds();
+    const ULONGLONG current_tick = GetTickCount64();
+    const std::uint64_t staged_elapsed_ms =
+        update_ready_since_tick_ != 0 && current_tick >= update_ready_since_tick_
+            ? current_tick - update_ready_since_tick_
+            : 0;
+    const std::optional<std::uint64_t> user_idle =
+        current_user_input_idle_ms();
+    const bool app_idle = can_restart_for_update();
+    const bool interruption_allowed =
+        seamless_update_interruption_allowed();
+
+    const SeamlessUpdateActivationContext activation_context{
+        update_ready_,
+        config_.automatic_updates_enabled,
+        config_.seamless_updates_enabled,
+        app_idle,
+        interruption_allowed,
+        config_.update_restart_deferred_until_unix,
+        now,
+        staged_elapsed_ms,
+        user_idle.value_or(0),
+        config_.automatic_update_idle_minutes,
+    };
+    if (user_idle &&
+        seamless_update_activation_allowed(activation_context)) {
+        activate_pending_update(false);
+        return;
+    }
+
+    DWORD delay = kUpdateActivationProbeMs;
+    if (config_.update_restart_deferred_until_unix > now) {
+        delay = bounded_timer_delay_until_unix(
+            config_.update_restart_deferred_until_unix, now);
+    } else if (staged_elapsed_ms < kUpdateStagedSettleMs) {
+        delay = static_cast<DWORD>(std::max<std::uint64_t>(
+            1'000,
+            kUpdateStagedSettleMs - staged_elapsed_ms));
+    } else if (user_idle) {
+        const std::uint64_t required_idle_ms =
+            static_cast<std::uint64_t>(std::clamp(
+                config_.automatic_update_idle_minutes,
+                kUpdateMinIdleMinutes,
+                kUpdateMaxIdleMinutes)) *
+            60'000ULL;
+        if (*user_idle < required_idle_ms) {
+            delay = static_cast<DWORD>(std::max<std::uint64_t>(
+                1'000,
+                std::min<std::uint64_t>(
+                    kUpdateActivationProbeMs,
+                    required_idle_ms - *user_idle)));
+        }
+    }
+    schedule_seamless_update_activation(delay);
+}
+
 bool HostApp::apply_automatic_update_preference(
     bool previous_enabled) {
     const AutomaticUpdateRuntimeAction action =
@@ -1529,16 +1717,21 @@ bool HostApp::apply_automatic_update_preference(
         case AutomaticUpdateRuntimeAction::none:
             return false;
         case AutomaticUpdateRuntimeAction::schedule:
+            consecutive_update_failures_ = 0;
+            consecutive_update_activation_failures_ = 0;
             schedule_update_check(kUpdateInitialDelayMs);
+            schedule_seamless_update_activation(kUpdateActivationProbeMs);
             return false;
         case AutomaticUpdateRuntimeAction::disable:
             if (window_) {
                 KillTimer(window_, kUpdateTimer);
+                KillTimer(window_, kSeamlessUpdateTimer);
             }
             return false;
         case AutomaticUpdateRuntimeAction::disable_and_cancel:
             if (window_) {
                 KillTimer(window_, kUpdateTimer);
+                KillTimer(window_, kSeamlessUpdateTimer);
             }
             if (update_thread_.joinable()) {
                 update_thread_.request_stop();
@@ -1579,7 +1772,9 @@ void HostApp::toggle_automatic_updates() {
     if (config_.automatic_updates_enabled) {
         notify(
             L"自动更新已开启",
-            L"Air Screenshot 将每天静默检查并下载经过验证的更新。");
+            config_.seamless_updates_enabled
+                ? L"Air Screenshot 会静默下载更新，并在电脑和截图工具都空闲时快速重启完成更新。"
+                : L"Air Screenshot 将每天静默检查并下载经过验证的更新。");
     } else {
         notify(
             L"自动更新已关闭",
@@ -1587,6 +1782,29 @@ void HostApp::toggle_automatic_updates() {
                 ? L"正在停止后台自动下载；自动暂存的版本也会暂停安装，仍可手动检查更新。"
                 : L"自动暂存的版本会暂停安装；仍可从托盘菜单手动检查更新。");
     }
+}
+
+void HostApp::toggle_update_restart_deferral() {
+    if (!update_ready_ || !config_.automatic_updates_enabled ||
+        !config_.seamless_updates_enabled) {
+        return;
+    }
+
+    const std::int64_t now = now_unix_seconds();
+    const bool was_deferred =
+        config_.update_restart_deferred_until_unix > now;
+    AppConfig next = config_;
+    next.update_restart_deferred_until_unix =
+        was_deferred ? 0 : now + kUpdateRestartDeferralSeconds;
+    if (!persist_update_config(std::move(next), true)) {
+        return;
+    }
+    schedule_seamless_update_activation(kUpdateActivationProbeMs);
+    notify(
+        was_deferred ? L"已恢复空闲自动更新" : L"已暂缓自动重启",
+        was_deferred
+            ? L"满足空闲条件后会自动完成已下载的更新。"
+            : L"未来 24 小时不会自动重启；退出或下次启动时仍可无打扰完成更新。");
 }
 
 void HostApp::check_for_updates(bool user_triggered) {
@@ -1701,7 +1919,8 @@ void HostApp::check_for_updates(bool user_triggered) {
 
 bool HostApp::can_restart_for_update() {
     prune_closed_pin_windows();
-    if (update_activation_running_.load(std::memory_order_acquire) ||
+    if (system_session_ending_.load(std::memory_order_acquire) ||
+        update_activation_running_.load(std::memory_order_acquire) ||
         mode_ != UiMode::idle || capture_session_ ||
         capture_completion_ ||
         (settings_window_ && IsWindow(settings_window_)) ||
@@ -1715,42 +1934,53 @@ bool HostApp::can_restart_for_update() {
     return pending_requests_.empty() && dispatch_queue_.empty();
 }
 
-void HostApp::activate_pending_update() {
-    std::wstring intent_error;
-    switch (mark_pending_update_manual(&intent_error)) {
-        case PendingUpdateManualResult::ready:
-            break;
-        case PendingUpdateManualResult::missing:
-            update_ready_ = false;
+void HostApp::activate_pending_update(bool user_triggered) {
+    if (system_session_ending_.load(std::memory_order_acquire)) {
+        if (user_triggered) {
             notify(
-                L"待安装版本已不存在",
-                L"请重新检查更新。");
-            return;
-        case PendingUpdateManualResult::invalid:
-            update_ready_ = false;
-            notify(
-                L"待安装版本已失效",
-                intent_error.empty()
-                    ? L"请重新检查更新。"
-                    : intent_error);
-            return;
-        case PendingUpdateManualResult::busy:
-            notify(
-                L"更新操作正在进行",
-                L"手动更新入口已保留，请稍后重试。");
-            return;
-        case PendingUpdateManualResult::failed:
-            notify(
-                L"无法确认手动更新",
-                intent_error.empty()
-                    ? L"手动更新入口已保留，请稍后重试。"
-                    : intent_error + L" 请稍后重试。");
-            return;
+                L"更新将在稍后安装",
+                L"Windows 正在注销或关机，更新已安全保留到下次启动。");
+        }
+        return;
+    }
+    if (user_triggered) {
+        std::wstring intent_error;
+        switch (mark_pending_update_manual(&intent_error)) {
+            case PendingUpdateManualResult::ready:
+                break;
+            case PendingUpdateManualResult::missing:
+                update_ready_ = false;
+                notify(L"待安装版本已不存在", L"请重新检查更新。");
+                return;
+            case PendingUpdateManualResult::invalid:
+                update_ready_ = false;
+                notify(
+                    L"待安装版本已失效",
+                    intent_error.empty() ? L"请重新检查更新。"
+                                         : intent_error);
+                return;
+            case PendingUpdateManualResult::busy:
+                notify(
+                    L"更新操作正在进行",
+                    L"手动更新入口已保留，请稍后重试。");
+                return;
+            case PendingUpdateManualResult::failed:
+                notify(
+                    L"无法确认手动更新",
+                    intent_error.empty()
+                        ? L"手动更新入口已保留，请稍后重试。"
+                        : intent_error + L" 请稍后重试。");
+                return;
+        }
     }
     if (!can_restart_for_update()) {
-        notify(
-            L"更新将在稍后安装",
-            L"请先完成截图、设置、贴图或其他进行中的操作；也可直接退出，更新会在退出时应用。");
+        if (user_triggered) {
+            notify(
+                L"更新将在稍后安装",
+                L"请先完成截图、设置、贴图或其他进行中的操作；也可直接退出，更新会在退出时应用。");
+        } else {
+            schedule_seamless_update_activation(kUpdateActivationProbeMs);
+        }
         return;
     }
 
@@ -1762,42 +1992,101 @@ void HostApp::activate_pending_update() {
         return;
     }
     mode_ = UiMode::update_activation;
+    // Close the admission gate before launching the helper. The pipe remains
+    // alive so a failed helper launch can restore service without rebuilding
+    // the listener, while racing clients receive a fast retryable response.
+    accepting_requests_.store(false, std::memory_order_release);
 
     if (update_activation_thread_.joinable()) {
         update_activation_thread_.join();
     }
     const HWND owner = window_;
     try {
-        update_activation_thread_ = std::jthread([this, owner] {
-            UpdateActivationCompletion completion;
-            if (launch_pending_update(true, &completion.message)) {
-                completion.result = UpdateActivationResult::launched;
-            } else if (completion.message.empty()) {
-                completion.result = UpdateActivationResult::unavailable;
-            } else {
-                completion.result = UpdateActivationResult::failed;
-            }
-            {
-                std::lock_guard lock(update_activation_mutex_);
-                update_activation_completion_.emplace(std::move(completion));
-            }
-            if (!PostMessageW(owner, kUpdateActivationCompleted, 0, 0)) {
-                std::lock_guard lock(update_activation_mutex_);
-                update_activation_completion_.reset();
-                update_activation_running_.store(false, std::memory_order_release);
-            }
-        });
+        update_activation_thread_ =
+            std::jthread([this, owner, user_triggered](
+                             std::stop_token stop_token) {
+                UpdateActivationCompletion completion;
+                completion.user_triggered = user_triggered;
+                const ULONGLONG drain_deadline = GetTickCount64() + 5'000;
+                bool drained = false;
+                while (!stop_token.stop_requested() &&
+                       !system_session_ending_.load(
+                           std::memory_order_acquire) &&
+                       GetTickCount64() < drain_deadline) {
+                    bool requests_drained = false;
+                    {
+                        std::lock_guard lock(request_mutex_);
+                        requests_drained = pending_requests_.empty() &&
+                                           dispatch_queue_.empty();
+                    }
+                    if (requests_drained &&
+                        pipe_server_.active_clients() == 0 &&
+                        responses_in_flight_.load(
+                            std::memory_order_acquire) == 0) {
+                        drained = true;
+                        break;
+                    }
+                    Sleep(25);
+                }
+                if (stop_token.stop_requested() ||
+                    system_session_ending_.load(
+                        std::memory_order_acquire)) {
+                    completion.result = UpdateActivationResult::canceled;
+                    completion.message = L"更新应用已取消，更新文件已保留。";
+                } else if (!drained) {
+                    completion.result = UpdateActivationResult::failed;
+                    completion.message =
+                        L"仍有请求正在完成，已保留更新并稍后重试。";
+                } else if (launch_pending_update(
+                               true,
+                               true,
+                               &completion.message,
+                               stop_token)) {
+                    completion.result = UpdateActivationResult::launched;
+                    update_helper_launched_.store(
+                        true, std::memory_order_release);
+                } else if (stop_token.stop_requested() ||
+                           system_session_ending_.load(
+                               std::memory_order_acquire)) {
+                    completion.result = UpdateActivationResult::canceled;
+                } else if (completion.message.empty()) {
+                    completion.result = UpdateActivationResult::unavailable;
+                } else {
+                    completion.result = UpdateActivationResult::failed;
+                }
+                {
+                    std::lock_guard lock(update_activation_mutex_);
+                    update_activation_completion_.emplace(
+                        std::move(completion));
+                }
+                if (!PostMessageW(
+                        owner, kUpdateActivationCompleted, 0, 0)) {
+                    std::lock_guard lock(update_activation_mutex_);
+                    update_activation_completion_.reset();
+                    update_activation_running_.store(
+                        false, std::memory_order_release);
+                }
+            });
     } catch (const std::exception&) {
         update_activation_running_.store(false, std::memory_order_release);
         mode_ = UiMode::idle;
-        notify(
-            L"无法启动更新",
-            L"无法创建后台更新应用任务，请稍后重试。");
+        accepting_requests_.store(true, std::memory_order_release);
+        if (user_triggered) {
+            notify(
+                L"无法启动更新",
+                L"无法创建后台更新应用任务，请稍后重试。");
+        } else {
+            schedule_seamless_update_activation(
+                automatic_update_retry_delay_ms(
+                    ++consecutive_update_activation_failures_));
+        }
         return;
     }
-    notify(
-        L"正在准备更新",
-        L"Air Screenshot 正在后台启动已验证的更新，界面仍可正常响应。");
+    if (user_triggered) {
+        notify(
+            L"正在准备更新",
+            L"Air Screenshot 正在后台启动已验证的更新，界面仍可正常响应。");
+    }
 }
 
 std::wstring HostApp::handle_pipe_request(
@@ -2330,14 +2619,23 @@ void HostApp::handle_update_completion() {
     }
 
     if (completion->result != UpdateStageResult::failed) {
+        consecutive_update_failures_ = 0;
         AppConfig next = config_;
         next.warned_update_target.clear();
         next.last_update_check_unix = now_unix_seconds();
+        if (next.update_restart_deferred_until_unix <=
+            next.last_update_check_unix) {
+            next.update_restart_deferred_until_unix = 0;
+        }
         (void)persist_update_config(std::move(next), false);
     }
 
     if (completion->result == UpdateStageResult::failed) {
-        schedule_update_check(kUpdateRetryDelayMs);
+        if (!completion->user_triggered) {
+            ++consecutive_update_failures_;
+        }
+        schedule_update_check(automatic_update_retry_delay_ms(
+            std::max<std::uint32_t>(1, consecutive_update_failures_)));
     } else {
         schedule_update_check(
             static_cast<DWORD>(kUpdateIntervalSeconds * 1'000));
@@ -2346,20 +2644,33 @@ void HostApp::handle_update_completion() {
     switch (completion->result) {
         case UpdateStageResult::staged:
             update_ready_ = true;
+            update_ready_since_tick_ = GetTickCount64();
+            consecutive_update_activation_failures_ = 0;
             if (!completion->user_triggered &&
                 !config_.automatic_updates_enabled) {
                 notify(
                     L"更新已下载但自动安装已暂停",
                     L"可从托盘菜单选择“立即重启并更新”，或重新开启自动更新。");
-            } else {
+            } else if (completion->user_triggered) {
                 notify(
                     L"更新已准备好",
-                    completion->user_triggered
-                        ? L"可从托盘菜单选择“立即重启并更新”；继续使用时，更新会在退出或下次启动时安装。"
-                        : L"新版本已通过校验，将在退出或下次启动时安装。");
+                    config_.automatic_updates_enabled &&
+                            config_.seamless_updates_enabled
+                        ? L"可立即重启更新；若继续使用，空闲后会自动完成。"
+                        : L"可从托盘菜单立即更新；退出或下次启动时也会安装。");
+            } else if (!config_.seamless_updates_enabled) {
+                notify(
+                    L"更新已准备好",
+                    L"新版本已通过校验，将在退出或下次启动时安装。");
             }
+            schedule_seamless_update_activation(kUpdateActivationProbeMs);
             break;
         case UpdateStageResult::up_to_date:
+            update_ready_ = false;
+            update_ready_since_tick_ = 0;
+            if (window_) {
+                KillTimer(window_, kSeamlessUpdateTimer);
+            }
             if (completion->user_triggered) {
                 notify(
                     L"Air Screenshot 已是最新版本",
@@ -2398,7 +2709,8 @@ void HostApp::handle_update_activation_completion() {
     if (mode_ == UiMode::shutting_down) {
         if (completion->result == UpdateActivationResult::launched) {
             update_ready_ = false;
-            update_helper_launched_ = true;
+            update_helper_launched_.store(
+                true, std::memory_order_release);
         }
         maybe_finish_shutdown();
         return;
@@ -2409,21 +2721,52 @@ void HostApp::handle_update_activation_completion() {
     }
 
     switch (completion->result) {
+        case UpdateActivationResult::canceled:
+            accepting_requests_.store(true, std::memory_order_release);
+            if (!system_session_ending_.load(
+                    std::memory_order_acquire)) {
+                schedule_seamless_update_activation(
+                    kUpdateActivationProbeMs);
+            }
+            break;
         case UpdateActivationResult::launched:
             update_ready_ = false;
-            update_helper_launched_ = true;
+            update_ready_since_tick_ = 0;
+            update_helper_launched_.store(
+                true, std::memory_order_release);
+            consecutive_update_activation_failures_ = 0;
+            if (config_.update_restart_deferred_until_unix != 0) {
+                AppConfig next = config_;
+                next.update_restart_deferred_until_unix = 0;
+                (void)persist_update_config(std::move(next), false);
+            }
             request_shutdown();
             break;
         case UpdateActivationResult::unavailable:
+            accepting_requests_.store(true, std::memory_order_release);
             update_ready_ = false;
-            check_for_updates(true);
+            update_ready_since_tick_ = 0;
+            if (completion->user_triggered) {
+                check_for_updates(true);
+            } else {
+                schedule_update_check(kUpdateInitialDelayMs);
+            }
             break;
         case UpdateActivationResult::failed:
-            notify(
-                L"无法启动更新",
-                completion->message.empty()
-                    ? L"已验证的更新暂时无法启动。"
-                    : completion->message);
+            accepting_requests_.store(true, std::memory_order_release);
+            if (completion->user_triggered) {
+                notify(
+                    L"无法启动更新",
+                    completion->message.empty()
+                        ? L"已验证的更新暂时无法启动。"
+                        : completion->message);
+            } else {
+                ++consecutive_update_activation_failures_;
+            }
+            schedule_seamless_update_activation(
+                automatic_update_retry_delay_ms(
+                    std::max<std::uint32_t>(
+                        1, consecutive_update_activation_failures_)));
             break;
     }
 }
@@ -2936,6 +3279,11 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
                     SetForegroundWindow(settings_window_);
                 }
                 break;
+            case kMenuDeferUpdateRestart:
+                if (mode_ == UiMode::idle) {
+                    toggle_update_restart_deferral();
+                }
+                break;
             case kMenuAbout: (void)show_about(); break;
             case kMenuCloseAllPins: {
                 prune_closed_pin_windows();
@@ -3011,6 +3359,15 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
         check_for_updates(false);
         return 0;
     }
+    if (message == WM_TIMER && w_param == kSeamlessUpdateTimer) {
+        maybe_activate_seamless_update();
+        return 0;
+    }
+    if (message == WM_TIMER && w_param == kUpdateCleanupTimer) {
+        KillTimer(window_, kUpdateCleanupTimer);
+        cleanup_stale_updates();
+        return 0;
+    }
     if (message == WM_TIMER && w_param == kTrayRetryTimer) {
         KillTimer(window_, kTrayRetryTimer);
         if (!tray_added_ && config_.shell_enabled &&
@@ -3020,11 +3377,38 @@ LRESULT HostApp::handle_message(UINT message, WPARAM w_param, LPARAM l_param) {
         return 0;
     }
     if (message == WM_QUERYENDSESSION) {
+        system_session_ending_.store(true, std::memory_order_release);
+        if (window_) {
+            KillTimer(window_, kSeamlessUpdateTimer);
+        }
+        if (update_activation_thread_.joinable()) {
+            update_activation_thread_.request_stop();
+        }
         return TRUE;
     }
-    if (message == WM_ENDSESSION && w_param != FALSE) {
-        request_shutdown();
+    if (message == WM_ENDSESSION) {
+        if (w_param != FALSE) {
+            system_session_ending_.store(true, std::memory_order_release);
+            if (update_activation_thread_.joinable()) {
+                update_activation_thread_.request_stop();
+            }
+            request_shutdown();
+        } else {
+            system_session_ending_.store(false, std::memory_order_release);
+            if (mode_ != UiMode::shutting_down &&
+                !update_activation_running_.load(
+                    std::memory_order_acquire)) {
+                schedule_seamless_update_activation(
+                    kUpdateActivationProbeMs);
+            }
+        }
         return 0;
+    }
+    if (message == WM_POWERBROADCAST &&
+        w_param == PBT_APMRESUMEAUTOMATIC) {
+        schedule_update_check(60'000);
+        schedule_seamless_update_activation(10'000);
+        return TRUE;
     }
     if (message == WM_CLOSE) {
         request_shutdown();

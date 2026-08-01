@@ -1947,7 +1947,8 @@ void OverlayWindow::paint() {
     }
 
     // Draw high-precision pixel magnifier
-    if (!session_.selection_complete() || session_.dragging_selection()) {
+    if (session_.magnifier_visible() &&
+        (!session_.selection_complete() || session_.dragging_selection())) {
         POINT cursor_pos = session_.cursor_pos();
         if (monitor_.bounds.contains(cursor_pos)) {
             int cx = cursor_pos.x - monitor_.bounds.left;
@@ -2293,12 +2294,12 @@ void OverlayWindow::paint() {
                 }
                 if (id == L"line") {
                     return std::format(
-                        L"直线 ({}) · Shift 吸附 45°",
+                        L"直线 ({}) · Tab 切箭头 · Shift 吸附 45°",
                         config.tool_shortcut_line);
                 }
                 if (id == L"arrow") {
                     return std::format(
-                        L"箭头 ({}) · Shift 吸附 45°",
+                        L"箭头 ({}) · Tab 切直线 · Shift 吸附 45°",
                         config.tool_shortcut_arrow);
                 }
                 if (id == L"pen") {
@@ -2376,8 +2377,8 @@ void OverlayWindow::paint() {
                 if (id == L"watermark_opacity_slider") return L"水印浓度";
                 if (id == L"width_small") {
                     return session_.active_tool() == Tool::eraser
-                               ? L"小号橡皮 · 半径 6 像素"
-                               : L"细线 · 2 像素";
+                               ? L"小号橡皮 · 半径 6 像素 · 1/[ 减小，2/] 增大"
+                               : L"细线 · 2 像素 · 1/[ 减小，2/] 增大";
                 }
                 if (id == L"width_medium") {
                     return session_.active_tool() == Tool::eraser
@@ -2676,6 +2677,13 @@ LRESULT CALLBACK OverlayWindow::window_proc(HWND window, UINT message, WPARAM w_
             return 0;
         }
     }
+    if (message == WM_KEYUP || message == WM_SYSKEYUP) {
+        self->session_.on_key_up(w_param);
+        return 0;
+    }
+    if (message == WM_KILLFOCUS) {
+        self->session_.on_key_up(0);
+    }
     if (message == WM_MOUSEWHEEL) {
         short delta = GET_WHEEL_DELTA_WPARAM(w_param);
         self->session_.on_mouse_wheel(delta);
@@ -2721,7 +2729,24 @@ LRESULT CALLBACK OverlayWindow::window_proc(HWND window, UINT message, WPARAM w_
                 cursor = LoadCursorW(nullptr, IDC_SIZEWE);
                 break;
             case DragMode::annotate:
-                cursor = LoadCursorW(nullptr, self->session_.active_tool() == Tool::text ? IDC_IBEAM : IDC_CROSS);
+                if (self->session_.active_tool() == Tool::select) {
+                    const RectI selection = self->session_.selection();
+                    const POINT relative{
+                        point.x - selection.left,
+                        point.y - selection.top,
+                    };
+                    cursor = LoadCursorW(
+                        nullptr,
+                        self->session_.hit_test_annotation(relative)
+                            ? IDC_SIZEALL
+                            : IDC_ARROW);
+                } else {
+                    cursor = LoadCursorW(
+                        nullptr,
+                        self->session_.active_tool() == Tool::text
+                            ? IDC_IBEAM
+                            : IDC_CROSS);
+                }
                 break;
             default:
                 cursor = LoadCursorW(nullptr, IDC_CROSS);

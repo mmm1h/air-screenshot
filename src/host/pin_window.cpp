@@ -521,7 +521,7 @@ void PinWindow::register_class(HINSTANCE instance) {
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         wc.hbrBackground = nullptr; // We draw the entire area
         wc.lpszClassName = L"AirScreenshot.Pin";
-        wc.style = CS_DROPSHADOW;
+        wc.style = CS_DROPSHADOW | CS_DBLCLKS;
         RegisterClassExW(&wc);
     });
 }
@@ -808,20 +808,91 @@ bool PinWindow::replace_bitmap(Bitmap bitmap) {
     }
     const bool replacement_has_transparency =
         summarize_pin_bitmap_alpha(bitmap).has_transparency;
+
+    RECT native_window{};
+    RectI current_bounds{};
+    std::optional<PinResizePlan> resize_plan;
+    if (hwnd_ && IsWindow(hwnd_)) {
+        const auto work_area = current_work_area();
+        if (!work_area || !GetWindowRect(hwnd_, &native_window)) {
+            DeleteObject(replacement);
+            return false;
+        }
+        current_bounds = RectI::from_native(native_window);
+        const POINT center{
+            current_bounds.left + current_bounds.width() / 2,
+            current_bounds.top + current_bounds.height() / 2,
+        };
+        double target_scale = state_.presentation.scale;
+        if (thumbnail_state_.active) {
+            const UINT dpi = GetDpiForWindow(hwnd_);
+            target_scale = pin_fixed_thumbnail_scale(
+                bitmap.width,
+                bitmap.height,
+                scale_for_dpi(
+                    kPinThumbnailLongEdgeDip,
+                    dpi == 0 ? 96U : dpi),
+                *work_area);
+        }
+        const PinResizePlan plan = plan_pin_scale_resize(
+            bitmap.width,
+            bitmap.height,
+            current_bounds,
+            center,
+            target_scale,
+            *work_area);
+        if (!plan.apply) {
+            DeleteObject(replacement);
+            return false;
+        }
+        resize_plan = plan;
+    }
+
     Bitmap previous_bitmap = std::move(bitmap_);
     HBITMAP previous_native_bitmap = hbitmap_;
     const bool previous_has_transparency = source_has_transparency_;
+    const double previous_scale = state_.presentation.scale;
     bitmap_ = std::move(bitmap);
     hbitmap_ = replacement;
     source_has_transparency_ = replacement_has_transparency;
-    if (hwnd_ && IsWindow(hwnd_) &&
-        !refresh_window_presentation()) {
+
+    bool committed = true;
+    if (resize_plan) {
+        const RectI& bounds = resize_plan->bounds;
+        committed = SetWindowPos(
+                        hwnd_,
+                        nullptr,
+                        bounds.left,
+                        bounds.top,
+                        bounds.width(),
+                        bounds.height(),
+                        SWP_NOZORDER | SWP_NOACTIVATE) != FALSE;
+        if (committed) {
+            committed = refresh_window_presentation();
+        }
+    }
+    if (!committed) {
         bitmap_ = std::move(previous_bitmap);
         hbitmap_ = previous_native_bitmap;
         source_has_transparency_ = previous_has_transparency;
+        state_.presentation.scale = previous_scale;
         DeleteObject(replacement);
+        if (current_bounds.width() > 0 && current_bounds.height() > 0) {
+            (void)SetWindowPos(
+                hwnd_,
+                nullptr,
+                current_bounds.left,
+                current_bounds.top,
+                current_bounds.width(),
+                current_bounds.height(),
+                SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         (void)refresh_window_presentation();
         return false;
+    }
+    if (resize_plan) {
+        state_.presentation.scale = resize_plan->scale;
+        ensure_visible();
     }
     if (previous_native_bitmap) {
         DeleteObject(previous_native_bitmap);
@@ -1103,6 +1174,24 @@ void PinWindow::notify_click_through_enabled() const noexcept {
     }
 }
 
+std::optional<RectI> PinWindow::current_work_area() const noexcept {
+    if (!hwnd_ || !IsWindow(hwnd_)) {
+        return std::nullopt;
+    }
+    RECT window_rect{};
+    if (!GetWindowRect(hwnd_, &window_rect)) {
+        return std::nullopt;
+    }
+    const HMONITOR monitor = MonitorFromRect(
+        &window_rect,
+        MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{sizeof(info)};
+    if (!monitor || !GetMonitorInfoW(monitor, &info)) {
+        return std::nullopt;
+    }
+    return RectI::from_native(info.rcWork);
+}
+
 void PinWindow::ensure_visible() noexcept {
     if (!hwnd_ || !IsWindow(hwnd_)) {
         return;
@@ -1139,70 +1228,25 @@ void PinWindow::ensure_visible() noexcept {
     }
 }
 
-bool PinWindow::resize_to_scale(
-    double scale,
-    POINT anchor_screen) noexcept {
-    if (!hwnd_ || !IsWindow(hwnd_) ||
-        !std::isfinite(scale)) {
+bool PinWindow::apply_resize_plan(
+    const PinResizePlan& plan,
+    bool preserve_thumbnail_mode) noexcept {
+    if (!plan.apply || !hwnd_ || !IsWindow(hwnd_) ||
+        plan.bounds.width() <= 0 || plan.bounds.height() <= 0 ||
+        !std::isfinite(plan.scale) || plan.scale <= 0.0) {
         return false;
     }
-    const double candidate_scale =
-        std::clamp(scale, 0.02, 20.0);
-    const auto candidate_size = scaled_size(candidate_scale);
     RECT window_rect{};
-    if (!candidate_size ||
-        !GetWindowRect(hwnd_, &window_rect)) {
+    if (!GetWindowRect(hwnd_, &window_rect)) {
         return false;
     }
-
-    const int current_width =
-        window_rect.right - window_rect.left;
-    const int current_height =
-        window_rect.bottom - window_rect.top;
-    const double ratio_x =
-        current_width > 0
-            ? std::clamp(
-                  static_cast<double>(
-                      anchor_screen.x - window_rect.left) /
-                      current_width,
-                  0.0,
-                  1.0)
-            : 0.5;
-    const double ratio_y =
-        current_height > 0
-            ? std::clamp(
-                  static_cast<double>(
-                      anchor_screen.y - window_rect.top) /
-                      current_height,
-                  0.0,
-                  1.0)
-            : 0.5;
-
-    const long long new_left =
-        static_cast<long long>(anchor_screen.x) -
-        static_cast<long long>(
-            std::llround(ratio_x * candidate_size->cx));
-    const long long new_top =
-        static_cast<long long>(anchor_screen.y) -
-        static_cast<long long>(
-            std::llround(ratio_y * candidate_size->cy));
-    const int clamped_left = static_cast<int>(
-        std::clamp<long long>(
-            new_left,
-            std::numeric_limits<int>::min(),
-            std::numeric_limits<int>::max()));
-    const int clamped_top = static_cast<int>(
-        std::clamp<long long>(
-            new_top,
-            std::numeric_limits<int>::min(),
-            std::numeric_limits<int>::max()));
     if (!SetWindowPos(
             hwnd_,
             nullptr,
-            clamped_left,
-            clamped_top,
-            candidate_size->cx,
-            candidate_size->cy,
+            plan.bounds.left,
+            plan.bounds.top,
+            plan.bounds.width(),
+            plan.bounds.height(),
             SWP_NOZORDER | SWP_NOACTIVATE)) {
         return false;
     }
@@ -1212,15 +1256,157 @@ bool PinWindow::resize_to_scale(
             nullptr,
             window_rect.left,
             window_rect.top,
-            current_width,
-            current_height,
+            window_rect.right - window_rect.left,
+            window_rect.bottom - window_rect.top,
             SWP_NOZORDER | SWP_NOACTIVATE);
         (void)refresh_window_presentation();
         return false;
     }
-    state_.presentation.scale = candidate_scale;
+    state_.presentation.scale = plan.scale;
+    if (!preserve_thumbnail_mode) {
+        thumbnail_state_ = {};
+    }
     ensure_visible();
     return true;
+}
+
+bool PinWindow::resize_to_scale(
+    double scale,
+    POINT anchor_screen,
+    bool preserve_thumbnail_mode) noexcept {
+    if (!hwnd_ || !IsWindow(hwnd_) || !bitmap_.valid()) {
+        return false;
+    }
+    RECT native_window{};
+    const auto work_area = current_work_area();
+    if (!work_area || !GetWindowRect(hwnd_, &native_window)) {
+        return false;
+    }
+    const PinResizePlan plan = plan_pin_scale_resize(
+        bitmap_.width,
+        bitmap_.height,
+        RectI::from_native(native_window),
+        anchor_screen,
+        scale,
+        *work_area);
+    return apply_resize_plan(plan, preserve_thumbnail_mode);
+}
+
+PinResizeEdge PinWindow::resize_edge_at(
+    POINT screen_point) const noexcept {
+    if (!hwnd_ || !IsWindow(hwnd_)) {
+        return PinResizeEdge::none;
+    }
+    RECT rect{};
+    if (!GetWindowRect(hwnd_, &rect)) {
+        return PinResizeEdge::none;
+    }
+    const UINT dpi = GetDpiForWindow(hwnd_);
+    const int margin = scale_for_dpi(
+        kPinResizeHitTargetDip,
+        dpi == 0 ? 96U : dpi);
+    return pin_resize_hit_test(
+        screen_point.x - rect.left,
+        screen_point.y - rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        margin);
+}
+
+void PinWindow::begin_border_resize(PinResizeEdge edge) noexcept {
+    if (!pin_resize_edge_is_interactive(edge) ||
+        click_through() || !hwnd_ || !IsWindow(hwnd_)) {
+        return;
+    }
+    RECT bounds{};
+    const auto work_area = current_work_area();
+    if (!work_area || !GetWindowRect(hwnd_, &bounds)) {
+        return;
+    }
+    border_resize_edge_ = edge;
+    border_resize_start_bounds_ = RectI::from_native(bounds);
+    border_resize_work_area_ = *work_area;
+    border_resize_failed_ = false;
+    SetCapture(hwnd_);
+}
+
+void PinWindow::update_border_resize() noexcept {
+    if (!pin_resize_edge_is_interactive(border_resize_edge_) ||
+        !bitmap_.valid()) {
+        return;
+    }
+    POINT cursor{};
+    if (!GetCursorPos(&cursor)) {
+        border_resize_failed_ = true;
+        return;
+    }
+    const PinResizePlan plan = plan_pin_drag_resize(
+        border_resize_edge_,
+        bitmap_.width,
+        bitmap_.height,
+        border_resize_start_bounds_,
+        cursor,
+        border_resize_work_area_);
+    if (!plan.apply || !apply_resize_plan(plan)) {
+        border_resize_failed_ = true;
+    }
+}
+
+void PinWindow::end_border_resize(bool release_capture) noexcept {
+    if (!pin_resize_edge_is_interactive(border_resize_edge_)) {
+        return;
+    }
+    const bool failed = border_resize_failed_;
+    border_resize_edge_ = PinResizeEdge::none;
+    border_resize_start_bounds_ = {};
+    border_resize_work_area_ = {};
+    border_resize_failed_ = false;
+    if (release_capture && GetCapture() == hwnd_) {
+        ReleaseCapture();
+    }
+    if (failed) {
+        show_message(
+            L"部分缩放位置受屏幕或图形资源限制，贴图已保留在最后一个有效尺寸。",
+            MB_OK | MB_ICONWARNING);
+    }
+}
+
+void PinWindow::toggle_thumbnail_mode() {
+    if (!hwnd_ || !IsWindow(hwnd_) || !bitmap_.valid()) {
+        return;
+    }
+    RECT rect{};
+    const auto work_area = current_work_area();
+    if (!work_area || !GetWindowRect(hwnd_, &rect)) {
+        return;
+    }
+    const UINT dpi = GetDpiForWindow(hwnd_);
+    const PinThumbnailPlan plan = plan_pin_thumbnail_toggle(
+        thumbnail_state_,
+        state_.presentation.scale,
+        bitmap_.width,
+        bitmap_.height,
+        scale_for_dpi(
+            kPinThumbnailLongEdgeDip,
+            dpi == 0 ? 96U : dpi),
+        *work_area);
+    if (!plan.apply) {
+        show_message(
+            L"无法切换固定缩略图：当前屏幕空间或图形资源不足。",
+            MB_OK | MB_ICONERROR);
+        return;
+    }
+    const POINT center{
+        rect.left + (rect.right - rect.left) / 2,
+        rect.top + (rect.bottom - rect.top) / 2,
+    };
+    if (!resize_to_scale(plan.scale, center, true)) {
+        show_message(
+            L"无法切换固定缩略图，原贴图尺寸已保留。",
+            MB_OK | MB_ICONERROR);
+        return;
+    }
+    thumbnail_state_ = plan.state;
 }
 
 void PinWindow::fit_to_work_area() {
@@ -1331,12 +1517,105 @@ LRESULT PinWindow::handle_message(UINT msg, WPARAM wparam, LPARAM lparam) {
                     return HTTRANSPARENT;
                 }
             }
+            {
+                const POINT screen_point{
+                    GET_X_LPARAM(lparam),
+                    GET_Y_LPARAM(lparam),
+                };
+                switch (resize_edge_at(screen_point)) {
+                    case PinResizeEdge::left: return HTLEFT;
+                    case PinResizeEdge::right: return HTRIGHT;
+                    case PinResizeEdge::top: return HTTOP;
+                    case PinResizeEdge::bottom: return HTBOTTOM;
+                    case PinResizeEdge::top_left: return HTTOPLEFT;
+                    case PinResizeEdge::top_right: return HTTOPRIGHT;
+                    case PinResizeEdge::bottom_left: return HTBOTTOMLEFT;
+                    case PinResizeEdge::bottom_right: return HTBOTTOMRIGHT;
+                    case PinResizeEdge::none: break;
+                }
+            }
             return HTCAPTION; // Allow dragging the window
 
+        case WM_SETCURSOR: {
+            HCURSOR cursor = nullptr;
+            switch (LOWORD(lparam)) {
+                case HTLEFT:
+                case HTRIGHT:
+                    cursor = LoadCursorW(nullptr, IDC_SIZEWE);
+                    break;
+                case HTTOP:
+                case HTBOTTOM:
+                    cursor = LoadCursorW(nullptr, IDC_SIZENS);
+                    break;
+                case HTTOPLEFT:
+                case HTBOTTOMRIGHT:
+                    cursor = LoadCursorW(nullptr, IDC_SIZENWSE);
+                    break;
+                case HTTOPRIGHT:
+                case HTBOTTOMLEFT:
+                    cursor = LoadCursorW(nullptr, IDC_SIZENESW);
+                    break;
+                default:
+                    break;
+            }
+            if (cursor) {
+                SetCursor(cursor);
+                return TRUE;
+            }
+            break;
+        }
+
+        case WM_NCLBUTTONDOWN: {
+            PinResizeEdge edge = PinResizeEdge::none;
+            switch (wparam) {
+                case HTLEFT: edge = PinResizeEdge::left; break;
+                case HTRIGHT: edge = PinResizeEdge::right; break;
+                case HTTOP: edge = PinResizeEdge::top; break;
+                case HTBOTTOM: edge = PinResizeEdge::bottom; break;
+                case HTTOPLEFT: edge = PinResizeEdge::top_left; break;
+                case HTTOPRIGHT: edge = PinResizeEdge::top_right; break;
+                case HTBOTTOMLEFT: edge = PinResizeEdge::bottom_left; break;
+                case HTBOTTOMRIGHT: edge = PinResizeEdge::bottom_right; break;
+                default: break;
+            }
+            if (pin_resize_edge_is_interactive(edge)) {
+                begin_border_resize(edge);
+                return 0;
+            }
+            break;
+        }
+
+        case WM_MOUSEMOVE:
+        case WM_NCMOUSEMOVE:
+            if (pin_resize_edge_is_interactive(border_resize_edge_)) {
+                update_border_resize();
+                return 0;
+            }
+            break;
+
+        case WM_LBUTTONUP:
+        case WM_NCLBUTTONUP:
+            if (pin_resize_edge_is_interactive(border_resize_edge_)) {
+                end_border_resize(true);
+                return 0;
+            }
+            break;
+
+        case WM_CAPTURECHANGED:
+            if (pin_resize_edge_is_interactive(border_resize_edge_)) {
+                end_border_resize(false);
+                return 0;
+            }
+            break;
+
         case WM_NCLBUTTONDBLCLK:
-            // A hidden pin remains recoverable from the tray. Permanent
-            // destruction requires an explicit confirmed action.
-            request_hide();
+            if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+                toggle_thumbnail_mode();
+            } else {
+                // A hidden pin remains recoverable from the tray. Permanent
+                // destruction requires an explicit confirmed action.
+                request_hide();
+            }
             return 0;
 
         case WM_MOUSEWHEEL: {
@@ -1373,6 +1652,9 @@ LRESULT PinWindow::handle_message(UINT msg, WPARAM wparam, LPARAM lparam) {
                 if (!error.empty()) {
                     show_message(error, MB_OK | MB_ICONERROR);
                 }
+                return 0;
+            } else if (wparam == 'V' && control) {
+                replace_from_clipboard();
                 return 0;
             } else if (wparam == VK_ESCAPE) {
                 const bool shift_pressed =
@@ -1471,6 +1753,24 @@ LRESULT PinWindow::handle_message(UINT msg, WPARAM wparam, LPARAM lparam) {
                     0,
                     0,
                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            if (thumbnail_state_.active) {
+                RECT rect{};
+                const auto work_area = current_work_area();
+                if (work_area && GetWindowRect(hwnd_, &rect)) {
+                    const double scale = pin_fixed_thumbnail_scale(
+                        bitmap_.width,
+                        bitmap_.height,
+                        scale_for_dpi(
+                            kPinThumbnailLongEdgeDip,
+                            LOWORD(wparam) == 0 ? 96U : LOWORD(wparam)),
+                        *work_area);
+                    const POINT center{
+                        rect.left + (rect.right - rect.left) / 2,
+                        rect.top + (rect.bottom - rect.top) / 2,
+                    };
+                    (void)resize_to_scale(scale, center, true);
+                }
             }
             ensure_visible();
             return 0;
@@ -1582,6 +1882,11 @@ void PinWindow::show_context_menu(POINT screen_pos) {
         MF_STRING,
         1,
         L"复制当前可见效果\tCtrl+C");
+    AppendMenuW(
+        menu.get(),
+        MF_STRING,
+        26,
+        L"用剪贴板内容替换\tCtrl+V");
     AppendMenuW(menu.get(), MF_STRING, 2, L"保存当前可见效果…");
     AppendMenuW(
         menu.get(),
@@ -1609,6 +1914,17 @@ void PinWindow::show_context_menu(POINT screen_pos) {
             state_.presentation.alpha * 100.0 / 255.0)));
     AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 20, scale_status.c_str());
     AppendMenuW(menu.get(), MF_STRING | MF_GRAYED, 21, alpha_status.c_str());
+    AppendMenuW(
+        menu.get(),
+        MF_STRING |
+            (thumbnail_state_.active ? MF_CHECKED : MF_UNCHECKED),
+        27,
+        L"固定缩略图\tShift+双击");
+    AppendMenuW(
+        menu.get(),
+        MF_STRING | MF_GRAYED,
+        28,
+        L"提示：拖动边缘或四角可等比缩放");
     AppendMenuW(menu.get(), MF_STRING, 15, L"放大\t+");
     AppendMenuW(menu.get(), MF_STRING, 16, L"缩小\t-");
     const int rounded_scale = static_cast<int>(
@@ -1704,6 +2020,8 @@ void PinWindow::show_context_menu(POINT screen_pos) {
         if (!error.empty()) {
             show_message(error, MB_OK | MB_ICONERROR);
         }
+    } else if (selection == 26) {
+        replace_from_clipboard();
     } else if (selection == 2) {
         std::optional<std::filesystem::path> path = prompt_png_path(hwnd_);
         if (!close_pending_ && path) {
@@ -1771,6 +2089,8 @@ void PinWindow::show_context_menu(POINT screen_pos) {
         if (prompt_plan.apply) {
             set_scale_percent(prompt_plan.percent);
         }
+    } else if (selection == 27) {
+        toggle_thumbnail_mode();
     } else if (selection == 5) {
         rotate(true);
     } else if (selection == 6) {
@@ -1781,6 +2101,34 @@ void PinWindow::show_context_menu(POINT screen_pos) {
         flip(false);
     }
     (void)leave_modal();
+}
+
+void PinWindow::replace_from_clipboard() {
+    std::wstring error;
+    auto visual = read_clipboard_visual(hwnd_, &error);
+    if (!visual || !visual->bitmap.valid()) {
+        show_message(
+            error.empty()
+                ? L"剪贴板中没有可用于替换贴图的内容。"
+                : error,
+            MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (replacement_guard_) {
+        if (auto budget_error = replacement_guard_(
+                bitmap_.pixels.size(),
+                visual->bitmap)) {
+            show_message(*budget_error, MB_OK | MB_ICONERROR);
+            return;
+        }
+    }
+    if (!replace_bitmap(std::move(visual->bitmap))) {
+        show_message(
+            L"无法替换贴图：屏幕空间、内存或 GDI 资源不足，原贴图已完整保留。",
+            MB_OK | MB_ICONERROR);
+        return;
+    }
+    InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
 void PinWindow::replace_from_drop(HDROP drop) {
@@ -1829,7 +2177,6 @@ void PinWindow::replace_from_drop(HDROP drop) {
             MB_OK | MB_ICONERROR);
         return;
     }
-    fit_to_work_area();
     InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
@@ -1841,15 +2188,6 @@ void PinWindow::rotate(bool cw) {
         show_message(L"无法旋转贴图：内存或 GDI 资源不足。",
                      MB_OK | MB_ICONERROR);
         return;
-    }
-    RECT rect_window{};
-    if (GetWindowRect(hwnd_, &rect_window)) {
-        const POINT anchor{rect_window.left, rect_window.top};
-        if (!resize_to_scale(state_.presentation.scale, anchor)) {
-            show_message(
-                L"贴图已旋转，但无法按新尺寸刷新透明显示。",
-                MB_OK | MB_ICONWARNING);
-        }
     }
     ensure_visible();
 }

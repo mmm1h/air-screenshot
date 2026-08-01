@@ -432,8 +432,9 @@ The application-icon family shares a centered safe-area system and the same sema
 
 ### Update & Security
 
-- The sixth destination contains one editable automatic-update switch followed by read-only verification, installation-safety, manual-check, and activation guidance.
-- Saving changes only the preference draft; it never starts network activity. The manual “检查更新” action remains in the tray so automatic and explicit user intent are visually and behaviorally distinct.
+- The sixth destination contains two dependent switches—background download and seamless idle completion—plus a four-choice 5/15/30/60-minute idle control. Dependent controls leave pointer hit testing and keyboard focus when disabled.
+- Saving changes only the policy draft; it never starts network activity. Manual “检查更新”, immediate restart, and 24-hour restart deferral remain in the tray so automatic and explicit user intent stay behaviorally distinct.
+- The read-only safety group explains verification, preservation of active captures/settings/pins/IPC, full-screen and presentation deferral, and quiet transactional recovery without turning trust guarantees into configurable badges.
 - Security guarantees use normal row hierarchy and concise recovery copy. They are not presented as decorative badges or controls that imply a configurable trust policy.
 
 ### Shortcut Fields

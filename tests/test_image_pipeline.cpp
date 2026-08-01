@@ -1,6 +1,7 @@
 #include "airshot/bitmap.h"
 #include "airshot/capture.h"
 #include "airshot/output.h"
+#include "airshot/output_decorations.h"
 #include "overlay_helpers.h"
 #include "overlay_session.h"
 
@@ -946,7 +947,36 @@ void test_overlay_close_lifecycle() {
     }
 }
 
-void test_text_prompt_deactivation_cancels_draft() {
+void test_text_prompt_focus_policy() {
+    using airshot::overlay_detail::TextPromptAction;
+    using airshot::overlay_detail::TextPromptEvent;
+    using airshot::overlay_detail::text_prompt_action;
+
+    expect(
+        text_prompt_action(TextPromptEvent::deactivated) ==
+            TextPromptAction::keep_editing,
+        L"text prompt retains its draft across temporary deactivation");
+    expect(
+        text_prompt_action(TextPromptEvent::enter) ==
+                TextPromptAction::accept &&
+            text_prompt_action(TextPromptEvent::enter, true, false) ==
+                TextPromptAction::pass_to_editor &&
+            text_prompt_action(TextPromptEvent::enter, false, true) ==
+                TextPromptAction::pass_to_editor,
+        L"text prompt accepts plain Enter but leaves newline and IME Enter to the editor");
+    expect(
+        text_prompt_action(TextPromptEvent::escape, false, true) ==
+                TextPromptAction::pass_to_editor &&
+            text_prompt_action(TextPromptEvent::escape) ==
+                TextPromptAction::cancel,
+        L"IME Escape cancels composition before a later Escape cancels the prompt");
+    expect(
+        text_prompt_action(TextPromptEvent::close_request) ==
+            TextPromptAction::cancel,
+        L"closing the text prompt explicitly cancels its draft");
+}
+
+void test_text_prompt_deactivation_preserves_draft() {
     bool completed = false;
     std::optional<std::wstring> result;
     const HWND prompt = airshot::overlay_detail::show_text_prompt(
@@ -974,11 +1004,88 @@ void test_text_prompt_deactivation_cancels_draft() {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
-    expect(completed && !result.has_value() && !IsWindow(prompt),
-           L"deactivating a text prompt cancels instead of committing its draft");
+    wchar_t retained[32]{};
+    if (edit && IsWindow(edit)) {
+        GetWindowTextW(edit, retained, static_cast<int>(std::size(retained)));
+    }
+    expect(!completed && IsWindow(prompt) && std::wstring_view(retained) == L"draft",
+           L"deactivating a text prompt keeps the window and draft alive");
+
+    SendMessageW(prompt, WM_COMMAND, MAKEWPARAM(IDOK, 0), 0);
+    expect(completed && result && *result == L"draft" && !IsWindow(prompt),
+           L"a retained draft can still be committed after reactivation");
     if (IsWindow(prompt)) {
         DestroyWindow(prompt);
     }
+}
+
+void test_text_prompt_escape_explicitly_cancels() {
+    bool completed = false;
+    std::optional<std::wstring> result;
+    const HWND prompt = airshot::overlay_detail::show_text_prompt(
+        nullptr,
+        POINT{20, 20},
+        RGB(255, 255, 255),
+        16.0F,
+        false,
+        [&](std::optional<std::wstring> text) {
+            result = std::move(text);
+            completed = true;
+        },
+        L"do not commit");
+    expect(prompt != nullptr, L"text prompt is created for explicit cancel testing");
+    if (!prompt) {
+        return;
+    }
+
+    const HWND edit = GetDlgItem(prompt, 100);
+    expect(edit != nullptr, L"text prompt edit exists for explicit cancel testing");
+    if (edit) {
+        SendMessageW(edit, WM_KEYDOWN, VK_ESCAPE, 0);
+    }
+    MSG message{};
+    while (!completed && PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    expect(completed && !result.has_value() && !IsWindow(prompt),
+           L"Escape explicitly cancels without committing the retained draft");
+    if (IsWindow(prompt)) {
+        DestroyWindow(prompt);
+    }
+}
+
+void test_text_prompt_forced_destroy_completes_once() {
+    int completion_count = 0;
+    std::optional<std::wstring> result;
+    const HWND prompt = airshot::overlay_detail::show_text_prompt(
+        nullptr,
+        POINT{20, 20},
+        RGB(255, 255, 255),
+        16.0F,
+        false,
+        [&](std::optional<std::wstring> text) {
+            result = std::move(text);
+            ++completion_count;
+        },
+        L"retained draft");
+    expect(prompt != nullptr, L"text prompt is created for forced-destroy testing");
+    if (!prompt) {
+        return;
+    }
+
+    SendMessageW(prompt, WM_ACTIVATE, MAKEWPARAM(WA_INACTIVE, 0), 0);
+    DestroyWindow(prompt);
+    expect(completion_count == 1 && !result.has_value() && !IsWindow(prompt),
+           L"owner shutdown cancels a retained draft and completes exactly once");
+
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    expect(completion_count == 1,
+           L"destroyed text prompt does not leave a late completion callback");
 }
 
 void test_text_prompt_supports_editing_existing_text() {
@@ -1295,6 +1402,204 @@ void test_watermark_alpha() {
            L"watermark opacity follows annotation alpha");
 }
 
+void test_output_decorations_disabled_is_identity() {
+    airshot::Bitmap source = patterned_bitmap(4, 3);
+    source.row(0)[3] = 0;
+    source.row(1)[7] = 96;
+    const airshot::Bitmap original = source;
+
+    const auto result = airshot::decorate_output_bitmap(source);
+    expect(
+        result.status == airshot::OutputDecorationStatus::no_change &&
+            result.bitmap.valid() &&
+            result.bitmap.width == source.width &&
+            result.bitmap.height == source.height &&
+            result.bitmap.pixels == source.pixels,
+        L"disabled output decorations return a byte-exact source copy");
+    expect(
+        source.width == original.width &&
+            source.height == original.height &&
+            source.pixels == original.pixels,
+        L"output decoration never mutates its source bitmap");
+
+    airshot::Bitmap transparent(2, 2);
+    std::fill(
+        transparent.pixels.begin(),
+        transparent.pixels.end(),
+        std::uint8_t{0});
+    airshot::OutputDecorationOptions transparent_options;
+    transparent_options.border_width = 3;
+    transparent_options.shadow_blur_radius = 2;
+    transparent_options.shadow_offset_x = 2;
+    transparent_options.shadow_offset_y = 1;
+    transparent_options.shadow_opacity = 160;
+    const auto transparent_result = airshot::decorate_output_bitmap(
+        transparent,
+        transparent_options);
+    expect(
+        transparent_result.status ==
+                airshot::OutputDecorationStatus::no_change &&
+            transparent_result.bitmap.width == transparent.width &&
+            transparent_result.bitmap.height == transparent.height &&
+            transparent_result.bitmap.pixels == transparent.pixels,
+        L"a fully transparent source produces neither a border nor a shadow");
+}
+
+void test_output_border_follows_source_alpha() {
+    airshot::Bitmap source(5, 5);
+    std::fill(source.pixels.begin(), source.pixels.end(), std::uint8_t{0});
+    auto center = source.row(2);
+    const std::size_t center_offset = 2U * airshot::Bitmap::bytes_per_pixel;
+    center[center_offset] = 100;
+    center[center_offset + 1] = 90;
+    center[center_offset + 2] = 80;
+    center[center_offset + 3] = 255;
+    const airshot::Bitmap original = source;
+
+    airshot::OutputDecorationOptions options;
+    options.border_width = 1;
+    options.border_color = RGB(10, 20, 30);
+    const auto result = airshot::decorate_output_bitmap(source, options);
+
+    expect(
+        result.status == airshot::OutputDecorationStatus::applied &&
+            result.bitmap.valid() && result.bitmap.width == 7 &&
+            result.bitmap.height == 7,
+        L"an alpha-derived border expands the output canvas exactly once");
+    if (result.bitmap.valid()) {
+        expect(
+            channel(result.bitmap, 3, 3, 0) == 100 &&
+                channel(result.bitmap, 3, 3, 1) == 90 &&
+                channel(result.bitmap, 3, 3, 2) == 80 &&
+                channel(result.bitmap, 3, 3, 3) == 255,
+            L"the source pixel remains unchanged above its border");
+        expect(
+            channel(result.bitmap, 2, 3, 0) == 30 &&
+                channel(result.bitmap, 2, 3, 1) == 20 &&
+                channel(result.bitmap, 2, 3, 2) == 10 &&
+                channel(result.bitmap, 2, 3, 3) == 255,
+            L"the border uses the configured COLORREF around visible alpha");
+        expect(
+            channel(result.bitmap, 1, 1, 3) == 0 &&
+                channel(result.bitmap, 0, 0, 3) == 0,
+            L"transparent source corners are not treated as an opaque rectangle");
+    }
+    expect(
+        source.pixels == original.pixels,
+        L"border generation leaves the alpha source byte-for-byte unchanged");
+}
+
+void test_output_shadow_range_and_alpha_composition() {
+    airshot::Bitmap ranged_source(1, 1);
+    ranged_source.pixels = {255, 255, 255, 255};
+    airshot::OutputDecorationOptions ranged_options;
+    ranged_options.shadow_blur_radius = 1;
+    ranged_options.shadow_offset_x = 3;
+    ranged_options.shadow_color = RGB(0, 0, 0);
+    ranged_options.shadow_opacity = 180;
+    const auto ranged = airshot::decorate_output_bitmap(
+        ranged_source,
+        ranged_options);
+    expect(
+        ranged.status == airshot::OutputDecorationStatus::applied &&
+            ranged.bitmap.valid() && ranged.bitmap.width == 5 &&
+            ranged.bitmap.height == 3,
+        L"shadow offset and blur support determine the expanded canvas bounds");
+    if (ranged.bitmap.valid()) {
+        expect(
+            channel(ranged.bitmap, 0, 1, 3) == 255 &&
+                channel(ranged.bitmap, 1, 1, 3) == 0,
+            L"a separated shadow does not bridge pixels outside its blur range");
+        expect(
+            channel(ranged.bitmap, 2, 1, 3) > 0 &&
+                channel(ranged.bitmap, 3, 1, 3) > 0 &&
+                channel(ranged.bitmap, 4, 1, 3) > 0 &&
+                channel(ranged.bitmap, 3, 1, 0) == 0 &&
+                channel(ranged.bitmap, 3, 1, 1) == 0 &&
+                channel(ranged.bitmap, 3, 1, 2) == 0,
+            L"soft shadow alpha stays inside the planned support and uses its color");
+    }
+
+    airshot::Bitmap translucent_source(1, 1);
+    translucent_source.pixels = {0, 0, 255, 128};
+    airshot::OutputDecorationOptions composite_options;
+    composite_options.shadow_color = RGB(0, 0, 0);
+    composite_options.shadow_opacity = 128;
+    const auto composite = airshot::decorate_output_bitmap(
+        translucent_source,
+        composite_options);
+    expect(
+        composite.status == airshot::OutputDecorationStatus::applied &&
+            composite.bitmap.valid() &&
+            composite.bitmap.pixels ==
+                std::vector<std::uint8_t>({0, 0, 204, 160}),
+        L"straight-alpha source-over composition preserves translucent color correctly");
+}
+
+void test_output_decoration_limits_fail_safely() {
+    airshot::Bitmap invalid(2, 2);
+    invalid.pixels.pop_back();
+    expect(
+        airshot::decorate_output_bitmap(invalid).status ==
+            airshot::OutputDecorationStatus::invalid_input,
+        L"output decorations reject malformed and empty bitmaps");
+
+    airshot::Bitmap source = patterned_bitmap(4, 4);
+    const airshot::Bitmap original = source;
+    airshot::OutputDecorationOptions invalid_options;
+    invalid_options.border_width =
+        airshot::OutputDecorationOptions::maximum_border_width + 1;
+    expect(
+        airshot::decorate_output_bitmap(source, invalid_options).status ==
+            airshot::OutputDecorationStatus::invalid_options,
+        L"output decorations reject an excessive border width");
+    invalid_options = {};
+    invalid_options.shadow_blur_radius =
+        airshot::OutputDecorationOptions::maximum_shadow_blur_radius + 1;
+    expect(
+        airshot::decorate_output_bitmap(source, invalid_options).status ==
+            airshot::OutputDecorationStatus::invalid_options,
+        L"output decorations reject an excessive shadow radius");
+    invalid_options = {};
+    invalid_options.shadow_offset_x = std::numeric_limits<int>::min();
+    invalid_options.shadow_opacity = 128;
+    expect(
+        airshot::decorate_output_bitmap(source, invalid_options).status ==
+            airshot::OutputDecorationStatus::invalid_options,
+        L"output decorations reject extreme offsets before doing arithmetic");
+    invalid_options = {};
+    invalid_options.shadow_opacity = 256;
+    expect(
+        airshot::decorate_output_bitmap(source, invalid_options).status ==
+            airshot::OutputDecorationStatus::invalid_options,
+        L"output decorations reject shadow opacity outside byte range");
+
+    airshot::OutputDecorationOptions bounded_options;
+    bounded_options.border_width = 1;
+    airshot::OutputDecorationLimits limits;
+    limits.max_output_pixels = 20;
+    const auto limited = airshot::decorate_output_bitmap(
+        source,
+        bounded_options,
+        limits);
+    expect(
+        limited.status == airshot::OutputDecorationStatus::resource_limit &&
+            limited.bitmap.empty() && source.pixels == original.pixels,
+        L"output canvas budget fails without allocating or changing the source");
+    limits.max_output_pixels =
+        airshot::OutputDecorationLimits::hard_max_output_pixels;
+    limits.max_working_bytes = 16;
+    const auto working_limited = airshot::decorate_output_bitmap(
+        source,
+        bounded_options,
+        limits);
+    expect(
+        working_limited.status ==
+                airshot::OutputDecorationStatus::resource_limit &&
+            working_limited.bitmap.empty() && source.pixels == original.pixels,
+        L"output working-memory budget covers masks as well as final pixels");
+}
+
 void test_atomic_png_output() {
     const auto directory = std::filesystem::temp_directory_path() /
                            std::format(L"airshot-image-test-{}-{}", GetCurrentProcessId(), GetTickCount64());
@@ -1403,11 +1708,18 @@ int wmain() {
     test_shape_tools_are_outline_only();
     test_product_shape_styles_and_zero_strength_effects();
     test_overlay_close_lifecycle();
-    test_text_prompt_deactivation_cancels_draft();
+    test_text_prompt_focus_policy();
+    test_text_prompt_deactivation_preserves_draft();
+    test_text_prompt_escape_explicitly_cancels();
+    test_text_prompt_forced_destroy_completes_once();
     test_text_prompt_supports_editing_existing_text();
     test_text_prompt_uses_annotation_typography_and_style();
     test_selection_size_prompt_validates_without_side_effects();
     test_watermark_alpha();
+    test_output_decorations_disabled_is_identity();
+    test_output_border_follows_source_alpha();
+    test_output_shadow_range_and_alpha_composition();
+    test_output_decoration_limits_fail_safely();
     test_atomic_png_output();
     if (failures == 0) {
         std::wcout << L"All image pipeline tests passed.\n";

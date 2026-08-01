@@ -50,6 +50,7 @@ public:
     void on_mouse_up(HWND source, POINT point);
     void on_double_click(HWND source, POINT point);
     void on_key_down(HWND source, WPARAM key, bool is_auto_repeat);
+    void on_key_up(WPARAM key);
     [[nodiscard]] bool on_system_key_down(
         HWND source,
         WPARAM key,
@@ -115,6 +116,9 @@ public:
     }
     [[nodiscard]] bool can_edit_selection_size() const noexcept;
     [[nodiscard]] bool color_format_hex() const noexcept { return color_format_hex_; }
+    [[nodiscard]] bool magnifier_visible() const noexcept {
+        return magnifier_visible_;
+    }
     [[nodiscard]] bool is_over_toolbar(POINT point) const noexcept;
     [[nodiscard]] bool is_over_toolbar_drag_handle(POINT point) const noexcept;
     [[nodiscard]] bool toolbar_dragging() const noexcept { return dragging_toolbar_; }
@@ -282,6 +286,7 @@ private:
     double selection_locked_aspect_ratio_{};
     POINT cursor_pos_{};
     bool color_format_hex_{true};
+    bool magnifier_visible_{true};
     int selected_annotation_idx_{-1};
     Annotation original_annotation_;
     AnnotationHandle active_annotation_handle_{AnnotationHandle::none};
@@ -293,6 +298,7 @@ private:
     bool mosaic_is_rect_{};
     EraserMode eraser_mode_{EraserMode::object};
     bool highlight_constraint_active_{};
+    WPARAM annotation_key_transaction_key_{};
     ToolStylePalette tool_styles_;
     bool text_size_dropdown_open_{};
     int text_size_hovered_idx_{-1};

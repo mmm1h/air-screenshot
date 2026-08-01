@@ -2,6 +2,7 @@
 
 #include "airshot/common.h"
 #include "airshot/region_policy.h"
+#include "airshot/update_policy.h"
 
 #include <array>
 #include <cstdint>
@@ -32,7 +33,9 @@ inline constexpr std::wstring_view save = L"Ctrl+S";
 inline constexpr std::wstring_view undo = L"Ctrl+Z";
 inline constexpr std::wstring_view redo = L"Ctrl+Y";
 inline constexpr std::wstring_view redo_alternate = L"Ctrl+Shift+Z";
-inline constexpr std::array<std::wstring_view, 7> reserved{
+inline constexpr std::wstring_view decrease_tool_size = L"1";
+inline constexpr std::wstring_view increase_tool_size = L"2";
+inline constexpr std::array<std::wstring_view, 9> reserved{
     precision_size,
     duplicate,
     copy,
@@ -40,6 +43,8 @@ inline constexpr std::array<std::wstring_view, 7> reserved{
     undo,
     redo,
     redo_alternate,
+    decrease_tool_size,
+    increase_tool_size,
 };
 }  // namespace capture_editor_shortcuts
 
@@ -71,6 +76,9 @@ struct AppConfig {
     bool global_ocr_enabled{false};
     bool notifications_enabled{false};
     bool automatic_updates_enabled{true};
+    bool seamless_updates_enabled{true};
+    int automatic_update_idle_minutes{kUpdateDefaultIdleMinutes};
+    std::int64_t update_restart_deferred_until_unix{};
     std::int64_t last_update_check_unix{};
     std::wstring warned_update_target;
     std::wstring ocr_engine{std::wstring(kDefaultOcrEngine)};

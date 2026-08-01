@@ -50,6 +50,47 @@ void show_rgb_picker_popup(HWND parent_hwnd,
 
 using TextPromptCompletion = std::function<void(std::optional<std::wstring>)>;
 
+// Keep the text editor's close semantics independent from the native window
+// procedure. In particular, losing activation is not a cancellation signal:
+// toolbar clicks, Alt+Tab and IME-owned UI can all deactivate the popup for a
+// short time while the user's draft must remain intact.
+enum class TextPromptEvent {
+    enter,
+    escape,
+    deactivated,
+    close_request,
+};
+
+enum class TextPromptAction {
+    keep_editing,
+    pass_to_editor,
+    accept,
+    cancel,
+};
+
+[[nodiscard]] constexpr TextPromptAction text_prompt_action(
+    TextPromptEvent event,
+    bool shift_down = false,
+    bool ime_composing = false) noexcept {
+    switch (event) {
+        case TextPromptEvent::enter:
+            if (shift_down || ime_composing) {
+                return TextPromptAction::pass_to_editor;
+            }
+            return TextPromptAction::accept;
+        case TextPromptEvent::escape:
+            if (ime_composing) {
+                return TextPromptAction::pass_to_editor;
+            }
+            return TextPromptAction::cancel;
+        case TextPromptEvent::close_request:
+            return TextPromptAction::cancel;
+        case TextPromptEvent::deactivated:
+            return TextPromptAction::keep_editing;
+    }
+    return TextPromptAction::keep_editing;
+}
+
 [[nodiscard]] HWND show_text_prompt(HWND owner,
                                     POINT position,
                                     COLORREF color,

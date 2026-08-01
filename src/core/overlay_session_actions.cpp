@@ -1841,6 +1841,7 @@ void OverlaySession::invoke_sub(std::wstring_view id, HWND source) {
                 prompt_window_ = nullptr;
                 if (!done_ && text) {
                     watermark_text_ = std::move(*text);
+                    build_sub_toolbar();
                     invalidate_all();
                 }
             },
@@ -2069,6 +2070,22 @@ void OverlaySession::invoke(std::wstring_view id, HWND source) {
 
 void OverlaySession::apply_watermark() {
     if (selection_.empty()) {
+        return;
+    }
+    const bool has_watermark = std::ranges::any_of(
+        annotations_,
+        [](const Annotation& annotation) {
+            return annotation.tool == Tool::watermark;
+        });
+    if (watermark_opacity_ <= 0) {
+        if (!has_watermark) {
+            return;
+        }
+        record_annotation_change();
+        std::erase_if(annotations_, [](const Annotation& annotation) {
+            return annotation.tool == Tool::watermark;
+        });
+        finish_annotation();
         return;
     }
     record_annotation_change();

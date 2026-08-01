@@ -169,6 +169,7 @@ add_library(airshot_core STATIC
     src/core/ipc.cpp
     src/core/ocr.cpp
     src/core/output.cpp
+    src/core/output_decorations.cpp
     src/core/overlay.cpp
     src/core/overlay_color_picker.cpp
     src/core/overlay_ocr_result.cpp

@@ -2618,6 +2618,19 @@ bool create_process(
     return true;
 }
 
+bool restart_target_with_retry(const std::filesystem::path& target) {
+    for (DWORD attempt = 0; attempt < 3; ++attempt) {
+        std::wstring command = quote_argument(target.wstring());
+        if (create_process(target, std::move(command), nullptr)) {
+            return true;
+        }
+        if (attempt + 1 < 3) {
+            Sleep(250 * (attempt + 1));
+        }
+    }
+    return false;
+}
+
 std::optional<DWORD> parse_process_id(std::wstring_view value) {
     if (value.empty() || (value.size() > 1 && value.front() == L'0')) {
         return std::nullopt;
@@ -4403,9 +4416,25 @@ bool launch_pending_update(
     bool restart_after_update,
     bool allow_automatic_pending,
     std::wstring* error) {
+    return launch_pending_update(
+        restart_after_update,
+        allow_automatic_pending,
+        error,
+        {});
+}
+
+bool launch_pending_update(
+    bool restart_after_update,
+    bool allow_automatic_pending,
+    std::wstring* error,
+    std::stop_token stop_token) {
     clear_error(error);
+    if (stop_token.stop_requested()) {
+        set_error(error, L"更新应用已取消。");
+        return false;
+    }
     auto update_lock =
-        lock_update_operation({}, 15'000, error);
+        lock_update_operation(stop_token, 15'000, error);
     if (!update_lock) {
         return false;
     }
@@ -4476,6 +4505,10 @@ bool launch_pending_update(
         if (!ready_event) {
             return false;
         }
+        if (stop_token.stop_requested()) {
+            set_error(error, L"更新应用已取消。");
+            return false;
+        }
         const std::wstring command =
             std::format(L"{} --apply-update {} {} {} {}",
                         quote_argument(staged.wstring()),
@@ -4490,27 +4523,36 @@ bool launch_pending_update(
         }
         const std::array<HANDLE, 2> wait_handles{
             ready_event.get(), helper_process.get()};
+        constexpr DWORD kHandshakeCanceled = WAIT_FAILED - 1;
         const auto handshake_deadline =
             std::chrono::steady_clock::now() +
             std::chrono::seconds(15);
         const auto wait_for_handshake_phase =
-            [&wait_handles, &handshake_deadline]() -> DWORD {
-                const auto now =
-                    std::chrono::steady_clock::now();
-                if (now >= handshake_deadline) {
-                    return WAIT_TIMEOUT;
+            [&wait_handles, &handshake_deadline, stop_token]() -> DWORD {
+                while (true) {
+                    if (stop_token.stop_requested()) {
+                        return kHandshakeCanceled;
+                    }
+                    const auto now =
+                        std::chrono::steady_clock::now();
+                    if (now >= handshake_deadline) {
+                        return WAIT_TIMEOUT;
+                    }
+                    const auto remaining =
+                        std::chrono::duration_cast<
+                            std::chrono::milliseconds>(
+                            handshake_deadline - now);
+                    const DWORD wait_result = WaitForMultipleObjects(
+                        static_cast<DWORD>(wait_handles.size()),
+                        wait_handles.data(),
+                        FALSE,
+                        static_cast<DWORD>(
+                            std::clamp<long long>(
+                                remaining.count(), 1, 100)));
+                    if (wait_result != WAIT_TIMEOUT) {
+                        return wait_result;
+                    }
                 }
-                const auto remaining =
-                    std::chrono::duration_cast<
-                        std::chrono::milliseconds>(
-                        handshake_deadline - now);
-                return WaitForMultipleObjects(
-                    static_cast<DWORD>(wait_handles.size()),
-                    wait_handles.data(),
-                    FALSE,
-                    static_cast<DWORD>(
-                        std::max<long long>(
-                            1, remaining.count())));
             };
         const auto report_handshake_failure =
             [&helper_process, error](DWORD wait_result) {
@@ -4552,7 +4594,9 @@ bool launch_pending_update(
                             terminated));
                     return false;
                 }
-                if (wait_result == WAIT_TIMEOUT) {
+                if (wait_result == kHandshakeCanceled) {
+                    set_error(error, L"更新应用已取消，更新文件已保留。");
+                } else if (wait_result == WAIT_TIMEOUT) {
                     set_error(
                         error,
                         L"更新 helper 未能在时限内完成安全启动握手，已停止 helper。");
@@ -4575,12 +4619,18 @@ bool launch_pending_update(
         if (!ResetEvent(ready_event.get())) {
             return report_handshake_failure(WAIT_FAILED);
         }
+        if (stop_token.stop_requested()) {
+            return report_handshake_failure(kHandshakeCanceled);
+        }
         update_lock.reset();
 
         const DWORD lease_acquired =
             wait_for_handshake_phase();
         if (lease_acquired != WAIT_OBJECT_0) {
             return report_handshake_failure(lease_acquired);
+        }
+        if (stop_token.stop_requested()) {
+            return report_handshake_failure(kHandshakeCanceled);
         }
         return true;
     } catch (const std::exception& exception) {
@@ -4735,21 +4785,19 @@ int run_update_helper(std::span<const std::wstring> arguments) {
                 &original_target,
                 &stable_target,
                 &error)) {
-            MessageBoxW(
-                nullptr,
-                error.empty()
-                    ? L"无法安全替换 AirScreenshot.exe。请将程序移到可写目录后重试。"
-                    : error.c_str(),
-                kAppName,
-                MB_OK | MB_ICONERROR);
+            // The interactive host has already exited after the helper
+            // handshake. A transactional replacement failure leaves (or
+            // restores) the old target in place, so restart it quietly and
+            // keep the pending payload for a later retry.
+            if (arguments[3] == L"restart") {
+                (void)restart_target_with_retry(target);
+            }
             return static_cast<int>(ExitCode::operation_failed);
         }
 
         remove_regular_file(pending_manifest_path(*directory));
         if (arguments[3] == L"restart") {
-            std::wstring command =
-                quote_argument(target.wstring());
-            if (!create_process(target, std::move(command), nullptr)) {
+            if (!restart_target_with_retry(target)) {
                 return static_cast<int>(ExitCode::operation_failed);
             }
         }
@@ -4772,11 +4820,18 @@ void cleanup_stale_updates() {
         }
         auto directory_guard =
             lock_safe_directory_tree(*directory, nullptr);
-        if (!directory_guard ||
-            pending_update_available_unlocked(*directory)) {
+        if (!directory_guard) {
             return;
         }
-        remove_regular_file(pending_manifest_path(*directory));
+        const auto pending = validated_pending_update_unlocked(*directory);
+        const std::optional<std::filesystem::path> preserved_staged =
+            pending ? std::optional<std::filesystem::path>(
+                          update_executable_path(
+                              *directory, pending->manifest.version))
+                    : std::nullopt;
+        if (!pending) {
+            remove_regular_file(pending_manifest_path(*directory));
+        }
 
         std::error_code filesystem_error;
         for (const auto& entry :
@@ -4795,6 +4850,10 @@ void cleanup_stale_updates() {
             }
             const std::wstring filename =
                 entry.path().filename().wstring();
+            if (preserved_staged &&
+                entry.path().filename() == preserved_staged->filename()) {
+                continue;
+            }
             if (staged_filename(filename) ||
                 temporary_update_filename(filename)) {
                 remove_regular_file(entry.path());

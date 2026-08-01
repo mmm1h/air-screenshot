@@ -412,6 +412,14 @@ int named_clamped_integer(const JsonNode& object, std::wstring_view name, int fa
     return std::clamp(named_integer(object, name, fallback), minimum, maximum);
 }
 
+int automatic_update_idle_minutes_or_default(int value) noexcept {
+    if (value < kUpdateMinIdleMinutes ||
+        value > kUpdateMaxIdleMinutes) {
+        return kUpdateDefaultIdleMinutes;
+    }
+    return value;
+}
+
 std::int64_t named_nonnegative_int64(
     const JsonNode& object,
     std::wstring_view name,
@@ -844,6 +852,12 @@ bool validate_current_config(const JsonNode& root, std::wstring* error) {
     if (update &&
         (!validate_optional_kind(
              *update, L"update", L"automatic", JsonKind::boolean, error) ||
+         !validate_optional_kind(
+             *update, L"update", L"seamless", JsonKind::boolean, error) ||
+         !validate_optional_integer(
+             *update, L"update", L"idleMinutes", error) ||
+         !validate_optional_integer(
+             *update, L"update", L"deferUntilUnix", error) ||
          !validate_optional_integer(
              *update, L"update", L"lastCheckUnix", error) ||
          !validate_optional_kind(
@@ -851,14 +865,18 @@ bool validate_current_config(const JsonNode& root, std::wstring* error) {
         return false;
     }
     if (update) {
-        const auto* last_check = member(*update, L"lastCheckUnix");
-        if (last_check &&
-            named_nonnegative_int64(
-                *update, L"lastCheckUnix", -1) < 0) {
-            set_config_error(
-                error,
-                L"配置字段 update.lastCheckUnix 必须是非负整数。");
-            return false;
+        constexpr std::array<std::wstring_view, 2> timestamp_fields{
+            L"deferUntilUnix",
+            L"lastCheckUnix",
+        };
+        for (const auto field : timestamp_fields) {
+            if (member(*update, field) &&
+                named_nonnegative_int64(*update, field, -1) < 0) {
+                set_config_error(
+                    error,
+                    std::format(L"配置字段 update.{} 必须是非负整数。", field));
+                return false;
+            }
         }
     }
 
@@ -1978,6 +1996,14 @@ std::wstring known_config_to_json(const AppConfig& config) {
     result += L",\"appIcon\":" + quote_json(normalize_app_icon(config.app_icon)) + L"}";
     result += L",\"update\":{\"automatic\":" +
               std::wstring(json_boolean(config.automatic_updates_enabled));
+    result += L",\"seamless\":" +
+              std::wstring(json_boolean(config.seamless_updates_enabled));
+    result += L",\"idleMinutes\":" +
+              std::to_wstring(automatic_update_idle_minutes_or_default(
+                  config.automatic_update_idle_minutes));
+    result += L",\"deferUntilUnix\":" +
+              std::to_wstring(std::max<std::int64_t>(
+                  0, config.update_restart_deferred_until_unix));
     result += L",\"lastCheckUnix\":" +
               std::to_wstring(std::max<std::int64_t>(0, config.last_update_check_unix));
     result += L",\"warnedTarget\":" + quote_json(config.warned_update_target) + L"}";
@@ -2117,6 +2143,15 @@ std::optional<AppConfig> config_from_json(std::wstring_view json_text, std::wstr
     if (const auto* update = member(*root, L"update")) {
         config.automatic_updates_enabled =
             named_boolean(*update, L"automatic", true);
+        config.seamless_updates_enabled =
+            named_boolean(*update, L"seamless", true);
+        config.automatic_update_idle_minutes =
+            automatic_update_idle_minutes_or_default(named_integer(
+                *update,
+                L"idleMinutes",
+                kUpdateDefaultIdleMinutes));
+        config.update_restart_deferred_until_unix =
+            named_nonnegative_int64(*update, L"deferUntilUnix", 0);
         config.last_update_check_unix =
             named_nonnegative_int64(*update, L"lastCheckUnix", 0);
         config.warned_update_target =

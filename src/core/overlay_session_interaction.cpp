@@ -74,8 +74,23 @@ bool hit_annotation(
                 point,
                 6.0 + safe_additional_radius);
         case Tool::line:
-        case Tool::arrow:
             return distance_to_segment(point, annotation.start, annotation.end) <= threshold;
+        case Tool::arrow: {
+            if (distance_to_segment(point, annotation.start, annotation.end) <=
+                threshold) {
+                return true;
+            }
+            const auto head_hit = [&](POINT tip, POINT tail) {
+                const ArrowHeadWings wings =
+                    arrow_head_wings(tip, tail, annotation.width);
+                return distance_to_segment(point, tip, wings.first) <= threshold ||
+                       distance_to_segment(point, tip, wings.second) <= threshold;
+            };
+            return (arrow_has_start_head(annotation.arrow_head_style) &&
+                    head_hit(annotation.start, annotation.end)) ||
+                   (arrow_has_end_head(annotation.arrow_head_style) &&
+                    head_hit(annotation.end, annotation.start));
+        }
         case Tool::pen:
         case Tool::highlight:
             return near_polyline(point, annotation.points, threshold);
@@ -742,6 +757,10 @@ bool OverlaySession::erase_annotations_between(POINT start, POINT end) {
 }
 
 void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
+    if (annotation_key_transaction_key_ != 0) {
+        commit_annotation_transaction();
+        annotation_key_transaction_key_ = 0;
+    }
     if (ocr_running_) {
         if (!right) {
             for (const auto& button : toolbar_) {
@@ -1073,7 +1092,12 @@ void OverlaySession::on_mouse_down(HWND source, POINT point, bool right) {
                 }
             }
             current_drag_mode_ = DragMode::annotate;
-            highlight_constraint_active_ = false;
+            // Lock the highlight geometry for the complete gesture. Toggling
+            // Shift halfway through a free stroke must never discard points
+            // that the user has already drawn.
+            highlight_constraint_active_ =
+                active_tool_ == Tool::highlight &&
+                (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             mark_preview_visual_changed();
             SetCapture(source);
             return;
@@ -1220,7 +1244,8 @@ void OverlaySession::on_mouse_move(POINT point) {
             invalidate_all();
             return;
         }
-        if (preview_.tool == Tool::highlight && constrain) {
+        if (preview_.tool == Tool::highlight &&
+            highlight_constraint_active_) {
             const POINT endpoint =
                 orthogonal_endpoint(annotation_anchor_, relative);
             preview_.end = endpoint;
@@ -1230,16 +1255,9 @@ void OverlaySession::on_mouse_move(POINT point) {
                 preview_.points,
                 endpoint,
                 0.5);
-            highlight_constraint_active_ = true;
             mark_preview_visual_changed();
             invalidate_all();
             return;
-        }
-        if (preview_.tool == Tool::highlight &&
-            highlight_constraint_active_) {
-            preview_.points.clear();
-            preview_.points.push_back(annotation_anchor_);
-            highlight_constraint_active_ = false;
         }
         if (tool_uses_points(preview_.tool) && selection_.contains(point)) {
             if (!(tool_is_privacy_effect(preview_.tool) &&
@@ -1652,6 +1670,11 @@ void OverlaySession::on_key_down(
     HWND source,
     WPARAM key,
     bool is_auto_repeat) {
+    if (annotation_key_transaction_key_ != 0 &&
+        annotation_key_transaction_key_ != key) {
+        commit_annotation_transaction();
+        annotation_key_transaction_key_ = 0;
+    }
     if (scroll_capture_) {
         switch (scroll_keyboard_command(key)) {
             case ScrollKeyboardCommand::toggle_pause:
@@ -1721,7 +1744,11 @@ void OverlaySession::on_key_down(
             }
             std::wstring error;
             if (!copy_text_to_clipboard(color_str, &error)) {
-                finish({ExitCode::operation_failed, std::move(error)});
+                show_output_error(
+                    source,
+                    error.empty()
+                        ? L"无法复制颜色。截图仍会保留，您可以稍后重试。"
+                        : error + L"\n\n截图仍会保留，您可以稍后重试。");
                 return;
             }
 
@@ -1740,6 +1767,94 @@ void OverlaySession::on_key_down(
             color_format_hex_ = !color_format_hex_;
             invalidate_all();
             return;
+        }
+        return;
+    }
+
+    const bool control_down =
+        (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool alt_down = (GetKeyState(VK_MENU) & 0x8000) != 0;
+    const bool win_down =
+        (GetKeyState(VK_LWIN) & 0x8000) != 0 ||
+        (GetKeyState(VK_RWIN) & 0x8000) != 0;
+
+    // Keep the line family reachable from the keyboard even when a compact
+    // selection has moved the individual tools into the overflow menu.
+    if (key == VK_TAB && !control_down && !alt_down && !win_down &&
+        !is_auto_repeat) {
+        const auto available = [&](std::wstring_view id) {
+            return request_.config.annotation_enabled &&
+                   !annotation_tool_hidden(
+                       request_.config.annotation_hidden_tools,
+                       id);
+        };
+        Tool target = Tool::none;
+        if (active_tool_ == Tool::line && available(L"arrow")) {
+            target = Tool::arrow;
+        } else if (active_tool_ == Tool::arrow && available(L"line")) {
+            target = Tool::line;
+        } else if (available(L"line")) {
+            target = Tool::line;
+        } else if (available(L"arrow")) {
+            target = Tool::arrow;
+        }
+        if (target != Tool::none) {
+            (void)settle_active_interaction(
+                source,
+                InteractionSettleMode::cancel);
+            if (active_tool_ != target) {
+                remember_current_style();
+                active_tool_ = target;
+                selected_annotation_idx_ = -1;
+                load_active_style(target);
+            }
+            build_toolbar();
+            build_sub_toolbar();
+            invalidate_all();
+        }
+        return;
+    }
+
+    const bool decrease_size = key == '1' || key == VK_OEM_4;
+    const bool increase_size = key == '2' || key == VK_OEM_6;
+    if ((decrease_size || increase_size) &&
+        !control_down && !alt_down && !win_down) {
+        Tool style_tool = active_tool_;
+        const bool editing_selected =
+            active_tool_ == Tool::select &&
+            selected_annotation_idx_ >= 0 &&
+            selected_annotation_idx_ <
+                static_cast<int>(annotations_.size());
+        if (editing_selected) {
+            style_tool = annotations_[static_cast<std::size_t>(
+                selected_annotation_idx_)].tool;
+        }
+        const float direction = increase_size ? 1.0F : -1.0F;
+        bool changed = false;
+        if (style_tool == Tool::text) {
+            const float updated = std::clamp(
+                active_text_size_ + direction * 2.0F,
+                12.0F,
+                96.0F);
+            changed = updated != active_text_size_;
+            active_text_size_ = updated;
+        } else if (tool_supports_width(style_tool)) {
+            const float updated = std::clamp(
+                active_width_ + direction,
+                1.0F,
+                50.0F);
+            changed = updated != active_width_;
+            active_width_ = updated;
+        }
+        if (changed) {
+            if (editing_selected && annotation_key_transaction_key_ == 0) {
+                begin_annotation_transaction();
+                annotation_key_transaction_key_ = key;
+            }
+            remember_current_style();
+            apply_active_style_to_selected();
+            build_sub_toolbar();
+            invalidate_all();
         }
         return;
     }
@@ -1785,6 +1900,10 @@ void OverlaySession::on_key_down(
                 selection_.width(),
                 selection_.height());
         if (clamped_delta.x != 0 || clamped_delta.y != 0) {
+            if (annotation_key_transaction_key_ == 0) {
+                begin_annotation_transaction();
+                annotation_key_transaction_key_ = key;
+            }
             record_annotation_change();
             translate_annotation(
                 selected,
@@ -1804,8 +1923,6 @@ void OverlaySession::on_key_down(
         if (!annotations_.empty()) {
             return;
         }
-        const bool control_down =
-            (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool shift_down =
             (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         const SelectionResizeDirection direction =
@@ -2035,10 +2152,26 @@ void OverlaySession::on_key_down(
     }
 }
 
+void OverlaySession::on_key_up(WPARAM key) {
+    if (annotation_key_transaction_key_ == 0 ||
+        (key != 0 && key != annotation_key_transaction_key_)) {
+        return;
+    }
+    commit_annotation_transaction();
+    annotation_key_transaction_key_ = 0;
+}
+
 bool OverlaySession::on_system_key_down(
     HWND source,
     WPARAM key,
     bool is_auto_repeat) {
+    if (key == VK_MENU && !selection_complete_) {
+        if (!is_auto_repeat) {
+            magnifier_visible_ = !magnifier_visible_;
+            invalidate_all();
+        }
+        return true;
+    }
     const std::array<std::wstring_view, 13> configurable_shortcuts{
         request_.config.capture_ocr_shortcut,
         request_.config.tool_shortcut_select,

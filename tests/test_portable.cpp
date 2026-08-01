@@ -859,6 +859,17 @@ void test_no_pending_update_is_silent() {
     std::filesystem::remove_all(root, ignored);
 }
 
+void test_cancelled_update_activation_stops_before_launch() {
+    std::stop_source source;
+    source.request_stop();
+    std::wstring error = L"stale";
+    expect(
+        !airshot::launch_pending_update(
+            true, true, &error, source.get_token()) &&
+            error.find(L"取消") != std::wstring::npos,
+        L"a pre-cancelled activation exits before launching an update helper");
+}
+
 void test_reparse_update_directory_is_rejected() {
     const auto root = std::filesystem::temp_directory_path() /
                       std::format(
@@ -1007,6 +1018,7 @@ int wmain(int argument_count, wchar_t** arguments) {
     test_rollback_reconciles_post_commit_failure();
     test_update_cancellation();
     test_no_pending_update_is_silent();
+    test_cancelled_update_activation_stops_before_launch();
     test_reparse_update_directory_is_rejected();
     if (argument_count == 2 &&
         std::wstring_view(arguments[1]) == L"--network") {
